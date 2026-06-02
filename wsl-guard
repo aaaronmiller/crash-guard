@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-06-01 00:00:00 PT
+# ver: 1.0.0
+# author: Ice-ninja
+# model: Claude Opus 4.8
+# tags: [wsl2, session-recovery, wezterm, agentic-cli, crash-recovery, python]
+# ---
+# wsl-guard: restore agentic CLI/TUI sessions after a WSL2 crash.
+#
+# Architecture (revised from the Z.ai proposal after adversarial review):
+#   * No daemon, no socket, no mutable manifest. State is a directory of
+#     one-file-per-live-session "sentinels" (filesystem = state store).
+#   * A session is "live" while its sentinel file exists. The shell launcher
+#     creates it before running the tool and removes it after the tool exits.
+#   * Crash detection uses a boot epoch: each sentinel records the kernel
+#     boot_id at launch. After a restart the current boot_id differs, so any
+#     sentinel whose boot_id != current boot_id is a crashed session.
+#   * Restore is CWD-first (Tier 1: continue-in-directory) and only uses a
+#     session id (Tier 2) when several instances of the same tool ran in the
+#     same directory. Session ids are resolved at restore time from the tool's
+#     own on-disk store, not raced at launch time.
+#   * Restore verifies (and optionally repairs) the target session artifact
+#     before resuming, because a crash can leave it truncated or null-padded.
+#
+# This file is pure standard library. No third-party packages.
+
+import argparse
+import fnmatch
+import glob
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config")))
+XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", str(HOME / ".local/share")))
+CFG_DIR = XDG_CONFIG / "wsl-guard"
+CFG_FILE = CFG_DIR / "programs.json"
+DATA_DIR = XDG_DATA / "wsl-guard"
+LIVE_DIR = DATA_DIR / "live"
+ARCH_DIR = DATA_DIR / "archive"
+
+DEFAULT_ENV_PATTERNS = [
+    "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "GOOGLE_*",
+    "*_API_KEY", "*_BASE_URL", "*_AUTH_TOKEN", "*_API_BASE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "RTK_*", "HEADROOM_*", "CLAUDE_*", "CODEX_*",
+]
+
+DEFAULT_CONFIG = {
+    "wezterm": {"cli": "", "domain": ""},
+    "env_patterns": DEFAULT_ENV_PATTERNS,
+    "programs": {
+        # Verified against current (2026-06) tool behaviour.
+        "claude": {
+            "continue": ["claude", "-c"],
+            "resume_by_id": ["claude", "-r", "{id}"],
+            "store": {"type": "claude", "root": "~/.claude/projects"},
+            "interactive": True,
+        },
+        "codex": {
+            "continue": ["codex", "resume", "--last"],
+            "resume_by_id": ["codex", "resume", "{id}"],
+            "store": {"type": "codex", "root": "~/.codex/sessions"},
+            "interactive": True,
+        },
+        # Scaffolding: confirm the resume flags for these against your build.
+        "opencode": {
+            "continue": ["opencode", "-c"],
+            "resume_by_id": ["opencode", "-s", "{id}"],
+            "interactive": True,
+        },
+        "hermes": {"continue": ["hermes", "--resume"], "interactive": True},
+        "pi": {
+            "continue": ["pi", "-c"],
+            "resume_by_id": ["pi", "--session", "{id}"],
+            "interactive": True,
+        },
+        "antigravity": {"continue": ["agy", "--resume"], "interactive": True},
+        "kilo": {"continue": ["kilo", "session", "resume", "--last"], "interactive": True},
+        "ante": {"continue": ["ante", "--continue"], "interactive": True},
+        "gemini": {"continue": ["gemini", "--resume"], "interactive": True},
+    },
+}
+
+
+def boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except Exception:
+        return "unknown-boot"
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def ensure_dirs():
+    for d in (CFG_DIR, DATA_DIR, LIVE_DIR, ARCH_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_config():
+    if CFG_FILE.exists():
+        try:
+            cfg = json.loads(CFG_FILE.read_text())
+        except Exception as e:
+            sys.stderr.write("wsl-guard: config parse error: %s\n" % e)
+            cfg = {}
+    else:
+        cfg = {}
+    cfg.setdefault("programs", DEFAULT_CONFIG["programs"])
+    cfg.setdefault("env_patterns", DEFAULT_ENV_PATTERNS)
+    cfg.setdefault("wezterm", {})
+    return cfg
+
+
+def write_default_config():
+    ensure_dirs()
+    if not CFG_FILE.exists():
+        CFG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+        return True
+    return False
+
+
+def fnmatch_any(name, patterns):
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def env_snapshot(patterns):
+    return {k: v for k, v in os.environ.items() if fnmatch_any(k, patterns)}
+
+
+def atomic_write(path, text):
+    tmp = path.with_suffix(path.suffix + ".tmp-%d" % os.getpid())
+    tmp.write_text(text)
+    os.replace(str(tmp), str(path))
+
+
+def pid_alive(pid):
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# start / stop: called by the shell launcher. Never fail the wrapped command.
+# --------------------------------------------------------------------------
+
+def cmd_start(args):
+    try:
+        ensure_dirs()
+        cfg = load_config()
+        rec = {
+            "inv_id": args.inv_id,
+            "key": args.key,
+            "cwd": args.cwd or os.getcwd(),
+            "argv": args.argv,
+            "env": env_snapshot(cfg.get("env_patterns", DEFAULT_ENV_PATTERNS)),
+            "boot_id": boot_id(),
+            "shell_pid": args.shell_pid,
+            "launched_at": now_iso(),
+            "host": os.uname().nodename,
+        }
+        atomic_write(LIVE_DIR / (args.inv_id + ".json"), json.dumps(rec) + "\n")
+    except Exception as e:
+        sys.stderr.write("wsl-guard start: %s\n" % e)
+    return 0
+
+
+def cmd_stop(args):
+    try:
+        p = LIVE_DIR / (args.inv_id + ".json")
+        if p.exists():
+            p.unlink()
+    except Exception as e:
+        sys.stderr.write("wsl-guard stop: %s\n" % e)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# classify: read sentinels, decide running / stale / crashed.
+# --------------------------------------------------------------------------
+
+def read_sentinels():
+    out = []
+    if not LIVE_DIR.exists():
+        return out
+    for p in sorted(LIVE_DIR.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text())
+            rec["_path"] = str(p)
+            out.append(rec)
+        except Exception:
+            sys.stderr.write("wsl-guard: skipping unreadable sentinel %s\n" % p)
+    return out
+
+
+def classify(records, cur_boot):
+    running, stale, crashed = [], [], []
+    for r in records:
+        if r.get("boot_id") != cur_boot:
+            crashed.append(r)
+        elif pid_alive(int(r.get("shell_pid") or 0)):
+            running.append(r)
+        else:
+            stale.append(r)
+    return running, stale, crashed
+
+
+# --------------------------------------------------------------------------
+# session-store enumeration (Tier 2, multi-instance-per-directory only)
+# --------------------------------------------------------------------------
+
+def claude_encode_cwd(cwd):
+    # Claude Code: every non-alphanumeric character of the absolute path
+    # becomes '-'. (~/.claude/projects/<encoded>/<uuid>.jsonl)
+    return "".join(c if c.isalnum() else "-" for c in cwd)
+
+
+def store_sessions(prog, cwd, limit):
+    """Return up to `limit` (session_id, jsonl_path) newest-first for cwd."""
+    store = prog.get("store")
+    if not store:
+        return []
+    root = Path(os.path.expanduser(store.get("root", "")))
+    stype = store.get("type")
+    found = []
+    if stype == "claude":
+        d = root / claude_encode_cwd(cwd)
+        if d.is_dir():
+            files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            found = [(p.stem, p) for p in files]
+    elif stype == "codex":
+        # Best effort: scan rollout files, keep those whose header cwd matches.
+        cands = sorted(
+            root.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for p in cands:
+            if len(found) >= limit * 3 + 5:
+                break
+            sid = _codex_id_for_path(p, cwd)
+            if sid:
+                found.append((sid, p))
+    return found[:limit]
+
+
+def _codex_id_for_path(path, want_cwd):
+    try:
+        with path.open("r", errors="replace") as f:
+            head = f.readline()
+        meta = json.loads(head)
+    except Exception:
+        return None
+    hcwd = meta.get("cwd") or (meta.get("payload") or {}).get("cwd") or (meta.get("git") or {}).get("cwd")
+    if hcwd and os.path.normpath(hcwd) != os.path.normpath(want_cwd):
+        return None
+    sid = meta.get("id") or meta.get("session_id") or (meta.get("payload") or {}).get("id")
+    if sid:
+        return sid
+    name = path.stem
+    return name.replace("rollout-", "") or name
+
+
+# --------------------------------------------------------------------------
+# artifact verification / optional repair
+# --------------------------------------------------------------------------
+
+def verify_artifact(path, repair=False):
+    """Return one of: missing, empty, ok, repaired, corrupt."""
+    p = Path(path)
+    if not p.exists():
+        return "missing"
+    data = p.read_bytes()
+    if not data.strip():
+        return "empty"
+    changed = False
+    if data.endswith(b"\x00") or b"\x00" in data[-4096:]:
+        stripped = data.rstrip(b"\x00")
+        if stripped != data:
+            data = stripped
+            changed = True
+    lines = data.split(b"\n")
+    while lines and lines[-1].strip() == b"":
+        lines.pop()
+    last_ok = False
+    if lines:
+        try:
+            json.loads(lines[-1].decode("utf-8", "replace"))
+            last_ok = True
+        except Exception:
+            last_ok = False
+    if not last_ok and lines:
+        lines = lines[:-1]
+        changed = True
+    if not lines:
+        return "corrupt"
+    if changed and repair:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        backup = ARCH_DIR / ("%s.%s.bak" % (p.name, ts))
+        try:
+            backup.write_bytes(p.read_bytes())
+            p.write_bytes(b"\n".join(lines) + b"\n")
+            return "repaired"
+        except Exception as e:
+            sys.stderr.write("wsl-guard: repair failed for %s: %s\n" % (p, e))
+            return "corrupt"
+    if changed:
+        return "corrupt"
+    return "ok"
+
+
+# --------------------------------------------------------------------------
+# restore planning
+# --------------------------------------------------------------------------
+
+def build_plan(crashed, cfg, repair=False):
+    """Group crashed sentinels by (key, cwd) and resolve resume commands."""
+    groups = {}
+    for r in crashed:
+        groups.setdefault((r.get("key"), r.get("cwd")), []).append(r)
+
+    plan = []
+    for (key, cwd), recs in groups.items():
+        prog = cfg["programs"].get(key)
+        n = len(recs)
+        if not prog:
+            for r in recs:
+                plan.append({
+                    "key": key, "cwd": cwd, "rec": r, "tier": "skip",
+                    "argv": None, "note": "no config entry for '%s'" % key,
+                    "env": r.get("env", {}),
+                })
+            continue
+
+        sessions = []
+        if n > 1 and prog.get("resume_by_id") and prog.get("store"):
+            sessions = store_sessions(prog, cwd, n)
+
+        for i, r in enumerate(recs):
+            env = r.get("env", {})
+            if i < len(sessions):
+                sid, spath = sessions[i]
+                status = verify_artifact(spath, repair=repair)
+                if status in ("ok", "repaired"):
+                    argv = [a.replace("{id}", sid).replace("{cwd}", cwd)
+                            for a in prog["resume_by_id"]]
+                    plan.append({
+                        "key": key, "cwd": cwd, "rec": r, "tier": "id",
+                        "argv": argv, "session": sid, "verify": status,
+                        "note": "" if status == "ok" else "artifact repaired",
+                        "env": env,
+                    })
+                    continue
+                # fall through to continue with a degradation note
+                plan.append({
+                    "key": key, "cwd": cwd, "rec": r, "tier": "continue",
+                    "argv": prog["continue"], "verify": status,
+                    "note": "session %s %s; using continue" % (sid[:8], status),
+                    "env": env,
+                })
+            else:
+                note = ""
+                if n > 1 and i > 0:
+                    note = "multiple in same dir, no distinct id; may collapse"
+                plan.append({
+                    "key": key, "cwd": cwd, "rec": r, "tier": "continue",
+                    "argv": prog["continue"], "note": note, "env": env,
+                })
+    return plan
+
+
+# --------------------------------------------------------------------------
+# WezTerm spawning (Windows interop aware)
+# --------------------------------------------------------------------------
+
+def wez_cli(cfg):
+    explicit = (cfg.get("wezterm") or {}).get("cli")
+    if explicit:
+        return explicit
+    for cand in ("wezterm.exe", "wezterm"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
+def wez_domain(cfg):
+    explicit = (cfg.get("wezterm") or {}).get("domain")
+    if explicit:
+        return explicit
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    if distro:
+        return "WSL:%s" % distro
+    return ""
+
+
+def build_inner(item, prog):
+    shell = os.environ.get("SHELL", "/bin/bash")
+    exports = ""
+    for k, v in (item.get("env") or {}).items():
+        exports += "export %s=%s; " % (k, shlex.quote(v))
+    resume_argv = item["argv"]
+    payload = "cd %s; %s wg_run %s -- %s" % (
+        shlex.quote(item["cwd"]),
+        exports,
+        shlex.quote(item["key"]),
+        " ".join(shlex.quote(a) for a in resume_argv),
+    )
+    return [shell, "-lic", payload]
+
+
+def wez_spawn(cli, domain, inner, window_id=None):
+    argv = [cli, "cli", "spawn"]
+    if domain:
+        argv += ["--domain-name", domain]
+    if window_id is None:
+        argv += ["--new-window"]
+    else:
+        argv += ["--window-id", str(window_id)]
+    argv += ["--"] + inner
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None, res.stderr.strip()
+    return res.stdout.strip(), None
+
+
+def wez_window_for_pane(cli, pane_id):
+    res = subprocess.run([cli, "cli", "list", "--format", "json"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    try:
+        for entry in json.loads(res.stdout):
+            if str(entry.get("pane_id")) == str(pane_id):
+                return entry.get("window_id")
+    except Exception:
+        pass
+    return None
+
+
+def wez_set_title(cli, pane_id, title):
+    subprocess.run([cli, "cli", "set-tab-title", "--pane-id", str(pane_id), title],
+                   capture_output=True, text=True)
+
+
+# --------------------------------------------------------------------------
+# commands: status / restore / list / prune / init / shell-init / genid
+# --------------------------------------------------------------------------
+
+def short(s, n=8):
+    return (s or "")[:n]
+
+
+def fmt_row(r, status):
+    return "  [%s] %-12s %s" % (status, r.get("key", "?"), r.get("cwd", "?"))
+
+
+def cmd_status(args):
+    cur = boot_id()
+    recs = read_sentinels()
+    running, stale, crashed = classify(recs, cur)
+    print("wsl-guard status  (boot %s)" % short(cur, 8))
+    print("  tracked sentinels: %d" % len(recs))
+    if running:
+        print("\nrunning (%d):" % len(running))
+        for r in running:
+            print(fmt_row(r, "run"))
+    if stale:
+        print("\nstale this boot (%d) -- launcher died, tool gone:" % len(stale))
+        for r in stale:
+            print(fmt_row(r, "stl"))
+    if crashed:
+        print("\ncrashed / from a previous boot (%d) -- restorable:" % len(crashed))
+        for r in crashed:
+            print(fmt_row(r, "crx"))
+    if not (running or stale or crashed):
+        print("  nothing tracked.")
+    return 0
+
+
+def cmd_list(args):
+    for r in read_sentinels():
+        print(json.dumps({k: v for k, v in r.items() if k != "env"}))
+    return 0
+
+
+def cmd_prune(args):
+    cur = boot_id()
+    recs = read_sentinels()
+    _, stale, _ = classify(recs, cur)
+    for r in stale:
+        try:
+            Path(r["_path"]).unlink()
+            print("pruned stale: %s %s" % (r.get("key"), r.get("cwd")))
+        except Exception as e:
+            sys.stderr.write("prune: %s\n" % e)
+    if not stale:
+        print("no stale sentinels.")
+    return 0
+
+
+def archive_sentinel(r):
+    try:
+        src = Path(r["_path"])
+        if src.exists():
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            src.rename(ARCH_DIR / ("%s.%s.json" % (src.stem, ts)))
+    except Exception as e:
+        sys.stderr.write("archive: %s\n" % e)
+
+
+def cmd_restore(args):
+    ensure_dirs()
+    cfg = load_config()
+    cur = boot_id()
+    recs = read_sentinels()
+    _, stale, crashed = classify(recs, cur)
+
+    targets = list(crashed)
+    if args.include_stale:
+        targets += stale
+    if not targets:
+        print("wsl-guard: no crashed sessions to restore.")
+        return 0
+
+    plan = build_plan(targets, cfg, repair=args.repair)
+
+    print("wsl-guard restore plan (%d session(s)):\n" % len(plan))
+    for i, item in enumerate(plan, 1):
+        tier = item["tier"]
+        cmd = " ".join(item["argv"]) if item["argv"] else "(skipped)"
+        line = "  %2d. %-12s %s" % (i, item["key"], item["cwd"])
+        print(line)
+        meta = "tier=%s  ->  %s" % (tier, cmd)
+        if item.get("session"):
+            meta += "  [id %s]" % short(item["session"], 8)
+        print("      " + meta)
+        if item.get("note"):
+            print("      note: %s" % item["note"])
+    print("")
+
+    if args.dry_run:
+        print("dry-run: nothing spawned.")
+        return 0
+
+    selected = plan
+    if args.select:
+        raw = input("Restore which? (e.g. 1,3-5 / all / none): ").strip().lower()
+        if raw in ("none", "n", ""):
+            print("aborted.")
+            return 0
+        if raw not in ("all", "a"):
+            selected = _select(plan, raw)
+    elif not args.yes:
+        ans = input("Restore all %d session(s)? [Y/n] " % len(plan)).strip().lower()
+        if ans in ("n", "no"):
+            print("aborted.")
+            return 0
+
+    if args.no_spawn:
+        print("no-spawn: printing commands only.\n")
+        for item in selected:
+            if item["argv"]:
+                print("cd %s && %s" % (item["cwd"], " ".join(item["argv"])))
+            archive_sentinel(item["rec"])
+        return 0
+
+    cli = wez_cli(cfg)
+    if not cli:
+        sys.stderr.write(
+            "wsl-guard: no wezterm CLI found (looked for wezterm.exe and wezterm).\n"
+            "Set wezterm.cli in %s, or run with --no-spawn.\n" % CFG_FILE)
+        return 2
+    domain = wez_domain(cfg)
+
+    window_id = None
+    ok = 0
+    for item in selected:
+        if not item["argv"]:
+            print("  skip %s (%s)" % (item["key"], item.get("note", "")))
+            continue
+        prog = cfg["programs"].get(item["key"], {})
+        inner = build_inner(item, prog)
+        pane, err = wez_spawn(cli, domain, inner, window_id=window_id)
+        if pane is None:
+            sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
+            continue
+        if window_id is None:
+            window_id = wez_window_for_pane(cli, pane)
+        title = "%s @ %s" % (item["key"], os.path.basename(item["cwd"].rstrip("/")) or "/")
+        wez_set_title(cli, pane, title)
+        print("  ok   %s @ %s  (pane %s)" % (item["key"], item["cwd"], pane))
+        archive_sentinel(item["rec"])
+        ok += 1
+
+    print("\nrestored %d/%d session(s)." % (ok, len(selected)))
+    return 0
+
+
+def _select(plan, raw):
+    idx = set()
+    for part in raw.replace(" ", "").split(","):
+        if "-" in part:
+            a, b = part.split("-", 1)
+            idx.update(range(int(a), int(b) + 1))
+        elif part:
+            idx.add(int(part))
+    return [plan[i - 1] for i in sorted(idx) if 1 <= i <= len(plan)]
+
+
+def cmd_init(args):
+    created = write_default_config()
+    ensure_dirs()
+    if created:
+        print("wrote default config: %s" % CFG_FILE)
+    else:
+        print("config already exists: %s" % CFG_FILE)
+    print("data dir: %s" % DATA_DIR)
+    print("\nNext: add 'source <path>/wsl-guard.sh' to your ~/.zshrc or ~/.bashrc,")
+    print("then wrap your launchers with wg_run (see wsl-guard.sh for examples).")
+    return 0
+
+
+def cmd_genid(args):
+    try:
+        print(Path("/proc/sys/kernel/random/uuid").read_text().strip())
+    except Exception:
+        import uuid
+        print(str(uuid.uuid4()))
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="wsl-guard", description="WSL2 agentic session recovery")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start")
+    s.add_argument("--key", required=True)
+    s.add_argument("--inv-id", required=True)
+    s.add_argument("--cwd", default="")
+    s.add_argument("--shell-pid", type=int, default=0)
+    s.add_argument("argv", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop")
+    s.add_argument("--inv-id", required=True)
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("status")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("list")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("prune")
+    s.set_defaults(func=cmd_prune)
+
+    s = sub.add_parser("restore")
+    s.add_argument("--yes", "-y", action="store_true")
+    s.add_argument("--select", action="store_true")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--no-spawn", action="store_true")
+    s.add_argument("--repair", action="store_true",
+                   help="truncate null/partial tails in session files (backs up first)")
+    s.add_argument("--include-stale", action="store_true")
+    s.set_defaults(func=cmd_restore)
+
+    s = sub.add_parser("init")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("shell-init")
+    s.set_defaults(func=lambda a: (print(SHELL_SNIPPET), 0)[1])
+
+    s = sub.add_parser("genid")
+    s.set_defaults(func=cmd_genid)
+
+    if "argv" in [a.dest for a in s._actions]:
+        pass
+    args = p.parse_args()
+    # strip a leading "--" left in REMAINDER for start
+    if getattr(args, "argv", None) and args.argv and args.argv[0] == "--":
+        args.argv = args.argv[1:]
+    sys.exit(args.func(args))
+
+
+SHELL_SNIPPET = "# run: wsl-guard shell-init  (the integration lives in wsl-guard.sh)"
+
+if __name__ == "__main__":
+    main()
