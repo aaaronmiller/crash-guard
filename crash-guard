@@ -1,49 +1,37 @@
-#!/usr/bin/env bash
-# ---
-# date: 2026-06-01 00:00:00 PT
-# ver: 1.0.0
-# author: Ice-ninja
-# model: Claude Opus 4.8
-# tags: [wsl2, installer, session-recovery, wezterm, agentic-cli]
-# ---
-# One-shot installer for wsl-guard. Paste this whole block into a WSL2 shell,
-# or run:  bash install-wsl-guard.sh
-set -euo pipefail
-BIN_DIR="$HOME/.local/bin"
-CFG_DIR="$HOME/.config/wsl-guard"
-mkdir -p "$BIN_DIR" "$CFG_DIR"
-
-cat > "$BIN_DIR/wsl-guard" <<'PYEOF'
 #!/usr/bin/env python3
 # ---
-# date: 2026-06-01 00:00:00 PT
-# ver: 1.0.0
+# date: 2026-06-02 00:00:00 PT
+# ver: 2.0.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, session-recovery, wezterm, agentic-cli, crash-recovery, python]
 # ---
-# wsl-guard: restore agentic CLI/TUI sessions after a WSL2 crash.
+# crash-guard: restore agentic CLI/TUI sessions after a WSL2 crash.
 #
-# Architecture (revised from the Z.ai proposal after adversarial review):
+# Architecture (filesystem-as-state, no daemon):
 #   * No daemon, no socket, no mutable manifest. State is a directory of
 #     one-file-per-live-session "sentinels" (filesystem = state store).
 #   * A session is "live" while its sentinel file exists. The shell launcher
-#     creates it before running the tool and removes it after the tool exits.
+#     (cg_run) creates it before running the tool and removes it after the
+#     tool exits. A crash kills the shell before the remove runs.
 #   * Crash detection uses a boot epoch: each sentinel records the kernel
 #     boot_id at launch. After a restart the current boot_id differs, so any
-#     sentinel whose boot_id != current boot_id is a crashed session.
+#     sentinel whose boot_id != current boot_id is a crashed session. PID
+#     liveness is only ever compared within the same boot (no PID-recycle bug).
 #   * Restore is CWD-first (Tier 1: continue-in-directory) and only uses a
 #     session id (Tier 2) when several instances of the same tool ran in the
 #     same directory. Session ids are resolved at restore time from the tool's
 #     own on-disk store, not raced at launch time.
 #   * Restore verifies (and optionally repairs) the target session artifact
 #     before resuming, because a crash can leave it truncated or null-padded.
+#   * Restore spawns each session as its own WezTerm TAB in the EXISTING window
+#     (the one you run `crash-guard restore` from, found via WEZTERM_PANE).
+#     If not launched from inside WezTerm, it falls back to a new window.
 #
-# This file is pure standard library. No third-party packages.
+# Pure standard library. No third-party packages.
 
 import argparse
 import fnmatch
-import glob
 import json
 import os
 import shlex
@@ -56,53 +44,80 @@ from pathlib import Path
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", str(HOME / ".config")))
 XDG_DATA = Path(os.environ.get("XDG_DATA_HOME", str(HOME / ".local/share")))
-CFG_DIR = XDG_CONFIG / "wsl-guard"
+CFG_DIR = XDG_CONFIG / "crash-guard"
 CFG_FILE = CFG_DIR / "programs.json"
-DATA_DIR = XDG_DATA / "wsl-guard"
+DATA_DIR = XDG_DATA / "crash-guard"
 LIVE_DIR = DATA_DIR / "live"
 ARCH_DIR = DATA_DIR / "archive"
 
-DEFAULT_ENV_PATTERNS = [
-    "ANTHROPIC_*", "OPENAI_*", "GEMINI_*", "GOOGLE_*",
-    "*_API_KEY", "*_BASE_URL", "*_AUTH_TOKEN", "*_API_BASE",
+# SECURITY: the sentinel is plaintext on disk and its env is replayed via
+# `export` in the restore payload (visible in `ps`). So we capture ONLY the
+# non-secret proxy-routing delta the launcher injected, never ambient secrets.
+# Real global keys are restored automatically because the restore shell
+# re-sources ~/.zshrc (`zsh -lic`).
+#
+# Routing patterns: always safe to capture (localhost/base URLs, proxy vars).
+ROUTING_ENV_PATTERNS = [
+    "*_BASE_URL", "*_API_BASE", "*_BASE",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "no_proxy",
-    "RTK_*", "HEADROOM_*", "CLAUDE_*", "CODEX_*",
+    "RTK_*", "HEADROOM_*",
 ]
+# Auth-named patterns: captured ONLY when the value is a non-secret placeholder
+# (the dummy `pass`/`dummy`/short token your proxy aliases set inline).
+AUTH_ENV_PATTERNS = ["*_API_KEY", "*_AUTH_TOKEN", "*_TOKEN", "*_KEY"]
+NONSECRET_VALUES = {"", "pass", "dummy", "none", "no", "x", "test", "local", "0", "1"}
+# Back-compat alias; load_config still reads "env_patterns" if a user set one.
+DEFAULT_ENV_PATTERNS = ROUTING_ENV_PATTERNS
 
+# Restore preamble: ensure the proxy stack is up before reconnecting, if the
+# user's shell defines _proxy_stack_auto_start. Harmless when it does not.
+DEFAULT_RESTORE_PRE = (
+    "command -v _proxy_stack_auto_start >/dev/null 2>&1 && _proxy_stack_auto_start;"
+)
+
+# Resume commands below intentionally include the `rtk` prefix and the user's
+# real flags, so a restored session reconnects through the same proxy +
+# compression chain. The proxy ENV (ANTHROPIC_BASE_URL, OPENAI_BASE_URL, ...)
+# is captured per-session at launch and replayed from the sentinel on restore.
 DEFAULT_CONFIG = {
     "wezterm": {"cli": "", "domain": ""},
     "env_patterns": DEFAULT_ENV_PATTERNS,
+    "restore": {"pre": DEFAULT_RESTORE_PRE},
     "programs": {
-        # Verified against current (2026-06) tool behaviour.
         "claude": {
-            "continue": ["claude", "-c"],
-            "resume_by_id": ["claude", "-r", "{id}"],
+            "continue": ["rtk", "claude", "--continue", "--dangerously-skip-permissions"],
+            "resume_by_id": ["rtk", "claude", "-r", "{id}", "--dangerously-skip-permissions"],
             "store": {"type": "claude", "root": "~/.claude/projects"},
             "interactive": True,
         },
+        "opencode": {
+            "continue": ["rtk", "opencode", "-c"],
+            "resume_by_id": ["rtk", "opencode", "-s", "{id}"],
+            "interactive": True,
+        },
+        "hermes": {
+            "continue": ["rtk", "hermes", "--continue", "--dangerously-skip-permissions"],
+            "resume_by_id": ["rtk", "hermes", "--resume", "{id}", "--dangerously-skip-permissions"],
+            "interactive": True,
+        },
+        "pi": {
+            "continue": ["rtk", "pi", "--provider", "openai", "-c"],
+            "resume_by_id": ["rtk", "pi", "--provider", "openai", "--session", "{id}"],
+            "interactive": True,
+        },
         "codex": {
-            "continue": ["codex", "resume", "--last"],
-            "resume_by_id": ["codex", "resume", "{id}"],
+            "continue": ["rtk", "codex", "resume", "--last"],
+            "resume_by_id": ["rtk", "codex", "resume", "{id}"],
             "store": {"type": "codex", "root": "~/.codex/sessions"},
             "interactive": True,
         },
-        # Scaffolding: confirm the resume flags for these against your build.
-        "opencode": {
-            "continue": ["opencode", "-c"],
-            "resume_by_id": ["opencode", "-s", "{id}"],
+        # ante repl is memory-based: a fresh launch auto-injects prior context.
+        # No session-resume flag exists, so restore just relaunches in the dir.
+        "ante": {
+            "continue": ["ante", "repl"],
             "interactive": True,
         },
-        "hermes": {"continue": ["hermes", "--resume"], "interactive": True},
-        "pi": {
-            "continue": ["pi", "-c"],
-            "resume_by_id": ["pi", "--session", "{id}"],
-            "interactive": True,
-        },
-        "antigravity": {"continue": ["agy", "--resume"], "interactive": True},
-        "kilo": {"continue": ["kilo", "session", "resume", "--last"], "interactive": True},
-        "ante": {"continue": ["ante", "--continue"], "interactive": True},
-        "gemini": {"continue": ["gemini", "--resume"], "interactive": True},
     },
 }
 
@@ -128,13 +143,15 @@ def load_config():
         try:
             cfg = json.loads(CFG_FILE.read_text())
         except Exception as e:
-            sys.stderr.write("wsl-guard: config parse error: %s\n" % e)
+            sys.stderr.write("crash-guard: config parse error: %s\n" % e)
             cfg = {}
     else:
         cfg = {}
     cfg.setdefault("programs", DEFAULT_CONFIG["programs"])
     cfg.setdefault("env_patterns", DEFAULT_ENV_PATTERNS)
     cfg.setdefault("wezterm", {})
+    cfg.setdefault("restore", {"pre": DEFAULT_RESTORE_PRE})
+    cfg["restore"].setdefault("pre", DEFAULT_RESTORE_PRE)
     return cfg
 
 
@@ -150,8 +167,30 @@ def fnmatch_any(name, patterns):
     return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
+def _value_is_nonsecret(v):
+    if v in NONSECRET_VALUES:
+        return True
+    # URLs are routing, not secrets (localhost / base endpoints).
+    if v.startswith(("http://", "https://")):
+        return True
+    # Anything longer than a short placeholder is treated as a secret.
+    return len(v) <= 8
+
+
 def env_snapshot(patterns):
-    return {k: v for k, v in os.environ.items() if fnmatch_any(k, patterns)}
+    """Capture proxy-routing env only. Never persist real credentials.
+
+    `patterns` (from config "env_patterns") select routing vars. Auth-named
+    vars are additionally allowed only when their VALUE is a non-secret
+    placeholder, so the dummy `pass` survives but real keys are dropped.
+    """
+    out = {}
+    for k, v in os.environ.items():
+        if fnmatch_any(k, patterns):
+            out[k] = v
+        elif fnmatch_any(k, AUTH_ENV_PATTERNS) and _value_is_nonsecret(v):
+            out[k] = v
+    return out
 
 
 def atomic_write(path, text):
@@ -195,7 +234,7 @@ def cmd_start(args):
         }
         atomic_write(LIVE_DIR / (args.inv_id + ".json"), json.dumps(rec) + "\n")
     except Exception as e:
-        sys.stderr.write("wsl-guard start: %s\n" % e)
+        sys.stderr.write("crash-guard start: %s\n" % e)
     return 0
 
 
@@ -205,7 +244,7 @@ def cmd_stop(args):
         if p.exists():
             p.unlink()
     except Exception as e:
-        sys.stderr.write("wsl-guard stop: %s\n" % e)
+        sys.stderr.write("crash-guard stop: %s\n" % e)
     return 0
 
 
@@ -223,7 +262,7 @@ def read_sentinels():
             rec["_path"] = str(p)
             out.append(rec)
         except Exception:
-            sys.stderr.write("wsl-guard: skipping unreadable sentinel %s\n" % p)
+            sys.stderr.write("crash-guard: skipping unreadable sentinel %s\n" % p)
     return out
 
 
@@ -334,7 +373,7 @@ def verify_artifact(path, repair=False):
             p.write_bytes(b"\n".join(lines) + b"\n")
             return "repaired"
         except Exception as e:
-            sys.stderr.write("wsl-guard: repair failed for %s: %s\n" % (p, e))
+            sys.stderr.write("crash-guard: repair failed for %s: %s\n" % (p, e))
             return "corrupt"
     if changed:
         return "corrupt"
@@ -426,18 +465,91 @@ def wez_domain(cfg):
     return ""
 
 
-def build_inner(item, prog):
-    shell = os.environ.get("SHELL", "/bin/bash")
+def wez_list(cli):
+    res = subprocess.run([cli, "cli", "list", "--format", "json"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    try:
+        return json.loads(res.stdout)
+    except Exception:
+        return []
+
+
+def wez_focused_pane(cli):
+    """The GUI's currently-focused pane id, via the mux (WSL-proof).
+
+    WezTerm does not export WEZTERM_PANE across the WSL boundary, so inside a
+    WSL pane the env var is empty. The mux still knows the focused pane, so we
+    ask it directly. If several clients are attached, prefer the least-idle.
+    """
+    res = subprocess.run([cli, "cli", "list-clients", "--format", "json"],
+                         capture_output=True, text=True)
+    if res.returncode != 0:
+        return None
+    try:
+        clients = [c for c in json.loads(res.stdout)
+                   if c.get("focused_pane_id") is not None]
+    except Exception:
+        return None
+    if not clients:
+        return None
+    clients.sort(key=lambda c: (c.get("idle_time") or {}).get("secs", 1 << 30))
+    return clients[0]["focused_pane_id"]
+
+
+def wez_current_window(cli):
+    """Window id of the EXISTING window to attach restored tabs to.
+
+    Resolution order: WEZTERM_PANE (native Linux/macOS) -> the mux's focused
+    pane (works under WSL where WEZTERM_PANE is absent) -> the sole window if
+    there is exactly one.
+    """
+    panes = wez_list(cli)
+    if not panes:
+        return None
+
+    def window_of(pane_id):
+        for entry in panes:
+            if str(entry.get("pane_id")) == str(pane_id):
+                return entry.get("window_id")
+        return None
+
+    env_pane = os.environ.get("WEZTERM_PANE")
+    if env_pane:
+        w = window_of(env_pane)
+        if w is not None:
+            return w
+
+    focused = wez_focused_pane(cli)
+    if focused is not None:
+        w = window_of(focused)
+        if w is not None:
+            return w
+
+    windows = {entry.get("window_id") for entry in panes}
+    if len(windows) == 1:
+        return next(iter(windows))
+    return None
+
+
+def build_inner(item, cfg):
+    shell = os.environ.get("SHELL", "/bin/zsh")
     exports = ""
     for k, v in (item.get("env") or {}).items():
         exports += "export %s=%s; " % (k, shlex.quote(v))
+    pre = (cfg.get("restore") or {}).get("pre", "")
+    pre_part = (pre.rstrip() + " ") if pre else ""
     resume_argv = item["argv"]
-    payload = "cd %s; %s wg_run %s -- %s" % (
+    payload = "cd %s; %s%scg_run %s -- %s" % (
         shlex.quote(item["cwd"]),
         exports,
+        pre_part,
         shlex.quote(item["key"]),
         " ".join(shlex.quote(a) for a in resume_argv),
     )
+    # -l login, -i interactive -> sources ~/.zshrc so cg_run + the proxy
+    # function are defined; -c runs our payload.
     return [shell, "-lic", payload]
 
 
@@ -457,16 +569,9 @@ def wez_spawn(cli, domain, inner, window_id=None):
 
 
 def wez_window_for_pane(cli, pane_id):
-    res = subprocess.run([cli, "cli", "list", "--format", "json"],
-                         capture_output=True, text=True)
-    if res.returncode != 0:
-        return None
-    try:
-        for entry in json.loads(res.stdout):
-            if str(entry.get("pane_id")) == str(pane_id):
-                return entry.get("window_id")
-    except Exception:
-        pass
+    for entry in wez_list(cli):
+        if str(entry.get("pane_id")) == str(pane_id):
+            return entry.get("window_id")
     return None
 
 
@@ -476,7 +581,7 @@ def wez_set_title(cli, pane_id, title):
 
 
 # --------------------------------------------------------------------------
-# commands: status / restore / list / prune / init / shell-init / genid
+# commands: status / restore / list / prune / init / notify / genid
 # --------------------------------------------------------------------------
 
 def short(s, n=8):
@@ -491,7 +596,7 @@ def cmd_status(args):
     cur = boot_id()
     recs = read_sentinels()
     running, stale, crashed = classify(recs, cur)
-    print("wsl-guard status  (boot %s)" % short(cur, 8))
+    print("crash-guard status  (boot %s)" % short(cur, 8))
     print("  tracked sentinels: %d" % len(recs))
     if running:
         print("\nrunning (%d):" % len(running))
@@ -507,6 +612,29 @@ def cmd_status(args):
             print(fmt_row(r, "crx"))
     if not (running or stale or crashed):
         print("  nothing tracked.")
+    return 0
+
+
+def cmd_notify(args):
+    """One-line, once-per-boot hint when crashed sessions exist. Login hook."""
+    cur = boot_id()
+    marker = DATA_DIR / (".notified-" + cur)
+    if marker.exists() and not args.force:
+        return 0
+    recs = read_sentinels()
+    _, _, crashed = classify(recs, cur)
+    # Mark shown for this boot regardless, so later shells skip the check.
+    try:
+        ensure_dirs()
+        marker.touch()
+    except Exception:
+        pass
+    if crashed:
+        sys.stdout.write(
+            "\033[33mcrash-guard:\033[0m %d crashed session(s) from a previous "
+            "boot -- run \033[1mcgr\033[0m to restore (\033[1mcgs\033[0m to preview).\n"
+            % len(crashed)
+        )
     return 0
 
 
@@ -552,17 +680,16 @@ def cmd_restore(args):
     if args.include_stale:
         targets += stale
     if not targets:
-        print("wsl-guard: no crashed sessions to restore.")
+        print("crash-guard: no crashed sessions to restore.")
         return 0
 
     plan = build_plan(targets, cfg, repair=args.repair)
 
-    print("wsl-guard restore plan (%d session(s)):\n" % len(plan))
+    print("crash-guard restore plan (%d session(s)):\n" % len(plan))
     for i, item in enumerate(plan, 1):
         tier = item["tier"]
         cmd = " ".join(item["argv"]) if item["argv"] else "(skipped)"
-        line = "  %2d. %-12s %s" % (i, item["key"], item["cwd"])
-        print(line)
+        print("  %2d. %-12s %s" % (i, item["key"], item["cwd"]))
         meta = "tier=%s  ->  %s" % (tier, cmd)
         if item.get("session"):
             meta += "  [id %s]" % short(item["session"], 8)
@@ -600,19 +727,24 @@ def cmd_restore(args):
     cli = wez_cli(cfg)
     if not cli:
         sys.stderr.write(
-            "wsl-guard: no wezterm CLI found (looked for wezterm.exe and wezterm).\n"
+            "crash-guard: no wezterm CLI found (looked for wezterm.exe and wezterm).\n"
             "Set wezterm.cli in %s, or run with --no-spawn.\n" % CFG_FILE)
         return 2
     domain = wez_domain(cfg)
 
-    window_id = None
+    # Spawn into the EXISTING window (focused pane's window under WSL).
+    window_id = wez_current_window(cli)
+    if window_id is not None:
+        print("  -> spawning tabs into existing window %s\n" % window_id)
+    else:
+        print("  -> could not resolve current window; opening a new one\n")
+
     ok = 0
     for item in selected:
         if not item["argv"]:
             print("  skip %s (%s)" % (item["key"], item.get("note", "")))
             continue
-        prog = cfg["programs"].get(item["key"], {})
-        inner = build_inner(item, prog)
+        inner = build_inner(item, cfg)
         pane, err = wez_spawn(cli, domain, inner, window_id=window_id)
         if pane is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
@@ -648,8 +780,7 @@ def cmd_init(args):
     else:
         print("config already exists: %s" % CFG_FILE)
     print("data dir: %s" % DATA_DIR)
-    print("\nNext: add 'source <path>/wsl-guard.sh' to your ~/.zshrc or ~/.bashrc,")
-    print("then wrap your launchers with wg_run (see wsl-guard.sh for examples).")
+    print("\nNext: source crash-guard.sh from ~/.zshrc, then wrap launchers with cg_run.")
     return 0
 
 
@@ -663,7 +794,7 @@ def cmd_genid(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="wsl-guard", description="WSL2 agentic session recovery")
+    p = argparse.ArgumentParser(prog="crash-guard", description="WSL2 agentic session recovery")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("start")
@@ -680,6 +811,10 @@ def main():
 
     s = sub.add_parser("status")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("notify")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_notify)
 
     s = sub.add_parser("list")
     s.set_defaults(func=cmd_list)
@@ -700,14 +835,9 @@ def main():
     s = sub.add_parser("init")
     s.set_defaults(func=cmd_init)
 
-    s = sub.add_parser("shell-init")
-    s.set_defaults(func=lambda a: (print(SHELL_SNIPPET), 0)[1])
-
     s = sub.add_parser("genid")
     s.set_defaults(func=cmd_genid)
 
-    if "argv" in [a.dest for a in s._actions]:
-        pass
     args = p.parse_args()
     # strip a leading "--" left in REMAINDER for start
     if getattr(args, "argv", None) and args.argv and args.argv[0] == "--":
@@ -715,94 +845,5 @@ def main():
     sys.exit(args.func(args))
 
 
-SHELL_SNIPPET = "# run: wsl-guard shell-init  (the integration lives in wsl-guard.sh)"
-
 if __name__ == "__main__":
     main()
-PYEOF
-chmod +x "$BIN_DIR/wsl-guard"
-
-cat > "$CFG_DIR/wsl-guard.sh" <<'SHEOF'
-# ---
-# date: 2026-06-01 00:00:00 PT
-# ver: 1.0.0
-# author: Ice-ninja
-# model: Claude Opus 4.8
-# tags: [wsl2, shell-integration, zsh, bash, session-recovery, wezterm]
-# ---
-# wsl-guard shell integration. Source this from ~/.zshrc or ~/.bashrc:
-#     source ~/.config/wsl-guard/wsl-guard.sh
-#
-# Works in both bash and zsh. Defines the wg_run launcher primitive and two
-# convenience aliases. It deliberately does NOT redefine your existing tool
-# aliases (cc, qw, rtk, ...). You compose wg_run into them yourself; see the
-# commented examples at the bottom.
-
-# wg_run KEY [--] CMD [ARGS...]
-#   Registers a live-session sentinel, runs CMD in the foreground (so signals,
-#   the tty, and your TUI behave exactly as normal), then clears the sentinel
-#   when CMD exits. A WSL2 crash kills the shell before the clear runs, which
-#   is precisely how a crashed session is detected on the next boot.
-wg_run() {
-  local key="$1"; shift
-  if [ "${1:-}" = "--" ]; then shift; fi
-  local inv
-  inv="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
-  [ -z "$inv" ] && inv="wg-$$-${RANDOM}-$(date +%s)"
-  command wsl-guard start --key "$key" --inv-id "$inv" \
-      --cwd "$PWD" --shell-pid "$$" -- "$@" 2>/dev/null
-  "$@"
-  local rc=$?
-  command wsl-guard stop --inv-id "$inv" 2>/dev/null
-  return $rc
-}
-
-alias wgr='wsl-guard restore'
-alias wgs='wsl-guard status'
-
-# ---------------------------------------------------------------------------
-# Composition examples. Copy, rename, and adapt to your real proxy stack.
-# Env vars set on the same line are exported to the tool and captured in the
-# sentinel, so restore reconnects through the same proxy/gateway after a crash.
-#
-# To keep RTK compression on restored sessions too, put your prefix in the
-# config resume command, e.g. set claude.resume_by_id to
-#   ["rtk","claude","-r","{id}"]   in ~/.config/wsl-guard/programs.json
-#
-# Claude Code through your Ultimate Proxy on :8082, tracked:
-#   cc() { ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:8082}" \
-#          ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-pass}" \
-#          wg_run claude -- rtk claude "$@"; }
-#
-# Codex, tracked:
-#   cx() { wg_run codex -- codex "$@"; }
-#
-# OpenCode, tracked:
-#   oc() { wg_run opencode -- opencode "$@"; }
-#
-# Hermes, Pi, Antigravity, Kilo, Ante: wrap the same way once you have set
-# their real resume flags in programs.json:
-#   hm() { wg_run hermes -- hermes "$@"; }
-#   pi() { wg_run pi -- pi "$@"; }
-# ---------------------------------------------------------------------------
-SHEOF
-
-python3 "$BIN_DIR/wsl-guard" init >/dev/null 2>&1 || true
-
-RC="$HOME/.zshrc"
-[ -f "$HOME/.zshrc" ] || RC="$HOME/.bashrc"
-touch "$RC"
-if ! grep -q 'wsl-guard/wsl-guard.sh' "$RC" 2>/dev/null; then
-  printf '\n# wsl-guard session recovery\nexport PATH="$HOME/.local/bin:$PATH"\nsource "$HOME/.config/wsl-guard/wsl-guard.sh"\n' >> "$RC"
-  echo "wired wsl-guard into $RC"
-fi
-
-echo ""
-echo "wsl-guard installed."
-echo "  binary : $BIN_DIR/wsl-guard"
-echo "  shell  : $CFG_DIR/wsl-guard.sh"
-echo "  config : $CFG_DIR/programs.json"
-echo ""
-echo "Open a new shell (or: source \"$RC\"), then wrap launchers with wg_run."
-echo "Verified resume flags: claude, codex. Confirm the rest in programs.json."
-echo "After a crash run:  wsl-guard restore    (preview: wsl-guard status)"
