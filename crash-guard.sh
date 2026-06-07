@@ -3,7 +3,7 @@
 # ver: 2.0.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
-# tags: [wsl2, shell-integration, zsh, bash, session-recovery, wezterm]
+# tags: [wsl2, shell-integration, zsh, bash, session-recovery, terminal]
 # ---
 # crash-guard shell integration. Sourced from ~/.zshrc (the installer wires this):
 #     source ~/.config/crash-guard/crash-guard.sh

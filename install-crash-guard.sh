@@ -4,7 +4,7 @@
 # ver: 2.0.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
-# tags: [wsl2, installer, session-recovery, wezterm, agentic-cli]
+# tags: [wsl2, installer, session-recovery, terminal, agentic-cli]
 # ---
 # Installer for crash-guard. Run from the repo (it copies the sibling files):
 #     bash install-crash-guard.sh
@@ -54,4 +54,4 @@ echo "  config : $CFG_DIR/programs.json"
 echo ""
 echo "Open a new shell (or: source \"$RC\"), then wrap launchers with cg_run."
 echo "Verified resume flags: claude, codex, opencode, hermes, pi. ante = relaunch (memory-based)."
-echo "After a crash, from any WezTerm tab run:  cgr    (preview: cgs)"
+echo "After a crash, from your terminal run:  cgr    (preview: cgs)"

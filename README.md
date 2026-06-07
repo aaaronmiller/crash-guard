@@ -3,36 +3,19 @@ date: 2026-06-02 00:00:00 PT
 ver: 2.0.0
 author: Ice-ninja
 model: claude-opus-4-8
-tags: [wsl2, session-recovery, wezterm, agentic-cli, crash-recovery, zsh]
+tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
 ---
 
 # crash-guard
 
-Restore every open agentic CLI / TUI session (claude, codex, opencode, hermes,
-pi, ante, ...) after a WSL2 crash. One command rebuilds them as **tabs in your
-current WezTerm window**, each `cd`'d back to its directory and reconnected
-through your proxy.
+Restore tracked agentic CLI / TUI sessions after a WSL2 crash. `crash-guard`
+records live sessions as small sentinel files, detects which ones survived from
+a previous boot, and restores them in the right working directory through your
+configured terminal.
 
-## How it works
-
-- **Filesystem is the state store.** No daemon, no socket, no manifest. While a
-  tool runs, a one-file sentinel exists under `~/.local/share/crash-guard/live/`.
-  `cg_run` writes it before launch and deletes it on clean exit. A crash kills
-  the shell before the delete, leaving the sentinel behind.
-- **Boot-epoch crash detection.** Each sentinel records the kernel `boot_id`.
-  After a reboot the current `boot_id` differs, so leftover sentinels are
-  unambiguously *crashed* (not merely a closed tab). PID checks only happen
-  within one boot, so recycled PIDs never cause a false "still running".
-- **CWD-first restore.** Tier 1 = `cd <dir> && <tool> --continue`. Tier 2
-  (resume by session id, resolved by mtime from the tool's own store) only
-  fires when several instances of one tool shared a directory.
-- **Artifact verify/repair.** A crash can leave a session file null-padded or
-  half-written. Restore verifies the target and (`--repair`) strips the bad
-  tail, backing up the original first, before resuming.
-- **Existing-window spawn.** Run `cgr` from any WezTerm tab; the window is found
-  via `WEZTERM_PANE` (native Linux/macOS) or, under WSL where that var is not
-  exported, via the mux's focused pane (`wezterm cli list-clients`), falling
-  back to the sole window. Every restored session opens as a new tab in it.
+Supported tools include Claude, Codex, opencode, Hermes, pi, Kilo, and ante.
+Restore commands keep the configured `rtk` prefix and captured proxy-routing
+environment so resumed sessions reconnect through the same proxy path.
 
 ## Install
 
@@ -40,58 +23,130 @@ through your proxy.
 bash install-crash-guard.sh && exec "$SHELL" -l
 ```
 
-Installs `~/.local/bin/crash-guard`, `~/.config/crash-guard/crash-guard.sh`,
-`~/.config/crash-guard/programs.json`, and sources the integration from
-`~/.zshrc` so it loads on every WSL shell start.
+The installer copies:
 
-## Daily use
+- `~/.local/bin/crash-guard`
+- `~/.config/crash-guard/crash-guard.sh`
+- `~/.config/crash-guard/programs.json`
 
-Launchers are wrapped so they self-register. Your aliases are unchanged in
-behavior, just tracked:
+It also adds one source line to `~/.zshrc` or `~/.bashrc` if the integration is
+not already loaded.
+
+## Daily Use
+
+Launchers are wrapped with `cg_run`, so normal interactive use stays the same
+while crash-guard tracks active sessions.
 
 | start | continue | tool |
 |-------|----------|------|
-| `cc`  | `ccc`    | claude |
-| `oc`  | `occ`    | opencode |
-| `hsi` | `hsr`    | hermes |
-| `psi` | `psi-c`  | pi |
-| `codex-run` | `codex-res` | codex |
-| `an`  | `anc`    | ante (memory-based; `anc` == `an`) |
+| `cc` | `ccc` | Claude |
+| `oc` | `occ` | opencode |
+| `hsi` | `hsr` | Hermes |
+| `psi` | `psi-c` | pi |
+| `codex-run` | `codex-res` | Codex |
+| custom | custom | Kilo |
+| `an` | `anc` | ante |
 
-Run as many as you like, including several `cc` in one repo — each gets its own
-sentinel.
-
-After a crash, open one WezTerm tab and run:
+After a crash or WSL restart:
 
 ```bash
-cgr            # crash-guard restore: prints the plan, asks once, rebuilds tabs
-cgs            # crash-guard status: running / stale / restorable
+cgs
+cgr
 ```
 
-Useful flags:
+`cgs` previews tracked sessions. `cgr` prints the restore plan, asks once, and
+opens each selected session through the detected terminal backend.
+
+Useful restore flags:
 
 ```bash
-crash-guard restore --dry-run        # plan only, spawn nothing
-crash-guard restore --select         # pick 1,3-5
-crash-guard restore --repair         # fix crash-truncated session files
-crash-guard restore --no-spawn       # print the cd && resume commands instead
-crash-guard restore --include-stale  # also restore same-boot stale sentinels
+crash-guard restore --dry-run
+crash-guard restore --select
+crash-guard restore --repair
+crash-guard restore --no-spawn
+crash-guard restore --include-stale
+crash-guard restore --terminal ghostty
+```
+
+`--terminal` accepts `auto`, `tmux`, `wezterm`, `kitty`, `ghostty`, `wt`, or
+`windows-terminal`.
+
+## Terminal Backends
+
+`terminal.backend` defaults to `auto`. Auto-detection prefers the multiplexer or
+terminal that launched restore, then falls back through the configured order.
+
+| backend | spawn behavior | notes |
+|---------|----------------|-------|
+| `tmux` | new tmux windows | Requires running `restore` inside tmux. Works inside common terminal emulators. |
+| `wezterm` | new tabs in the current/sole WezTerm window when resolvable, otherwise a new window | Uses `WEZTERM_PANE` or `wezterm cli list-clients` for WSL-aware mux lookup. |
+| `kitty` | new tabs via Kitty remote control | Falls back to a new Kitty OS window if remote control launch fails. |
+| `ghostty` | new Ghostty windows | Ghostty Linux exposes `+new-window`; crash-guard does not assume a stable current-window tab CLI. |
+| `windows-terminal` | new Windows Terminal tabs | Uses `wt.exe` and re-enters the current WSL distro with `wsl.exe --cd <cwd> --exec ...`. |
+
+Force a backend when auto-detection is not what you want:
+
+```bash
+crash-guard restore --terminal tmux
+crash-guard restore --terminal ghostty
+crash-guard restore --terminal windows-terminal
 ```
 
 ## Config
 
-`~/.config/crash-guard/programs.json` — per-tool `continue` / `resume_by_id`
-commands (with your `rtk` prefix + flags), session-store locations, the env
-patterns captured per launch, and a `restore.pre` hook that runs
-`_proxy_stack_auto_start` before reconnecting.
+`~/.config/crash-guard/programs.json` controls terminal selection, per-tool
+restore commands, session-store locations, captured environment patterns, and
+the restore pre-hook.
 
-## Notes
+Default terminal config:
 
-- Resume flags verified 2026-06: claude (`-c` / `-r <id>`), codex
-  (`resume --last` / `resume <id>`), opencode (`-c` / `-s <id>`), hermes
-  (`--continue` / `--resume <id>`), pi (`-c` / `--session <id>`).
-- ante (`@earendil-works`/extensible runtime) has **no** session-resume flag —
-  `ante repl` auto-injects memory context, so restore just relaunches in the
+```json
+"terminal": {
+  "backend": "auto",
+  "order": ["tmux", "wezterm", "kitty", "ghostty", "windows-terminal"]
+}
+```
+
+Per-terminal CLI overrides:
+
+```json
+"tmux": {"cli": ""},
+"wezterm": {"cli": "", "domain": ""},
+"kitty": {"cli": ""},
+"ghostty": {"cli": ""},
+"windows_terminal": {"cli": "", "wsl": ""}
+```
+
+`restore.pre` defaults to starting the local proxy stack when your shell defines
+`_proxy_stack_auto_start`.
+
+## How It Works
+
+- `cg_run` writes one sentinel under `~/.local/share/crash-guard/live/` before
+  launching a tracked TUI and removes it after clean exit.
+- Each sentinel records the current kernel `boot_id`. After a WSL restart,
+  old sentinels have a different boot id and are classified as crashed.
+- Restore is CWD-first: it runs the configured continue command in the recorded
   directory.
-- Exact multi-same-directory restore is precise for claude, best-effort for
-  codex; everything else degrades to CWD-first continue with a clear note.
+- Wrapper-launched sentinels are normalized at restore time. For example, a
+  sentinel recorded as `rtk` with argv `claude ...` restores through the Claude
+  config instead of being skipped as an unknown `rtk` program.
+- If several instances of the same tool ran in the same directory, restore can
+  resolve session ids from supported tool stores and use `resume_by_id`.
+- `--repair` can truncate null-padded or partial session artifacts after making
+  a backup in `~/.local/share/crash-guard/archive/`.
+
+## Tool Notes
+
+- Resume flags verified 2026-06: Claude (`-c` / `-r <id>`), Codex
+  (`resume --last` / `resume <id>`), opencode (`-c` / `-s <id>`), Hermes
+  (`--continue` / `--resume <id>`), pi (`-c` / `--session <id>`), Kilo (`-c`).
+- ante has no session-resume flag; restore relaunches `ante repl` in the
+  recorded directory and relies on ante memory injection.
+- Exact multi-instance restore is precise for Claude and best-effort for Codex.
+  Other tools degrade to CWD-first continue with a visible note.
+
+## Repository
+
+This project is licensed under the MIT License. Runtime state and local config
+live under XDG config/data directories, not in the repository.

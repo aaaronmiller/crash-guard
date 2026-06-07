@@ -4,7 +4,7 @@
 # ver: 2.0.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
-# tags: [wsl2, session-recovery, wezterm, agentic-cli, crash-recovery, python]
+# tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, python]
 # ---
 # crash-guard: restore agentic CLI/TUI sessions after a WSL2 crash.
 #
@@ -24,9 +24,8 @@
 #     own on-disk store, not raced at launch time.
 #   * Restore verifies (and optionally repairs) the target session artifact
 #     before resuming, because a crash can leave it truncated or null-padded.
-#   * Restore spawns each session as its own WezTerm TAB in the EXISTING window
-#     (the one you run `crash-guard restore` from, found via WEZTERM_PANE).
-#     If not launched from inside WezTerm, it falls back to a new window.
+#   * Restore spawns each session through the detected terminal backend:
+#     tmux windows, WezTerm/kitty/Windows Terminal tabs, or Ghostty windows.
 #
 # Pure standard library. No third-party packages.
 
@@ -81,7 +80,15 @@ DEFAULT_RESTORE_PRE = (
 # compression chain. The proxy ENV (ANTHROPIC_BASE_URL, OPENAI_BASE_URL, ...)
 # is captured per-session at launch and replayed from the sentinel on restore.
 DEFAULT_CONFIG = {
+    "terminal": {
+        "backend": "auto",
+        "order": ["tmux", "wezterm", "kitty", "ghostty", "windows-terminal"],
+    },
     "wezterm": {"cli": "", "domain": ""},
+    "ghostty": {"cli": ""},
+    "kitty": {"cli": ""},
+    "tmux": {"cli": ""},
+    "windows_terminal": {"cli": "", "wsl": ""},
     "env_patterns": DEFAULT_ENV_PATTERNS,
     "restore": {"pre": DEFAULT_RESTORE_PRE},
     "programs": {
@@ -110,6 +117,10 @@ DEFAULT_CONFIG = {
             "continue": ["rtk", "codex", "resume", "--last"],
             "resume_by_id": ["rtk", "codex", "resume", "{id}"],
             "store": {"type": "codex", "root": "~/.codex/sessions"},
+            "interactive": True,
+        },
+        "kilo": {
+            "continue": ["rtk", "kilo", "-c"],
             "interactive": True,
         },
         # ante repl is memory-based: a fresh launch auto-injects prior context.
@@ -147,9 +158,16 @@ def load_config():
             cfg = {}
     else:
         cfg = {}
-    cfg.setdefault("programs", DEFAULT_CONFIG["programs"])
+    programs = cfg.setdefault("programs", {})
+    for key, prog in DEFAULT_CONFIG["programs"].items():
+        programs.setdefault(key, prog)
     cfg.setdefault("env_patterns", DEFAULT_ENV_PATTERNS)
+    cfg.setdefault("terminal", DEFAULT_CONFIG["terminal"])
     cfg.setdefault("wezterm", {})
+    cfg.setdefault("ghostty", {})
+    cfg.setdefault("kitty", {})
+    cfg.setdefault("tmux", {})
+    cfg.setdefault("windows_terminal", {})
     cfg.setdefault("restore", {"pre": DEFAULT_RESTORE_PRE})
     cfg["restore"].setdefault("pre", DEFAULT_RESTORE_PRE)
     return cfg
@@ -384,11 +402,47 @@ def verify_artifact(path, repair=False):
 # restore planning
 # --------------------------------------------------------------------------
 
+def argv_program_key(argv, programs):
+    """Infer the configured program from a recorded command argv."""
+    names = [Path(a).name for a in (argv or []) if a]
+    for name in names[:3]:
+        prog = programs.get(name)
+        if prog and not prog.get("use_sentinel_argv"):
+            return name
+    return None
+
+
+def resolve_record_program(r, cfg):
+    """Return (plan_key, note) for a sentinel record.
+
+    Some launchers record a wrapper key such as `rtk` while storing the actual
+    tool in argv. Prefer the concrete tool config when it can be inferred.
+    """
+    programs = cfg["programs"]
+    key = r.get("key")
+    prog = programs.get(key)
+    inferred = argv_program_key(r.get("argv") or [], programs)
+    if inferred and (not prog or prog.get("use_sentinel_argv")):
+        if key and key != inferred:
+            return inferred, "recorded as '%s'; inferred from argv" % key
+        return inferred, ""
+    return key, ""
+
+
+def sentinel_restore_argv(r, key):
+    argv = list(r.get("argv") or [])
+    if key and (not argv or Path(argv[0]).name != key):
+        return [key] + argv
+    return argv
+
+
 def build_plan(crashed, cfg, repair=False):
     """Group crashed sentinels by (key, cwd) and resolve resume commands."""
     groups = {}
     for r in crashed:
-        groups.setdefault((r.get("key"), r.get("cwd")), []).append(r)
+        key, infer_note = resolve_record_program(r, cfg)
+        r["_plan_note"] = infer_note
+        groups.setdefault((key, r.get("cwd")), []).append(r)
 
     plan = []
     for (key, cwd), recs in groups.items():
@@ -396,9 +450,22 @@ def build_plan(crashed, cfg, repair=False):
         n = len(recs)
         if not prog:
             for r in recs:
+                note = "no config entry for '%s'" % key
+                if r.get("_plan_note"):
+                    note = "%s; %s" % (r["_plan_note"], note)
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "skip",
-                    "argv": None, "note": "no config entry for '%s'" % key,
+                    "argv": None, "note": note,
+                    "env": r.get("env", {}),
+                })
+            continue
+
+        if prog.get("use_sentinel_argv"):
+            for r in recs:
+                note = r.get("_plan_note") or "using recorded argv"
+                plan.append({
+                    "key": key, "cwd": cwd, "rec": r, "tier": "recorded",
+                    "argv": sentinel_restore_argv(r, key), "note": note,
                     "env": r.get("env", {}),
                 })
             continue
@@ -423,21 +490,209 @@ def build_plan(crashed, cfg, repair=False):
                     })
                     continue
                 # fall through to continue with a degradation note
+                note = "session %s %s; using continue" % (sid[:8], status)
+                if r.get("_plan_note"):
+                    note = "%s; %s" % (r["_plan_note"], note)
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "continue",
                     "argv": prog["continue"], "verify": status,
-                    "note": "session %s %s; using continue" % (sid[:8], status),
+                    "note": note,
                     "env": env,
                 })
             else:
-                note = ""
+                note = r.get("_plan_note") or ""
                 if n > 1 and i > 0:
-                    note = "multiple in same dir, no distinct id; may collapse"
+                    extra = "multiple in same dir, no distinct id; may collapse"
+                    note = "%s; %s" % (note, extra) if note else extra
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "continue",
                     "argv": prog["continue"], "note": note, "env": env,
                 })
     return plan
+
+
+# --------------------------------------------------------------------------
+# terminal spawning
+# --------------------------------------------------------------------------
+
+def _which_configured(cfg, section, key, candidates):
+    explicit = (cfg.get(section) or {}).get(key)
+    if explicit:
+        return explicit
+    for cand in candidates:
+        found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
+def _env_is(name):
+    return (os.environ.get("TERM_PROGRAM") or "").lower() == name.lower()
+
+
+def terminal_title(item):
+    base = os.path.basename(item["cwd"].rstrip("/")) or "/"
+    return "%s @ %s" % (item["key"], base)
+
+
+def resolve_terminal_backend(cfg, requested="auto"):
+    """Return (backend, cli, note) for the terminal used by restore."""
+    requested = requested or "auto"
+    aliases = {
+        "windows_terminal": "windows-terminal",
+        "wt": "windows-terminal",
+    }
+    requested = aliases.get(requested, requested)
+
+    def cli_for(backend):
+        if backend == "tmux":
+            return _which_configured(cfg, "tmux", "cli", ("tmux",))
+        if backend == "wezterm":
+            return wez_cli(cfg)
+        if backend == "kitty":
+            return _which_configured(cfg, "kitty", "cli", ("kitty",))
+        if backend == "ghostty":
+            return _which_configured(cfg, "ghostty", "cli", ("ghostty",))
+        if backend == "windows-terminal":
+            return _which_configured(cfg, "windows_terminal", "cli", ("wt.exe", "wt"))
+        return None
+
+    if requested != "auto":
+        cli = cli_for(requested)
+        if cli:
+            return requested, cli, "configured"
+        return None, None, "no CLI found for terminal backend '%s'" % requested
+
+    # Prefer the terminal/multiplexer we are actually inside. tmux wins because
+    # it works uniformly inside Ghostty, Windows Terminal, kitty, and WezTerm.
+    current = []
+    if os.environ.get("TMUX"):
+        current.append("tmux")
+    if os.environ.get("WEZTERM_PANE") or _env_is("WezTerm"):
+        current.append("wezterm")
+    if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
+        current.append("kitty")
+    if _env_is("ghostty"):
+        current.append("ghostty")
+    if os.environ.get("WT_SESSION"):
+        current.append("windows-terminal")
+
+    order = (cfg.get("terminal") or {}).get("order") or DEFAULT_CONFIG["terminal"]["order"]
+    for backend in current + [b for b in order if b not in current]:
+        cli = cli_for(backend)
+        if cli:
+            return backend, cli, "auto"
+    return None, None, "no supported terminal CLI found"
+
+
+def spawn_terminal_prepare(cfg, backend, cli):
+    if backend == "wezterm":
+        domain = wez_domain(cfg)
+        window_id = wez_current_window(cli)
+        if window_id is not None:
+            return {"domain": domain, "window_id": window_id, "label": "WezTerm tabs in window %s" % window_id}
+        return {"domain": domain, "window_id": None, "label": "WezTerm new window"}
+    if backend == "tmux":
+        if not os.environ.get("TMUX"):
+            return {"error": "tmux backend requires running restore from inside tmux"}
+        return {"label": "tmux windows"}
+    if backend == "kitty":
+        return {"label": "kitty tabs"}
+    if backend == "ghostty":
+        return {"label": "Ghostty windows"}
+    if backend == "windows-terminal":
+        wsl = _which_configured(cfg, "windows_terminal", "wsl", ("wsl.exe", "wsl"))
+        if not wsl:
+            return {"error": "windows-terminal backend requires wsl.exe/wsl on PATH"}
+        return {"wsl": wsl, "label": "Windows Terminal tabs"}
+    return {"error": "unsupported terminal backend '%s'" % backend}
+
+
+def spawn_terminal(cfg, backend, cli, ctx, item, inner):
+    title = terminal_title(item)
+    if backend == "wezterm":
+        pane, err = wez_spawn(cli, ctx["domain"], inner, window_id=ctx["window_id"])
+        if pane is None:
+            return None, err
+        if ctx["window_id"] is None:
+            ctx["window_id"] = wez_window_for_pane(cli, pane)
+        wez_set_title(cli, pane, title)
+        return "pane %s" % pane, None
+    if backend == "tmux":
+        return tmux_spawn(cli, item["cwd"], title, inner)
+    if backend == "kitty":
+        return kitty_spawn(cli, item["cwd"], title, inner)
+    if backend == "ghostty":
+        return ghostty_spawn(cli, item["cwd"], title, inner)
+    if backend == "windows-terminal":
+        return wt_spawn(cli, ctx["wsl"], item["cwd"], title, inner)
+    return None, "unsupported terminal backend '%s'" % backend
+
+
+def tmux_spawn(cli, cwd, title, inner):
+    argv = [cli, "new-window", "-P", "-F", "#{window_id}", "-n", title, "-c", cwd] + inner
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None, res.stderr.strip()
+    return res.stdout.strip() or "tmux window", None
+
+
+def kitty_spawn(cli, cwd, title, inner):
+    argv = [
+        cli, "@", "launch",
+        "--type=tab",
+        "--tab-title", title,
+        "--cwd", cwd,
+    ] + inner
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode == 0:
+        return res.stdout.strip() or "kitty tab", None
+
+    fallback = [cli, "--directory", cwd, "--title", title] + inner
+    try:
+        proc = subprocess.Popen(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return None, "%s; fallback failed: %s" % (res.stderr.strip(), e)
+    return "kitty pid %s" % proc.pid, None
+
+
+def ghostty_spawn(cli, cwd, title, inner):
+    argv = [
+        cli, "+new-window",
+        "--working-directory=%s" % cwd,
+        "--title=%s" % title,
+        "-e",
+    ] + inner
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode == 0:
+        return res.stdout.strip() or "ghostty window", None
+
+    # Older or platform-specific Ghostty builds may not support +new-window.
+    # Plain ghostty -e still creates a surface and returns immediately via Popen.
+    fallback = [
+        cli,
+        "--working-directory=%s" % cwd,
+        "--title=%s" % title,
+        "-e",
+    ] + inner
+    try:
+        proc = subprocess.Popen(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return None, "%s; fallback failed: %s" % (res.stderr.strip(), e)
+    return "ghostty pid %s" % proc.pid, None
+
+
+def wt_spawn(cli, wsl, cwd, title, inner):
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    wsl_argv = [wsl]
+    if distro:
+        wsl_argv += ["-d", distro]
+    wsl_argv += ["--cd", cwd, "--exec"] + inner
+    argv = [cli, "-w", "0", "new-tab", "--title", title] + wsl_argv
+    res = subprocess.run(argv, capture_output=True, text=True)
+    if res.returncode != 0:
+        return None, res.stderr.strip()
+    return "wt tab", None
 
 
 # --------------------------------------------------------------------------
@@ -724,20 +979,17 @@ def cmd_restore(args):
             archive_sentinel(item["rec"])
         return 0
 
-    cli = wez_cli(cfg)
+    backend, cli, note = resolve_terminal_backend(cfg, args.terminal or (cfg.get("terminal") or {}).get("backend", "auto"))
     if not cli:
         sys.stderr.write(
-            "crash-guard: no wezterm CLI found (looked for wezterm.exe and wezterm).\n"
-            "Set wezterm.cli in %s, or run with --no-spawn.\n" % CFG_FILE)
+            "crash-guard: %s.\n"
+            "Set terminal.backend or a per-terminal cli in %s, or run with --no-spawn.\n" % (note, CFG_FILE))
         return 2
-    domain = wez_domain(cfg)
-
-    # Spawn into the EXISTING window (focused pane's window under WSL).
-    window_id = wez_current_window(cli)
-    if window_id is not None:
-        print("  -> spawning tabs into existing window %s\n" % window_id)
-    else:
-        print("  -> could not resolve current window; opening a new one\n")
+    ctx = spawn_terminal_prepare(cfg, backend, cli)
+    if ctx.get("error"):
+        sys.stderr.write("crash-guard: %s.\n" % ctx["error"])
+        return 2
+    print("  -> terminal backend: %s (%s)\n" % (backend, ctx["label"]))
 
     ok = 0
     for item in selected:
@@ -745,15 +997,11 @@ def cmd_restore(args):
             print("  skip %s (%s)" % (item["key"], item.get("note", "")))
             continue
         inner = build_inner(item, cfg)
-        pane, err = wez_spawn(cli, domain, inner, window_id=window_id)
-        if pane is None:
+        spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
+        if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             continue
-        if window_id is None:
-            window_id = wez_window_for_pane(cli, pane)
-        title = "%s @ %s" % (item["key"], os.path.basename(item["cwd"].rstrip("/")) or "/")
-        wez_set_title(cli, pane, title)
-        print("  ok   %s @ %s  (pane %s)" % (item["key"], item["cwd"], pane))
+        print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
         archive_sentinel(item["rec"])
         ok += 1
 
@@ -827,6 +1075,9 @@ def main():
     s.add_argument("--select", action="store_true")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-spawn", action="store_true")
+    s.add_argument("--terminal", default=None,
+                   choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
+                   help="terminal backend for spawning restored sessions")
     s.add_argument("--repair", action="store_true",
                    help="truncate null/partial tails in session files (backs up first)")
     s.add_argument("--include-stale", action="store_true")
