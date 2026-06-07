@@ -10,7 +10,9 @@
 
 ### Changed
 - Reworked README structure around install, restore workflow, terminal backends, config, and limitations.
+- Changed Ghostty restore behavior to use tmux windows in the current Ghostty tab instead of opening Ghostty OS windows.
 
 ### Fixed
 - Fixed restore planning for wrapper-keyed sentinels such as `rtk` by inferring the concrete tool from recorded argv.
 - Fixed default config merging so existing user configs receive new built-in program entries without overwriting local entries.
+- Added `restore --from-archive` so sentinels archived by a failed restore can be recovered.

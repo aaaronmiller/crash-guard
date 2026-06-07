@@ -65,6 +65,7 @@ crash-guard restore --select
 crash-guard restore --repair
 crash-guard restore --no-spawn
 crash-guard restore --include-stale
+crash-guard restore --from-archive
 crash-guard restore --terminal ghostty
 ```
 
@@ -81,7 +82,7 @@ terminal that launched restore, then falls back through the configured order.
 | `tmux` | new tmux windows | Requires running `restore` inside tmux. Works inside common terminal emulators. |
 | `wezterm` | new tabs in the current/sole WezTerm window when resolvable, otherwise a new window | Uses `WEZTERM_PANE` or `wezterm cli list-clients` for WSL-aware mux lookup. |
 | `kitty` | new tabs via Kitty remote control | Falls back to a new Kitty OS window if remote control launch fails. |
-| `ghostty` | new Ghostty windows | Ghostty Linux exposes `+new-window`; crash-guard does not assume a stable current-window tab CLI. |
+| `ghostty` | tmux windows in the current Ghostty tab | Ghostty has a `new_tab` keybind action but no `+new-tab` CLI action in current Linux builds, so crash-guard uses tmux instead of spawning Ghostty windows. |
 | `windows-terminal` | new Windows Terminal tabs | Uses `wt.exe` and re-enters the current WSL distro with `wsl.exe --cd <cwd> --exec ...`. |
 
 Force a backend when auto-detection is not what you want:
@@ -90,6 +91,13 @@ Force a backend when auto-detection is not what you want:
 crash-guard restore --terminal tmux
 crash-guard restore --terminal ghostty
 crash-guard restore --terminal windows-terminal
+```
+
+If a previous restore attempt archived sentinels before the sessions were
+actually usable, recover them with:
+
+```bash
+crash-guard restore --from-archive --terminal ghostty
 ```
 
 ## Config
@@ -103,7 +111,7 @@ Default terminal config:
 ```json
 "terminal": {
   "backend": "auto",
-  "order": ["tmux", "wezterm", "kitty", "ghostty", "windows-terminal"]
+  "order": ["tmux", "wezterm", "kitty", "windows-terminal"]
 }
 ```
 
@@ -131,6 +139,8 @@ Per-terminal CLI overrides:
 - Wrapper-launched sentinels are normalized at restore time. For example, a
   sentinel recorded as `rtk` with argv `claude ...` restores through the Claude
   config instead of being skipped as an unknown `rtk` program.
+- `--from-archive` restores sentinel records that were already moved to
+  `~/.local/share/crash-guard/archive/`.
 - If several instances of the same tool ran in the same directory, restore can
   resolve session ids from supported tool stores and use `resume_by_id`.
 - `--repair` can truncate null-padded or partial session artifacts after making

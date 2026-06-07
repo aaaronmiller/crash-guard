@@ -82,7 +82,7 @@ DEFAULT_RESTORE_PRE = (
 DEFAULT_CONFIG = {
     "terminal": {
         "backend": "auto",
-        "order": ["tmux", "wezterm", "kitty", "ghostty", "windows-terminal"],
+        "order": ["tmux", "wezterm", "kitty", "windows-terminal"],
     },
     "wezterm": {"cli": "", "domain": ""},
     "ghostty": {"cli": ""},
@@ -281,6 +281,20 @@ def read_sentinels():
             out.append(rec)
         except Exception:
             sys.stderr.write("crash-guard: skipping unreadable sentinel %s\n" % p)
+    return out
+
+
+def read_archived_sentinels():
+    out = []
+    if not ARCH_DIR.exists():
+        return out
+    for p in sorted(ARCH_DIR.glob("*.json")):
+        try:
+            rec = json.loads(p.read_text())
+            rec["_path"] = str(p)
+            out.append(rec)
+        except Exception:
+            sys.stderr.write("crash-guard: skipping unreadable archive %s\n" % p)
     return out
 
 
@@ -535,10 +549,15 @@ def terminal_title(item):
     return "%s @ %s" % (item["key"], base)
 
 
+def shell_join(argv):
+    return " ".join(shlex.quote(a) for a in argv)
+
+
 def resolve_terminal_backend(cfg, requested="auto"):
     """Return (backend, cli, note) for the terminal used by restore."""
     requested = requested or "auto"
     aliases = {
+        "ghostty": "tmux",
         "windows_terminal": "windows-terminal",
         "wt": "windows-terminal",
     }
@@ -573,7 +592,7 @@ def resolve_terminal_backend(cfg, requested="auto"):
     if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
         current.append("kitty")
     if _env_is("ghostty"):
-        current.append("ghostty")
+        current.append("tmux")
     if os.environ.get("WT_SESSION"):
         current.append("windows-terminal")
 
@@ -593,9 +612,16 @@ def spawn_terminal_prepare(cfg, backend, cli):
             return {"domain": domain, "window_id": window_id, "label": "WezTerm tabs in window %s" % window_id}
         return {"domain": domain, "window_id": None, "label": "WezTerm new window"}
     if backend == "tmux":
-        if not os.environ.get("TMUX"):
-            return {"error": "tmux backend requires running restore from inside tmux"}
-        return {"label": "tmux windows"}
+        if os.environ.get("TMUX"):
+            return {"inside": True, "label": "tmux windows in current session"}
+        name = "crash-guard-%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), os.getpid())
+        return {
+            "inside": False,
+            "session": name,
+            "session_started": False,
+            "attach_after": True,
+            "label": "new tmux session %s" % name,
+        }
     if backend == "kitty":
         return {"label": "kitty tabs"}
     if backend == "ghostty":
@@ -619,7 +645,7 @@ def spawn_terminal(cfg, backend, cli, ctx, item, inner):
         wez_set_title(cli, pane, title)
         return "pane %s" % pane, None
     if backend == "tmux":
-        return tmux_spawn(cli, item["cwd"], title, inner)
+        return tmux_spawn(cli, ctx, item["cwd"], title, inner)
     if backend == "kitty":
         return kitty_spawn(cli, item["cwd"], title, inner)
     if backend == "ghostty":
@@ -629,12 +655,28 @@ def spawn_terminal(cfg, backend, cli, ctx, item, inner):
     return None, "unsupported terminal backend '%s'" % backend
 
 
-def tmux_spawn(cli, cwd, title, inner):
-    argv = [cli, "new-window", "-P", "-F", "#{window_id}", "-n", title, "-c", cwd] + inner
+def tmux_spawn(cli, ctx, cwd, title, inner):
+    command = shell_join(inner)
+    if ctx.get("inside"):
+        argv = [cli, "new-window", "-P", "-F", "#{window_id}", "-n", title, "-c", cwd, command]
+    elif not ctx.get("session_started"):
+        argv = [cli, "new-session", "-d", "-P", "-F", "#{session_name}:#{window_id}",
+                "-s", ctx["session"], "-n", title, "-c", cwd, command]
+        ctx["session_started"] = True
+    else:
+        argv = [cli, "new-window", "-P", "-F", "#{session_name}:#{window_id}",
+                "-t", ctx["session"], "-n", title, "-c", cwd, command]
     res = subprocess.run(argv, capture_output=True, text=True)
     if res.returncode != 0:
         return None, res.stderr.strip()
     return res.stdout.strip() or "tmux window", None
+
+
+def tmux_attach(cli, ctx):
+    if not ctx.get("attach_after") or not ctx.get("session_started"):
+        return 0
+    print("  -> attaching current terminal to tmux session %s" % ctx["session"])
+    return subprocess.run([cli, "attach-session", "-t", ctx["session"]]).returncode
 
 
 def kitty_spawn(cli, cwd, title, inner):
@@ -928,14 +970,17 @@ def cmd_restore(args):
     ensure_dirs()
     cfg = load_config()
     cur = boot_id()
-    recs = read_sentinels()
-    _, stale, crashed = classify(recs, cur)
-
-    targets = list(crashed)
-    if args.include_stale:
-        targets += stale
+    if args.from_archive:
+        targets = read_archived_sentinels()
+    else:
+        recs = read_sentinels()
+        _, stale, crashed = classify(recs, cur)
+        targets = list(crashed)
+        if args.include_stale:
+            targets += stale
     if not targets:
-        print("crash-guard: no crashed sessions to restore.")
+        msg = "no archived sessions to restore" if args.from_archive else "no crashed sessions to restore"
+        print("crash-guard: %s." % msg)
         return 0
 
     plan = build_plan(targets, cfg, repair=args.repair)
@@ -1006,6 +1051,10 @@ def cmd_restore(args):
         ok += 1
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
+    if backend == "tmux" and ok:
+        attach_rc = tmux_attach(cli, ctx)
+        if attach_rc != 0:
+            return attach_rc
     return 0
 
 
@@ -1081,6 +1130,8 @@ def main():
     s.add_argument("--repair", action="store_true",
                    help="truncate null/partial tails in session files (backs up first)")
     s.add_argument("--include-stale", action="store_true")
+    s.add_argument("--from-archive", action="store_true",
+                   help="restore previously archived sentinel records")
     s.set_defaults(func=cmd_restore)
 
     s = sub.add_parser("init")
