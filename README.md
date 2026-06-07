@@ -52,10 +52,13 @@ After a crash or WSL restart:
 ```bash
 cgs
 cgr
+cgr-archive
 ```
 
 `cgs` previews tracked sessions. `cgr` prints the restore plan, asks once, and
 opens each selected session through the detected terminal backend.
+`cgr-archive` retries sessions that were already moved to the archive by a
+previous failed restore.
 
 Useful restore flags:
 
@@ -79,10 +82,10 @@ terminal that launched restore, then falls back through the configured order.
 
 | backend | spawn behavior | notes |
 |---------|----------------|-------|
-| `tmux` | new tmux windows | Requires running `restore` inside tmux. Works inside common terminal emulators. |
+| `tmux` | new tmux windows | A tmux window is tmux's tab equivalent: one full-screen active workspace, not a split pane. |
 | `wezterm` | new tabs in the current/sole WezTerm window when resolvable, otherwise a new window | Uses `WEZTERM_PANE` or `wezterm cli list-clients` for WSL-aware mux lookup. |
 | `kitty` | new tabs via Kitty remote control | Falls back to a new Kitty OS window if remote control launch fails. |
-| `ghostty` | tmux windows in the current Ghostty tab | Ghostty has a `new_tab` keybind action but no `+new-tab` CLI action in current Linux builds, so crash-guard uses tmux instead of spawning Ghostty windows. |
+| `ghostty` | tmux windows in the current Ghostty tab | Ghostty has a `new_tab` keybind action but no `+new-tab` CLI action in current Linux builds, so crash-guard uses tmux windows instead of spawning Ghostty OS windows. |
 | `windows-terminal` | new Windows Terminal tabs | Uses `wt.exe` and re-enters the current WSL distro with `wsl.exe --cd <cwd> --exec ...`. |
 
 Force a backend when auto-detection is not what you want:
@@ -99,6 +102,9 @@ actually usable, recover them with:
 ```bash
 crash-guard restore --from-archive --terminal ghostty
 ```
+
+This creates tmux windows, not panes. You get one restored session per tmux
+window, each using the full terminal while active.
 
 ## Config
 
