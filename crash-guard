@@ -30,6 +30,7 @@
 # Pure standard library. No third-party packages.
 
 import argparse
+import datetime as dt
 import fnmatch
 import json
 import os
@@ -48,6 +49,8 @@ CFG_FILE = CFG_DIR / "programs.json"
 DATA_DIR = XDG_DATA / "crash-guard"
 LIVE_DIR = DATA_DIR / "live"
 ARCH_DIR = DATA_DIR / "archive"
+HISTORY_FILE = DATA_DIR / "history.jsonl"
+EXCISE_PHRASE = "Jettison the ghosts"
 
 # SECURITY: the sentinel is plaintext on disk and its env is replayed via
 # `export` in the restore payload (visible in `ps`). So we capture ONLY the
@@ -217,6 +220,36 @@ def atomic_write(path, text):
     os.replace(str(tmp), str(path))
 
 
+def append_history(event, rec=None, **extra):
+    """Append one durable history event. Best-effort, never blocks launchers."""
+    try:
+        ensure_dirs()
+        payload = {
+            "event": event,
+            "at": now_iso(),
+        }
+        if rec is not None:
+            payload["record"] = {k: v for k, v in rec.items() if k != "_path"}
+        payload.update(extra)
+        with HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception as e:
+        sys.stderr.write("crash-guard history: %s\n" % e)
+
+
+def parse_time(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return None
+
+
+def iso_from_ts(ts):
+    return dt.datetime.fromtimestamp(ts, dt.datetime.now().astimezone().tzinfo).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
 def pid_alive(pid):
     if not pid or pid <= 0:
         return False
@@ -251,6 +284,7 @@ def cmd_start(args):
             "host": os.uname().nodename,
         }
         atomic_write(LIVE_DIR / (args.inv_id + ".json"), json.dumps(rec) + "\n")
+        append_history("start", rec)
     except Exception as e:
         sys.stderr.write("crash-guard start: %s\n" % e)
     return 0
@@ -260,6 +294,11 @@ def cmd_stop(args):
     try:
         p = LIVE_DIR / (args.inv_id + ".json")
         if p.exists():
+            try:
+                rec = json.loads(p.read_text())
+            except Exception:
+                rec = {"inv_id": args.inv_id}
+            append_history("stop", rec, reason="closed")
             p.unlink()
     except Exception as e:
         sys.stderr.write("crash-guard stop: %s\n" % e)
@@ -292,9 +331,34 @@ def read_archived_sentinels():
         try:
             rec = json.loads(p.read_text())
             rec["_path"] = str(p)
+            parts = p.name.split(".")
+            archive_at = None
+            if len(parts) >= 3:
+                try:
+                    parsed = dt.datetime.strptime(parts[-2], "%Y%m%d-%H%M%S")
+                    archive_at = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo).strftime("%Y-%m-%dT%H:%M:%S%z")
+                except Exception:
+                    archive_at = None
+            rec["_archive_at"] = archive_at or iso_from_ts(p.stat().st_mtime)
             out.append(rec)
         except Exception:
             sys.stderr.write("crash-guard: skipping unreadable archive %s\n" % p)
+    return out
+
+
+def read_history_events():
+    out = []
+    if not HISTORY_FILE.exists():
+        return out
+    with HISTORY_FILE.open("r", encoding="utf-8", errors="replace") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                sys.stderr.write("crash-guard: skipping bad history line %d\n" % lineno)
     return out
 
 
@@ -308,6 +372,130 @@ def classify(records, cur_boot):
         else:
             stale.append(r)
     return running, stale, crashed
+
+
+def history_sessions():
+    sessions = {}
+    for ev in read_history_events():
+        rec = ev.get("record") or {}
+        inv_id = rec.get("inv_id")
+        if not inv_id:
+            continue
+        cur = sessions.setdefault(inv_id, {"record": rec, "events": []})
+        cur["record"].update({k: v for k, v in rec.items() if k != "_path"})
+        cur["events"].append(ev)
+        if ev.get("event") == "start":
+            cur["started_at"] = rec.get("launched_at") or ev.get("at")
+            cur["status"] = "running"
+            cur["reason"] = "started"
+        elif ev.get("event") == "stop":
+            cur["ended_at"] = ev.get("at")
+            cur["status"] = "closed"
+            cur["reason"] = ev.get("reason") or "closed"
+        elif ev.get("event") == "archive":
+            cur["ended_at"] = ev.get("at")
+            cur["status"] = ev.get("reason") or "archived"
+            cur["reason"] = ev.get("reason") or "archived"
+            if ev.get("archive_path"):
+                cur["archive_path"] = ev.get("archive_path")
+        elif ev.get("event") == "restore":
+            cur["last_restored_at"] = ev.get("at")
+
+    for rec in read_archived_sentinels():
+        inv_id = rec.get("inv_id") or Path(rec.get("_path", "")).stem.split(".", 1)[0]
+        cur = sessions.setdefault(inv_id, {"record": rec, "events": []})
+        cur["record"].update({k: v for k, v in rec.items() if k != "_path"})
+        cur.setdefault("ended_at", rec.get("_archive_at"))
+        cur.setdefault("status", "archived")
+        cur.setdefault("reason", "archived")
+        cur["archive_path"] = rec.get("_path")
+
+    live = read_sentinels()
+    running, stale, crashed = classify(live, boot_id())
+    live_status = {}
+    for r in running:
+        live_status[r.get("inv_id")] = ("running", "running")
+    for r in stale:
+        live_status[r.get("inv_id")] = ("stale", "stale")
+    for r in crashed:
+        live_status[r.get("inv_id")] = ("crashed", "crashed")
+    for rec in live:
+        inv_id = rec.get("inv_id")
+        cur = sessions.setdefault(inv_id, {"record": rec, "events": []})
+        cur["record"].update({k: v for k, v in rec.items() if k != "_path"})
+        status, reason = live_status.get(inv_id, ("running", "running"))
+        cur["status"] = status
+        cur["reason"] = reason
+        cur["live_path"] = rec.get("_path")
+        if status in ("stale", "crashed"):
+            cur.setdefault("ended_at", now_iso())
+    return sessions
+
+
+def session_sort_time(sess):
+    return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
+
+
+def restore_groups(include_closed=True):
+    sessions = []
+    for inv_id, sess in history_sessions().items():
+        status = sess.get("status")
+        if status == "running":
+            continue
+        if status == "closed" and not include_closed:
+            continue
+        rec = dict(sess.get("record") or {})
+        rec.setdefault("inv_id", inv_id)
+        if sess.get("live_path"):
+            rec["_path"] = sess["live_path"]
+        elif sess.get("archive_path"):
+            rec["_path"] = sess["archive_path"]
+        rec["_history_status"] = status or "unknown"
+        rec["_history_reason"] = sess.get("reason") or status or "unknown"
+        rec["_history_time"] = sess.get("ended_at") or sess.get("started_at") or ""
+        sessions.append((inv_id, sess, rec))
+
+    groups = []
+    for inv_id, sess, rec in sessions:
+        status = rec.get("_history_status")
+        when = session_sort_time(sess)
+        if status == "closed":
+            gkey = ("closed", inv_id)
+        else:
+            bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
+            gkey = (rec.get("boot_id"), status, bucket)
+        found = None
+        for g in groups:
+            if g["key"] == gkey:
+                found = g
+                break
+        if found is None:
+            found = {
+                "key": gkey,
+                "time": when,
+                "status": status,
+                "reason": rec.get("_history_reason"),
+                "records": [],
+            }
+            groups.append(found)
+        found["records"].append(rec)
+        if when > found["time"]:
+            found["time"] = when
+
+    for g in groups:
+        g["records"].sort(key=lambda r: r.get("cwd", ""))
+    groups.sort(key=lambda g: g["time"], reverse=True)
+    return groups
+
+
+def print_restore_groups(groups):
+    print("crash-guard recovery groups (%d):\n" % len(groups))
+    for i, g in enumerate(groups, 1):
+        when = g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown time"
+        print("  %2d. %-9s %s  (%d session(s))" % (i, g.get("status") or "unknown", when, len(g["records"])))
+        for j, r in enumerate(g["records"], 1):
+            print("      %d.%d  %-10s %s" % (i, j, r.get("key", "?"), r.get("cwd", "?")))
+    print("")
 
 
 # --------------------------------------------------------------------------
@@ -956,14 +1144,131 @@ def cmd_prune(args):
     return 0
 
 
+def cmd_history(args):
+    groups = restore_groups(include_closed=True)
+    if args.json:
+        serial = []
+        for i, g in enumerate(groups, 1):
+            serial.append({
+                "group": i,
+                "status": g.get("status"),
+                "reason": g.get("reason"),
+                "time": g["time"].strftime("%Y-%m-%dT%H:%M:%S%z") if g.get("time") else "",
+                "sessions": [{k: v for k, v in r.items() if k != "env"} for r in g["records"]],
+            })
+        print(json.dumps(serial, indent=2))
+    else:
+        print_restore_groups(groups)
+    return 0
+
+
+def cmd_excise(args):
+    ensure_dirs()
+    cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=args.older_than)
+    events = read_history_events()
+    keep, drop = [], []
+    for ev in events:
+        ev_time = parse_time(ev.get("at"))
+        if ev_time and ev_time < cutoff:
+            drop.append(ev)
+        else:
+            keep.append(ev)
+
+    archive_drop = []
+    if ARCH_DIR.exists():
+        for p in sorted(ARCH_DIR.glob("*.json")):
+            if dt.datetime.fromtimestamp(p.stat().st_mtime, dt.datetime.now().astimezone().tzinfo) < cutoff:
+                archive_drop.append(p)
+
+    history_bytes = HISTORY_FILE.stat().st_size if HISTORY_FILE.exists() else 0
+    archive_bytes = sum(p.stat().st_size for p in archive_drop)
+    print("crash-guard excise dry-run")
+    print("  cutoff: records older than %d day(s) (%s)" % (args.older_than, cutoff.strftime("%Y-%m-%d %H:%M:%S %z")))
+    print("  history events affected: %d/%d" % (len(drop), len(events)))
+    print("  archive files affected: %d" % len(archive_drop))
+    print("  history file size: %d bytes" % history_bytes)
+    print("  archive bytes reclaimable: %d bytes" % archive_bytes)
+
+    if not args.apply:
+        print("\ndry-run only. Re-run with --apply to excise old history.")
+        return 0
+
+    phrase = input('\nType "%s" to confirm old session history removal: ' % EXCISE_PHRASE)
+    if phrase != EXCISE_PHRASE:
+        print("aborted; the ghosts keep their bunks.")
+        return 1
+
+    tmp = HISTORY_FILE.with_suffix(".jsonl.tmp-%d" % os.getpid())
+    with tmp.open("w", encoding="utf-8") as f:
+        for ev in keep:
+            f.write(json.dumps(ev, separators=(",", ":")) + "\n")
+    os.replace(str(tmp), str(HISTORY_FILE))
+    for p in archive_drop:
+        try:
+            p.unlink()
+        except Exception as e:
+            sys.stderr.write("excise: failed to remove %s: %s\n" % (p, e))
+    print("excised %d history event(s) and %d archive file(s)." % (len(drop), len(archive_drop)))
+    return 0
+
+
 def archive_sentinel(r):
     try:
         src = Path(r["_path"])
         if src.exists():
             ts = time.strftime("%Y%m%d-%H%M%S")
-            src.rename(ARCH_DIR / ("%s.%s.json" % (src.stem, ts)))
+            dst = ARCH_DIR / ("%s.%s.json" % (src.stem, ts))
+            src.rename(dst)
+            append_history("archive", r, reason=r.get("_history_reason") or "restored", archive_path=str(dst))
     except Exception as e:
         sys.stderr.write("archive: %s\n" % e)
+
+
+def select_group_records(groups, args):
+    if args.from_archive:
+        return read_archived_sentinels()
+    if not groups:
+        return []
+    if args.group:
+        if not (1 <= args.group <= len(groups)):
+            raise ValueError("group %d out of range" % args.group)
+        records = groups[args.group - 1]["records"]
+    elif args.yes or args.dry_run:
+        records = groups[0]["records"]
+    else:
+        args._history_prompted = True
+        raw = input("Restore group/item [1]? (1, 2.1, 2.1,3.2, all, none): ").strip().lower()
+        if raw in ("", "1"):
+            records = groups[0]["records"]
+        elif raw in ("none", "n", "no"):
+            return []
+        elif raw in ("all", "a"):
+            records = [r for g in groups for r in g["records"]]
+        else:
+            picked = []
+            for part in raw.replace(" ", "").split(","):
+                if not part:
+                    continue
+                if "." in part:
+                    graw, iraw = part.split(".", 1)
+                    gi, ii = int(graw), int(iraw)
+                    if 1 <= gi <= len(groups) and 1 <= ii <= len(groups[gi - 1]["records"]):
+                        picked.append(groups[gi - 1]["records"][ii - 1])
+                else:
+                    gi = int(part)
+                    if 1 <= gi <= len(groups):
+                        picked.extend(groups[gi - 1]["records"])
+            records = picked
+    if args.item:
+        picked = []
+        for part in args.item.replace(" ", "").split(","):
+            if not part:
+                continue
+            idx = int(part)
+            if 1 <= idx <= len(records):
+                picked.append(records[idx - 1])
+        records = picked
+    return records
 
 
 def cmd_restore(args):
@@ -973,13 +1278,18 @@ def cmd_restore(args):
     if args.from_archive:
         targets = read_archived_sentinels()
     else:
-        recs = read_sentinels()
-        _, stale, crashed = classify(recs, cur)
-        targets = list(crashed)
-        if args.include_stale:
-            targets += stale
+        groups = restore_groups(include_closed=args.include_closed)
+        if args.list_groups:
+            print_restore_groups(groups)
+            return 0
+        print_restore_groups(groups)
+        try:
+            targets = select_group_records(groups, args)
+        except ValueError as e:
+            sys.stderr.write("crash-guard: %s\n" % e)
+            return 2
     if not targets:
-        msg = "no archived sessions to restore" if args.from_archive else "no crashed sessions to restore"
+        msg = "no archived sessions to restore" if args.from_archive else "no recovery sessions to restore"
         print("crash-guard: %s." % msg)
         return 0
 
@@ -1010,7 +1320,7 @@ def cmd_restore(args):
             return 0
         if raw not in ("all", "a"):
             selected = _select(plan, raw)
-    elif not args.yes:
+    elif not args.yes and not getattr(args, "_history_prompted", False):
         ans = input("Restore all %d session(s)? [Y/n] " % len(plan)).strip().lower()
         if ans in ("n", "no"):
             print("aborted.")
@@ -1021,7 +1331,6 @@ def cmd_restore(args):
         for item in selected:
             if item["argv"]:
                 print("cd %s && %s" % (item["cwd"], " ".join(item["argv"])))
-            archive_sentinel(item["rec"])
         return 0
 
     backend, cli, note = resolve_terminal_backend(cfg, args.terminal or (cfg.get("terminal") or {}).get("backend", "auto"))
@@ -1047,7 +1356,9 @@ def cmd_restore(args):
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             continue
         print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
-        archive_sentinel(item["rec"])
+        append_history("restore", item["rec"], backend=backend)
+        if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
+            archive_sentinel(item["rec"])
         ok += 1
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
@@ -1119,11 +1430,30 @@ def main():
     s = sub.add_parser("prune")
     s.set_defaults(func=cmd_prune)
 
+    s = sub.add_parser("history")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_history)
+
+    s = sub.add_parser("excise")
+    s.add_argument("--older-than", type=int, default=365,
+                   help="remove history/archive records older than this many days")
+    s.add_argument("--apply", action="store_true",
+                   help="actually rewrite history and remove old archive files after confirmation")
+    s.set_defaults(func=cmd_excise)
+
     s = sub.add_parser("restore")
     s.add_argument("--yes", "-y", action="store_true")
     s.add_argument("--select", action="store_true")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-spawn", action="store_true")
+    s.add_argument("--group", type=int, default=0,
+                   help="restore a numbered recovery group from crash-guard history")
+    s.add_argument("--item", default="",
+                   help="restore one or more item numbers from the selected group")
+    s.add_argument("--list-groups", action="store_true",
+                   help="list recovery groups without restoring")
+    s.add_argument("--no-closed", dest="include_closed", action="store_false", default=True,
+                   help="hide cleanly closed sessions from recovery history")
     s.add_argument("--terminal", default=None,
                    choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
                    help="terminal backend for spawning restored sessions")

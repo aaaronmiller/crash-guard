@@ -51,12 +51,14 @@ After a crash or WSL restart:
 
 ```bash
 cgs
+cgh
 cgr
 cgr-archive
 ```
 
-`cgs` previews tracked sessions. `cgr` prints the restore plan, asks once, and
-opens each selected session through the detected terminal backend.
+`cgs` previews currently live sentinels. `cgh` lists durable recovery groups.
+`cgr` prints the grouped restore history, defaults to the newest recoverable
+group, and opens each selected session through the detected terminal backend.
 `cgr-archive` retries sessions that were already moved to the archive by a
 previous failed restore.
 
@@ -70,6 +72,10 @@ crash-guard restore --no-spawn
 crash-guard restore --include-stale
 crash-guard restore --from-archive
 crash-guard restore --terminal ghostty
+crash-guard restore --group 2
+crash-guard restore --group 2 --item 3
+crash-guard history
+crash-guard excise --older-than 365
 ```
 
 `--terminal` accepts `auto`, `tmux`, `wezterm`, `kitty`, `ghostty`, `wt`, or
@@ -134,10 +140,41 @@ Per-terminal CLI overrides:
 `restore.pre` defaults to starting the local proxy stack when your shell defines
 `_proxy_stack_auto_start`.
 
+## Durable History
+
+Crash-guard keeps an append-only JSONL history at
+`~/.local/share/crash-guard/history.jsonl`. Live sentinel files and archived
+sentinels are folded into the same view, so a failed restore does not erase the
+only recovery record.
+
+Recovery groups are derived from the stored records:
+
+- Cleanly closed sessions are listed as individual groups.
+- Crashed, stale, or archived sessions that ended together are listed as one
+  group.
+- `crash-guard restore` with no group selected restores group `1`, the newest
+  recoverable group.
+- `crash-guard restore --group 2` restores all sessions in group `2`.
+- `crash-guard restore --group 2 --item 3` restores only item `3` from group
+  `2`.
+
+History is retained indefinitely by default. Cleanup is explicit:
+
+```bash
+crash-guard excise --older-than 365
+crash-guard excise --older-than 365 --apply
+```
+
+Without `--apply`, `excise` only reports how many events and archive files would
+be affected and how many archive bytes would be reclaimed. With `--apply`, it
+requires typing `Jettison the ghosts` before removing old history.
+
 ## How It Works
 
 - `cg_run` writes one sentinel under `~/.local/share/crash-guard/live/` before
   launching a tracked TUI and removes it after clean exit.
+- `start`, `stop`, `archive`, and `restore` events are appended to durable
+  history.
 - Each sentinel records the current kernel `boot_id`. After a WSL restart,
   old sentinels have a different boot id and are classified as crashed.
 - Restore is CWD-first: it runs the configured continue command in the recorded
