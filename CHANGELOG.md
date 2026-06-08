@@ -11,13 +11,17 @@
 - Added append-only durable session history with grouped recovery via `crash-guard history`.
 - Added `crash-guard restore --group` and `--item` for restoring older groups or individual sessions.
 - Added `crash-guard excise` dry-run cleanup with explicit confirmation for old history removal.
-- Added `cgh` and `cge` aliases for history and cleanup.
+- Added `cgh` alias for history.
+- Added no-argument `crash-guard` restore picker behavior.
+- Added OS boot-period browsing to `crash-guard history`.
+- Added `crash-guard restore --boot` for restoring groups from older boot periods.
 
 ### Changed
 - Reworked README structure around install, restore workflow, terminal backends, config, and limitations.
 - Changed Ghostty restore behavior to use tmux windows in the current Ghostty tab instead of opening Ghostty OS windows.
 - Clarified that tmux restore uses tmux windows, not split panes.
 - Changed default restore to derive targets from durable recovery groups instead of only currently crashed live sentinels.
+- Changed `history` from a flat group list into a boot-period browser with number/arrow-key selection.
 
 ### Fixed
 - Fixed restore planning for wrapper-keyed sentinels such as `rtk` by inferring the concrete tool from recorded argv.

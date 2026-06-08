@@ -41,7 +41,6 @@ alias cgr='crash-guard restore'
 alias cgs='crash-guard status'
 alias cgr-archive='crash-guard restore --from-archive --terminal ghostty'
 alias cgh='crash-guard history'
-alias cge='crash-guard excise'
 
 # Once-per-boot crash notice on an interactive shell. The marker file is keyed
 # to the current boot_id, so after the first interactive shell this boot the

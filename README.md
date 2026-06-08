@@ -50,6 +50,7 @@ while crash-guard tracks active sessions.
 After a crash or WSL restart:
 
 ```bash
+crash-guard
 cgs
 cgh
 cgr
@@ -57,8 +58,9 @@ cgr-archive
 ```
 
 `cgs` previews currently live sentinels. `cgh` lists durable recovery groups.
-`cgr` prints the grouped restore history, defaults to the newest recoverable
-group, and opens each selected session through the detected terminal backend.
+`crash-guard` with no arguments behaves like `cgr`: it prints the grouped
+restore history, defaults to the newest recoverable group, and opens each
+selected session through the detected terminal backend.
 `cgr-archive` retries sessions that were already moved to the archive by a
 previous failed restore.
 
@@ -66,6 +68,7 @@ Useful restore flags:
 
 ```bash
 crash-guard restore --dry-run
+crash-guard --dry-run
 crash-guard restore --select
 crash-guard restore --repair
 crash-guard restore --no-spawn
@@ -74,7 +77,9 @@ crash-guard restore --from-archive
 crash-guard restore --terminal ghostty
 crash-guard restore --group 2
 crash-guard restore --group 2 --item 3
+crash-guard restore --boot <boot-id> --group 2
 crash-guard history
+crash-guard history --list
 crash-guard excise --older-than 365
 ```
 
@@ -147,7 +152,13 @@ Crash-guard keeps an append-only JSONL history at
 sentinels are folded into the same view, so a failed restore does not erase the
 only recovery record.
 
-Recovery groups are derived from the stored records:
+`crash-guard history` is an OS boot-period browser. It first lists recorded boot
+periods with record counts, recoverable counts, closed counts, and running
+counts. In an interactive terminal, type a number or use the arrow keys to pick
+a boot period; crash-guard then shows the normal recovery-group list scoped to
+that period.
+
+Recovery groups inside a boot period are derived from the stored records:
 
 - Cleanly closed sessions are listed as individual groups.
 - Crashed, stale, or archived sessions that ended together are listed as one
@@ -157,6 +168,8 @@ Recovery groups are derived from the stored records:
 - `crash-guard restore --group 2` restores all sessions in group `2`.
 - `crash-guard restore --group 2 --item 3` restores only item `3` from group
   `2`.
+- `crash-guard restore --boot <boot-id> --group 2` restores group `2` from an
+  older OS boot period.
 
 History is retained indefinitely by default. Cleanup is explicit:
 

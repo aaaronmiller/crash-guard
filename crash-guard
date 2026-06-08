@@ -38,7 +38,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import time
+import tty
 from pathlib import Path
 
 HOME = Path.home()
@@ -436,7 +438,7 @@ def session_sort_time(sess):
     return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
 
-def restore_groups(include_closed=True):
+def restore_groups(include_closed=True, boot_id=None):
     sessions = []
     for inv_id, sess in history_sessions().items():
         status = sess.get("status")
@@ -445,6 +447,8 @@ def restore_groups(include_closed=True):
         if status == "closed" and not include_closed:
             continue
         rec = dict(sess.get("record") or {})
+        if boot_id and rec.get("boot_id") != boot_id:
+            continue
         rec.setdefault("inv_id", inv_id)
         if sess.get("live_path"):
             rec["_path"] = sess["live_path"]
@@ -486,6 +490,111 @@ def restore_groups(include_closed=True):
         g["records"].sort(key=lambda r: r.get("cwd", ""))
     groups.sort(key=lambda g: g["time"], reverse=True)
     return groups
+
+
+def boot_periods():
+    periods = {}
+    for inv_id, sess in history_sessions().items():
+        rec = sess.get("record") or {}
+        bid = rec.get("boot_id") or "unknown-boot"
+        cur = periods.setdefault(bid, {
+            "boot_id": bid,
+            "start": None,
+            "end": None,
+            "records": 0,
+            "running": 0,
+            "closed": 0,
+            "recoverable": 0,
+        })
+        cur["records"] += 1
+        status = sess.get("status") or "unknown"
+        if status == "running":
+            cur["running"] += 1
+        elif status == "closed":
+            cur["closed"] += 1
+        else:
+            cur["recoverable"] += 1
+        for val in (sess.get("started_at"), sess.get("ended_at")):
+            parsed = parse_time(val)
+            if not parsed:
+                continue
+            if cur["start"] is None or parsed < cur["start"]:
+                cur["start"] = parsed
+            if cur["end"] is None or parsed > cur["end"]:
+                cur["end"] = parsed
+    out = list(periods.values())
+    out.sort(key=lambda p: p["end"] or p["start"] or dt.datetime.fromtimestamp(0, dt.timezone.utc), reverse=True)
+    return out
+
+
+def fmt_period_time(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S %z") if value else "unknown"
+
+
+def print_boot_periods(periods):
+    print("crash-guard OS boot periods (%d):\n" % len(periods))
+    for i, p in enumerate(periods, 1):
+        print("  %2d. %s -> %s  records=%d recoverable=%d closed=%d running=%d boot=%s" % (
+            i,
+            fmt_period_time(p.get("start")),
+            fmt_period_time(p.get("end")),
+            p["records"],
+            p["recoverable"],
+            p["closed"],
+            p["running"],
+            short(p["boot_id"], 8),
+        ))
+    print("")
+
+
+def arrow_select(options, title, default=0):
+    if not options:
+        return None
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raw = input("%s [%d]: " % (title, default + 1)).strip()
+        return default if raw == "" else max(0, min(len(options) - 1, int(raw) - 1))
+
+    idx = default
+    old = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            sys.stdout.write("\033[?25l\033[2K\r%s\n" % title)
+            for i, opt in enumerate(options):
+                marker = ">" if i == idx else " "
+                sys.stdout.write("\033[2K\r %s %2d. %s\n" % (marker, i + 1, opt))
+            sys.stdout.write("\033[%dA" % (len(options) + 1))
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\033[%dB\033[?25h" % (len(options) + 1))
+                sys.stdout.flush()
+                return idx
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch.isdigit():
+                digits = ch
+                while True:
+                    nxt = sys.stdin.read(1)
+                    if not nxt.isdigit():
+                        break
+                    digits += nxt
+                val = int(digits)
+                if 1 <= val <= len(options):
+                    sys.stdout.write("\033[%dB\033[?25h" % (len(options) + 1))
+                    sys.stdout.flush()
+                    return val - 1
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A":
+                    idx = (idx - 1) % len(options)
+                elif seq == "[B":
+                    idx = (idx + 1) % len(options)
+            sys.stdout.write("\033[%dA" % 0)
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 def print_restore_groups(groups):
@@ -1145,20 +1254,42 @@ def cmd_prune(args):
 
 
 def cmd_history(args):
-    groups = restore_groups(include_closed=True)
+    periods = boot_periods()
     if args.json:
-        serial = []
-        for i, g in enumerate(groups, 1):
-            serial.append({
-                "group": i,
-                "status": g.get("status"),
-                "reason": g.get("reason"),
-                "time": g["time"].strftime("%Y-%m-%dT%H:%M:%S%z") if g.get("time") else "",
-                "sessions": [{k: v for k, v in r.items() if k != "env"} for r in g["records"]],
-            })
+        serial = [{
+            "period": i,
+            "boot_id": p["boot_id"],
+            "start": p["start"].strftime("%Y-%m-%dT%H:%M:%S%z") if p.get("start") else "",
+            "end": p["end"].strftime("%Y-%m-%dT%H:%M:%S%z") if p.get("end") else "",
+            "records": p["records"],
+            "recoverable": p["recoverable"],
+            "closed": p["closed"],
+            "running": p["running"],
+        } for i, p in enumerate(periods, 1)]
         print(json.dumps(serial, indent=2))
-    else:
-        print_restore_groups(groups)
+        return 0
+    if not periods:
+        print("crash-guard: no history recorded.")
+        return 0
+    print_boot_periods(periods)
+    if args.list or not sys.stdin.isatty():
+        return 0
+    opts = [
+        "%s -> %s  records=%d recoverable=%d boot=%s" % (
+            fmt_period_time(p.get("start")), fmt_period_time(p.get("end")),
+            p["records"], p["recoverable"], short(p["boot_id"], 8))
+        for p in periods
+    ]
+    try:
+        idx = arrow_select(opts, "Select OS boot period:")
+    except (KeyboardInterrupt, EOFError):
+        print("\naborted.")
+        return 1
+    print("")
+    period = periods[idx]
+    groups = restore_groups(include_closed=True, boot_id=period["boot_id"])
+    print_restore_groups(groups)
+    print("Restore from this period with: crash-guard restore --boot %s --group N" % period["boot_id"])
     return 0
 
 
@@ -1278,7 +1409,7 @@ def cmd_restore(args):
     if args.from_archive:
         targets = read_archived_sentinels()
     else:
-        groups = restore_groups(include_closed=args.include_closed)
+        groups = restore_groups(include_closed=args.include_closed, boot_id=args.boot)
         if args.list_groups:
             print_restore_groups(groups)
             return 0
@@ -1403,6 +1534,8 @@ def cmd_genid(args):
 
 def main():
     p = argparse.ArgumentParser(prog="crash-guard", description="WSL2 agentic session recovery")
+    if len(sys.argv) == 1 or (len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help")):
+        sys.argv.insert(1, "restore")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("start")
@@ -1432,6 +1565,8 @@ def main():
 
     s = sub.add_parser("history")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--list", action="store_true",
+                   help="list OS boot periods without interactive selection")
     s.set_defaults(func=cmd_history)
 
     s = sub.add_parser("excise")
@@ -1448,6 +1583,8 @@ def main():
     s.add_argument("--no-spawn", action="store_true")
     s.add_argument("--group", type=int, default=0,
                    help="restore a numbered recovery group from crash-guard history")
+    s.add_argument("--boot", default="",
+                   help="limit restore groups to a specific boot id")
     s.add_argument("--item", default="",
                    help="restore one or more item numbers from the selected group")
     s.add_argument("--list-groups", action="store_true",
