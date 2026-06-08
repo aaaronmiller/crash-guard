@@ -54,6 +54,23 @@ ARCH_DIR = DATA_DIR / "archive"
 HISTORY_FILE = DATA_DIR / "history.jsonl"
 EXCISE_PHRASE = "Jettison the ghosts"
 
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def color(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if USE_COLOR else text
+
+
+def title():
+    art = [
+        "   ____               __       ______                     __",
+        "  / __/______ ____  / /  ___ / ___/_ _____ _________ ___/ /",
+        " _\\ \\/ __/ _ `/ _ \\/ _ \\/ -_) (_ / // / _ `/ __/ _ `/ _  / ",
+        "/___/\\__/\\_,_/_//_/_//_/\\__/\\___/\\_,_/\\_,_/_/  \\_,_/\\_,_/  ",
+    ]
+    print(color("1;36", "\n".join(art)))
+    print(color("2;37", "terminal recovery ledger\n"))
+
 # SECURITY: the sentinel is plaintext on disk and its env is replayed via
 # `export` in the restore payload (visible in `ps`). So we capture ONLY the
 # non-secret proxy-routing delta the launcher injected, never ambient secrets.
@@ -532,10 +549,11 @@ def fmt_period_time(value):
 
 
 def print_boot_periods(periods):
-    print("crash-guard OS boot periods (%d):\n" % len(periods))
+    title()
+    print(color("1;33", "OS boot periods (%d):\n" % len(periods)))
     for i, p in enumerate(periods, 1):
-        print("  %2d. %s -> %s  records=%d recoverable=%d closed=%d running=%d boot=%s" % (
-            i,
+        print("  %s %s -> %s  records=%s recoverable=%s closed=%s running=%s boot=%s" % (
+            color("1;32", "%2d." % i),
             fmt_period_time(p.get("start")),
             fmt_period_time(p.get("end")),
             p["records"],
@@ -573,13 +591,7 @@ def arrow_select(options, title, default=0):
             if ch == "\x03":
                 raise KeyboardInterrupt
             if ch.isdigit():
-                digits = ch
-                while True:
-                    nxt = sys.stdin.read(1)
-                    if not nxt.isdigit():
-                        break
-                    digits += nxt
-                val = int(digits)
+                val = int(ch)
                 if 1 <= val <= len(options):
                     sys.stdout.write("\033[%dB\033[?25h" % (len(options) + 1))
                     sys.stdout.flush()
@@ -598,12 +610,15 @@ def arrow_select(options, title, default=0):
 
 
 def print_restore_groups(groups):
-    print("crash-guard recovery groups (%d):\n" % len(groups))
+    title()
+    print(color("1;33", "recovery groups (%d):\n" % len(groups)))
     for i, g in enumerate(groups, 1):
         when = g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown time"
-        print("  %2d. %-9s %s  (%d session(s))" % (i, g.get("status") or "unknown", when, len(g["records"])))
+        status = g.get("status") or "unknown"
+        status_color = {"stale": "1;31", "crashed": "1;31", "archived": "1;35", "closed": "1;34"}.get(status, "1;37")
+        print("  %s %-9s %s  (%d session(s))" % (color("1;32", "%2d." % i), color(status_color, status), when, len(g["records"])))
         for j, r in enumerate(g["records"], 1):
-            print("      %d.%d  %-10s %s" % (i, j, r.get("key", "?"), r.get("cwd", "?")))
+            print("      %s  %-10s %s" % (color("2;37", "%d.%d" % (i, j)), r.get("key", "?"), r.get("cwd", "?")))
     print("")
 
 
@@ -1366,6 +1381,27 @@ def select_group_records(groups, args):
         records = groups[args.group - 1]["records"]
     elif args.yes or args.dry_run:
         records = groups[0]["records"]
+    elif sys.stdin.isatty() and sys.stdout.isatty():
+        args._history_prompted = True
+        group_opts = [
+            "%s  %d session(s)  %s" % (
+                g.get("status") or "unknown",
+                len(g["records"]),
+                g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown",
+            )
+            for g in groups
+        ]
+        gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
+        if gi is None:
+            return []
+        group_records = groups[gi]["records"]
+        item_opts = ["all sessions in group %d" % (gi + 1)] + [
+            "%s  %s" % (r.get("key", "?"), r.get("cwd", "?")) for r in group_records
+        ]
+        ii = arrow_select(item_opts, "Select session (Enter = all):")
+        if ii is None:
+            return []
+        records = group_records if ii == 0 else [group_records[ii - 1]]
     else:
         args._history_prompted = True
         raw = input("Restore group/item [1]? (1, 2.1, 2.1,3.2, all, none): ").strip().lower()
@@ -1519,7 +1555,7 @@ def cmd_init(args):
     else:
         print("config already exists: %s" % CFG_FILE)
     print("data dir: %s" % DATA_DIR)
-    print("\nNext: source crash-guard.sh from ~/.zshrc, then wrap launchers with cg_run.")
+    print("\nNext: add the README shell integration block, then wrap launchers with cg_run.")
     return 0
 
 

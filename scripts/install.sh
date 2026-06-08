@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# ---
+# date: 2026-06-02 00:00:00 PT
+# ver: 2.0.0
+# author: Ice-ninja
+# model: Claude Opus 4.8
+# tags: [wsl2, installer, session-recovery, terminal, agentic-cli]
+# ---
+# Installer for crash-guard. Run from the repo:
+#     bash scripts/install.sh
+#
+# Installs:
+#   ~/.local/bin/crash-guard            (the python tool)
+#   ~/.config/crash-guard/crash-guard.sh (shell integration)
+#   ~/.config/crash-guard/programs.json  (default config via `crash-guard init`)
+# It does not edit shell rc files. The README contains the shell block to add.
+set -euo pipefail
+
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+BIN_DIR="$HOME/.local/bin"
+CFG_DIR="$HOME/.config/crash-guard"
+mkdir -p "$BIN_DIR" "$CFG_DIR"
+
+# --- copy the tool + shell integration from alongside this installer ---------
+if [ ! -f "$SRC_DIR/bin/crash-guard" ] || [ ! -f "$SRC_DIR/shell/crash-guard.sh" ]; then
+  echo "error: expected bin/crash-guard and shell/crash-guard.sh under $SRC_DIR." >&2
+  echo "       (found in: $SRC_DIR)" >&2
+  exit 1
+fi
+install -m 0755 "$SRC_DIR/bin/crash-guard" "$BIN_DIR/crash-guard"
+install -m 0644 "$SRC_DIR/shell/crash-guard.sh" "$CFG_DIR/crash-guard.sh"
+
+# --- write default config (idempotent; never clobbers an existing one) -------
+PATH="$BIN_DIR:$PATH" python3 "$BIN_DIR/crash-guard" init >/dev/null 2>&1 || true
+
+echo ""
+echo "crash-guard installed."
+echo "  binary : $BIN_DIR/crash-guard"
+echo "  shell  : $CFG_DIR/crash-guard.sh"
+echo "  config : $CFG_DIR/programs.json"
+echo ""
+echo "Next: add the README shell integration block to your shell rc, then open a new shell."
+echo "Verified resume flags: claude, codex, opencode, hermes, pi. ante = relaunch (memory-based)."
+echo "After a crash, run:  crash-guard    (preview periods: cgh, live status: cgs)"

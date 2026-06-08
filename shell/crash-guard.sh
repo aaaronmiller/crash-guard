@@ -5,13 +5,13 @@
 # model: Claude Opus 4.8
 # tags: [wsl2, shell-integration, zsh, bash, session-recovery, terminal]
 # ---
-# crash-guard shell integration. Sourced from ~/.zshrc (the installer wires this):
+# crash-guard shell integration. Source this from ~/.zshrc or ~/.bashrc:
 #     source ~/.config/crash-guard/crash-guard.sh
 #
 # Works in bash and zsh. Defines the cg_run launcher primitive, the cgr/cgs
 # aliases, and a once-per-boot login notice when crashed sessions are detected.
-# It does NOT redefine your tool aliases; you compose cg_run into them (the
-# installer does this for cc/oc/hsi/hsr/psi/codex-* and adds an/anc for ante).
+# It does NOT redefine your tool aliases; compose cg_run into your launcher
+# aliases in your shell rc.
 
 # cg_run KEY [--] CMD [ARGS...]
 #   Registers a live-session sentinel, runs CMD in the foreground (so signals,

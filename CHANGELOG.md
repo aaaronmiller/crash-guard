@@ -15,6 +15,7 @@
 - Added no-argument `crash-guard` restore picker behavior.
 - Added OS boot-period browsing to `crash-guard history`.
 - Added `crash-guard restore --boot` for restoring groups from older boot periods.
+- Added colorized terminal headings and an ASCII project title for interactive recovery views.
 
 ### Changed
 - Reworked README structure around install, restore workflow, terminal backends, config, and limitations.
@@ -22,6 +23,9 @@
 - Clarified that tmux restore uses tmux windows, not split panes.
 - Changed default restore to derive targets from durable recovery groups instead of only currently crashed live sentinels.
 - Changed `history` from a flat group list into a boot-period browser with number/arrow-key selection.
+- Changed interactive restore into a two-step arrow-key picker for recovery group and session selection.
+- Moved executable, shell integration, and installer into `bin/`, `shell/`, and `scripts/` for a cleaner repository root.
+- Changed `scripts/install.sh` to install files only and leave shell rc edits to documented setup steps.
 
 ### Fixed
 - Fixed restore planning for wrapper-keyed sentinels such as `rtk` by inferring the concrete tool from recorded argv.

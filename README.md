@@ -8,211 +8,198 @@ tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
 
 # crash-guard
 
-Restore tracked agentic CLI / TUI sessions after a WSL2 crash. `crash-guard`
-records live sessions as small sentinel files, detects which ones survived from
-a previous boot, and restores them in the right working directory through your
-configured terminal.
-
-Supported tools include Claude, Codex, opencode, Hermes, pi, Kilo, and ante.
-Restore commands keep the configured `rtk` prefix and captured proxy-routing
-environment so resumed sessions reconnect through the same proxy path.
-
-## Install
-
-```bash
-bash install-crash-guard.sh && exec "$SHELL" -l
+```
+   ____               __       ______                     __
+  / __/______ ____  / /  ___ / ___/_ _____ _________ ___/ /
+ _\ \/ __/ _ `/ _ \/ _ \/ -_) (_ / // / _ `/ __/ _ `/ _  /
+/___/\__/\_,_/_//_/_//_/\__/\___/\_,_/\_,_/_/  \_,_/\_,_/
 ```
 
-The installer copies:
+Crash-guard keeps a durable recovery ledger for agentic CLI / TUI sessions and
+restores them after WSL restarts, terminal crashes, or failed restore attempts.
+It tracks Claude, Codex, opencode, Hermes, pi, Kilo, ante, and wrapper-launched
+commands such as `rtk`/`xx`.
 
-- `~/.local/bin/crash-guard`
-- `~/.config/crash-guard/crash-guard.sh`
-- `~/.config/crash-guard/programs.json`
+It is not a PTY recorder. It stores enough metadata to relaunch the right
+continue/resume command in the right working directory, through the same
+captured non-secret proxy-routing environment.
 
-It also adds one source line to `~/.zshrc` or `~/.bashrc` if the integration is
-not already loaded.
+## Repository Layout
+
+```text
+bin/crash-guard       executable Python tool
+shell/crash-guard.sh  shell integration: cg_run, cgr, cgs, cgh
+scripts/install.sh    install files only; does not edit shell rc files
+README.md             setup and operating guide
+CHANGELOG.md          project changes
+LICENSE               MIT license
+```
+
+## Agent Install Guide
+
+If you are an agent setting this up on a new machine, do this from WSL/bash or a
+Linux shell:
+
+```bash
+git clone https://github.com/aaaronmiller/crash-guard ~/code/crash-guard
+cd ~/code/crash-guard
+bash scripts/install.sh
+```
+
+Add this shell integration block to `~/.zshrc` or `~/.bashrc`:
+
+```bash
+# crash-guard session recovery
+export PATH="$HOME/.local/bin:$PATH"
+source "$HOME/.config/crash-guard/crash-guard.sh"
+alias cgr='crash-guard restore'                                      # crash-guard restore tracked sessions
+alias cgs='crash-guard status'                                       # crash-guard status/preview
+alias cgr-archive='crash-guard restore --from-archive --terminal ghostty' # recover archived restore via Ghostty/tmux tabs
+alias cgh='crash-guard history'                                      # crash-guard OS boot history browser
+```
+
+Then add tracked launcher aliases. On this machine, the active proxy aliases use
+`xx`, so the tracked aliases are:
+
+```bash
+alias cc='cg_run xx cip'           # Claude init, proxy
+alias ccc='cg_run xx ccf'          # Claude continue, proxy, free tier
+alias hsi='cg_run xx hip'          # Hermes init, proxy
+alias hsr='cg_run xx hcf'          # Hermes continue, proxy, free tier
+alias psi='cg_run xx pip'          # Pi init, proxy
+alias psi-c='cg_run xx pcf'        # Pi continue, proxy, free tier
+alias qw='cg_run xx qip'           # Qwen init, proxy
+alias qw-c='cg_run xx qcf'         # Qwen continue, proxy, free tier
+alias codex-run='cg_run xx xip'    # Codex init, proxy
+alias codex-res='cg_run xx xcf'    # Codex continue, proxy, free tier
+alias oc='cg_run xx oip'           # OpenCode init, proxy
+alias ante='cg_run xx aip'         # Ante init, proxy
+```
+
+If the machine does not use `xx`, wrap the real command directly:
+
+```bash
+alias cc='cg_run claude -- rtk claude --dangerously-skip-permissions'
+alias ccc='cg_run claude -- rtk claude --continue --dangerously-skip-permissions'
+alias codex-run='cg_run codex -- rtk codex --dangerously-bypass-approvals-and-sandbox'
+alias codex-res='cg_run codex -- rtk codex resume'
+alias oc='cg_run opencode -- rtk opencode'
+alias hsi='cg_run hermes -- rtk hermes'
+alias hsr='cg_run hermes -- rtk hermes --resume'
+```
+
+System-specific notes:
+
+- Ghostty on Linux/Fedora: install `tmux`; crash-guard uses tmux windows as
+  tab-equivalents because Ghostty exposes `new_tab` as a keybind, not a
+  `+new-tab` CLI action.
+- WezTerm: install `wezterm` or `wezterm.exe`; existing-window tab spawning is
+  preserved.
+- Kitty: enable remote control if you want native Kitty tabs; crash-guard falls
+  back to a new Kitty OS window if remote launch fails.
+- Windows Terminal from WSL: `wt.exe` and `wsl.exe` must be on PATH.
+
+Open a new shell or run:
+
+```bash
+source ~/.zshrc
+```
 
 ## Daily Use
 
-Launchers are wrapped with `cg_run`, so normal interactive use stays the same
-while crash-guard tracks active sessions.
+Run tracked aliases normally. Each launcher writes a live sentinel before the
+tool starts and appends to durable history on start, stop, archive, and restore.
 
-| start | continue | tool |
-|-------|----------|------|
-| `cc` | `ccc` | Claude |
-| `oc` | `occ` | opencode |
-| `hsi` | `hsr` | Hermes |
-| `psi` | `psi-c` | pi |
-| `codex-run` | `codex-res` | Codex |
-| custom | custom | Kilo |
-| `an` | `anc` | ante |
-
-After a crash or WSL restart:
+Common commands:
 
 ```bash
-crash-guard
-cgs
-cgh
-cgr
-cgr-archive
+crash-guard       # restore picker; Enter restores newest group
+cgr               # same as crash-guard restore
+cgs               # current live/stale/crashed sentinel status
+cgh               # OS boot-period history browser
+cgr-archive       # retry records already moved to archive
 ```
 
-`cgs` previews currently live sentinels. `cgh` lists durable recovery groups.
-`crash-guard` with no arguments behaves like `cgr`: it prints the grouped
-restore history, defaults to the newest recoverable group, and opens each
-selected session through the detected terminal backend.
-`cgr-archive` retries sessions that were already moved to the archive by a
-previous failed restore.
+The restore picker shows recovery groups, then lets you use arrow keys or
+numbers to select a group. It then lets you select all sessions in that group or
+one individual session. Pressing Enter on the defaults restores the newest
+recoverable group.
 
-Useful restore flags:
+Useful non-interactive forms:
 
 ```bash
-crash-guard restore --dry-run
 crash-guard --dry-run
-crash-guard restore --select
-crash-guard restore --repair
-crash-guard restore --no-spawn
-crash-guard restore --include-stale
-crash-guard restore --from-archive
-crash-guard restore --terminal ghostty
 crash-guard restore --group 2
 crash-guard restore --group 2 --item 3
-crash-guard restore --boot <boot-id> --group 2
-crash-guard history
-crash-guard history --list
-crash-guard excise --older-than 365
-```
-
-`--terminal` accepts `auto`, `tmux`, `wezterm`, `kitty`, `ghostty`, `wt`, or
-`windows-terminal`.
-
-## Terminal Backends
-
-`terminal.backend` defaults to `auto`. Auto-detection prefers the multiplexer or
-terminal that launched restore, then falls back through the configured order.
-
-| backend | spawn behavior | notes |
-|---------|----------------|-------|
-| `tmux` | new tmux windows | A tmux window is tmux's tab equivalent: one full-screen active workspace, not a split pane. |
-| `wezterm` | new tabs in the current/sole WezTerm window when resolvable, otherwise a new window | Uses `WEZTERM_PANE` or `wezterm cli list-clients` for WSL-aware mux lookup. |
-| `kitty` | new tabs via Kitty remote control | Falls back to a new Kitty OS window if remote control launch fails. |
-| `ghostty` | tmux windows in the current Ghostty tab | Ghostty has a `new_tab` keybind action but no `+new-tab` CLI action in current Linux builds, so crash-guard uses tmux windows instead of spawning Ghostty OS windows. |
-| `windows-terminal` | new Windows Terminal tabs | Uses `wt.exe` and re-enters the current WSL distro with `wsl.exe --cd <cwd> --exec ...`. |
-
-Force a backend when auto-detection is not what you want:
-
-```bash
-crash-guard restore --terminal tmux
-crash-guard restore --terminal ghostty
-crash-guard restore --terminal windows-terminal
-```
-
-If a previous restore attempt archived sentinels before the sessions were
-actually usable, recover them with:
-
-```bash
+crash-guard restore --boot <boot-id> --group 1
 crash-guard restore --from-archive --terminal ghostty
+crash-guard restore --no-spawn
 ```
 
-This creates tmux windows, not panes. You get one restored session per tmux
-window, each using the full terminal while active.
+## History
 
-## Config
+Crash-guard keeps append-only history at:
 
-`~/.config/crash-guard/programs.json` controls terminal selection, per-tool
-restore commands, session-store locations, captured environment patterns, and
-the restore pre-hook.
-
-Default terminal config:
-
-```json
-"terminal": {
-  "backend": "auto",
-  "order": ["tmux", "wezterm", "kitty", "windows-terminal"]
-}
+```text
+~/.local/share/crash-guard/history.jsonl
 ```
 
-Per-terminal CLI overrides:
+It also folds in live sentinels and archived sentinels, so a failed restore does
+not erase the only recovery record.
 
-```json
-"tmux": {"cli": ""},
-"wezterm": {"cli": "", "domain": ""},
-"kitty": {"cli": ""},
-"ghostty": {"cli": ""},
-"windows_terminal": {"cli": "", "wsl": ""}
-```
+`crash-guard history` first lists OS boot periods with record counts. In an
+interactive terminal, choose a period with arrow keys or a number; crash-guard
+then shows that period's recovery groups.
 
-`restore.pre` defaults to starting the local proxy stack when your shell defines
-`_proxy_stack_auto_start`.
+Recovery grouping:
 
-## Durable History
+- Clean exits are kept as individual closed-session records.
+- Crashed, stale, or archived sessions that ended together are grouped.
+- The newest recoverable group is group `1` for plain `crash-guard`.
+- Older OS boot periods are restored with `--boot <boot-id>`.
 
-Crash-guard keeps an append-only JSONL history at
-`~/.local/share/crash-guard/history.jsonl`. Live sentinel files and archived
-sentinels are folded into the same view, so a failed restore does not erase the
-only recovery record.
-
-`crash-guard history` is an OS boot-period browser. It first lists recorded boot
-periods with record counts, recoverable counts, closed counts, and running
-counts. In an interactive terminal, type a number or use the arrow keys to pick
-a boot period; crash-guard then shows the normal recovery-group list scoped to
-that period.
-
-Recovery groups inside a boot period are derived from the stored records:
-
-- Cleanly closed sessions are listed as individual groups.
-- Crashed, stale, or archived sessions that ended together are listed as one
-  group.
-- `crash-guard restore` with no group selected restores group `1`, the newest
-  recoverable group.
-- `crash-guard restore --group 2` restores all sessions in group `2`.
-- `crash-guard restore --group 2 --item 3` restores only item `3` from group
-  `2`.
-- `crash-guard restore --boot <boot-id> --group 2` restores group `2` from an
-  older OS boot period.
-
-History is retained indefinitely by default. Cleanup is explicit:
+Cleanup is explicit and dry-run by default:
 
 ```bash
 crash-guard excise --older-than 365
 crash-guard excise --older-than 365 --apply
 ```
 
-Without `--apply`, `excise` only reports how many events and archive files would
-be affected and how many archive bytes would be reclaimed. With `--apply`, it
-requires typing `Jettison the ghosts` before removing old history.
+`--apply` requires typing `Jettison the ghosts` before old history is removed.
 
-## How It Works
+## Terminal Backends
 
-- `cg_run` writes one sentinel under `~/.local/share/crash-guard/live/` before
-  launching a tracked TUI and removes it after clean exit.
-- `start`, `stop`, `archive`, and `restore` events are appended to durable
-  history.
-- Each sentinel records the current kernel `boot_id`. After a WSL restart,
-  old sentinels have a different boot id and are classified as crashed.
-- Restore is CWD-first: it runs the configured continue command in the recorded
-  directory.
-- Wrapper-launched sentinels are normalized at restore time. For example, a
-  sentinel recorded as `rtk` with argv `claude ...` restores through the Claude
-  config instead of being skipped as an unknown `rtk` program.
-- `--from-archive` restores sentinel records that were already moved to
-  `~/.local/share/crash-guard/archive/`.
-- If several instances of the same tool ran in the same directory, restore can
-  resolve session ids from supported tool stores and use `resume_by_id`.
-- `--repair` can truncate null-padded or partial session artifacts after making
-  a backup in `~/.local/share/crash-guard/archive/`.
+| backend | behavior |
+|---------|----------|
+| `tmux` | new tmux windows, meaning full-screen tab-like workspaces, not panes |
+| `ghostty` | resolves to tmux on Linux for tab-like restore behavior |
+| `wezterm` | new tabs in the current/sole WezTerm window when resolvable |
+| `kitty` | new tabs through Kitty remote control, with OS-window fallback |
+| `windows-terminal` | new Windows Terminal tabs through `wt.exe` + `wsl.exe` |
 
-## Tool Notes
+Force a backend:
 
-- Resume flags verified 2026-06: Claude (`-c` / `-r <id>`), Codex
-  (`resume --last` / `resume <id>`), opencode (`-c` / `-s <id>`), Hermes
-  (`--continue` / `--resume <id>`), pi (`-c` / `--session <id>`), Kilo (`-c`).
-- ante has no session-resume flag; restore relaunches `ante repl` in the
-  recorded directory and relies on ante memory injection.
-- Exact multi-instance restore is precise for Claude and best-effort for Codex.
-  Other tools degrade to CWD-first continue with a visible note.
+```bash
+crash-guard restore --terminal tmux
+crash-guard restore --terminal ghostty
+crash-guard restore --terminal wezterm
+```
 
-## Repository
+## Config
 
-This project is licensed under the MIT License. Runtime state and local config
-live under XDG config/data directories, not in the repository.
+Default config lives at:
+
+```text
+~/.config/crash-guard/programs.json
+```
+
+It controls terminal backend selection, per-tool continue/resume commands,
+session-store locations, captured environment patterns, and the restore pre-hook.
+
+## Production Notes
+
+- Runtime state lives under `~/.local/share/crash-guard/`.
+- User config lives under `~/.config/crash-guard/`.
+- The repository has no build step and no third-party Python dependencies.
+- Generated caches and local state are ignored by `.gitignore`.
+- License: MIT.
