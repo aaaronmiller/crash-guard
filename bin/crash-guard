@@ -63,10 +63,11 @@ def color(code, text):
 
 def title():
     art = [
-        "   ____               __       ______                     __",
-        "  / __/______ ____  / /  ___ / ___/_ _____ _________ ___/ /",
-        " _\\ \\/ __/ _ `/ _ \\/ _ \\/ -_) (_ / // / _ `/ __/ _ `/ _  / ",
-        "/___/\\__/\\_,_/_//_/_//_/\\__/\\___/\\_,_/\\_,_/_/  \\_,_/\\_,_/  ",
+        "  _____ _____ _____ _____     _____ _____ _____ _____ ",
+        " |  _  |  _  |  _  |  _  |   |  _  |  _  |  _  |  _  |",
+        " | |_| | |_| | |_| | |_| |   | |_| | |_| | |_| | |_| |",
+        " |_____|_____|_____|_____|   |_____|_____|_____|_____|",
+        "|_____|_____|_____|_____|   |_____|_____|_____|_____|",
     ]
     print(color("1;36", "\n".join(art)))
     print(color("2;37", "terminal recovery ledger\n"))
@@ -112,7 +113,7 @@ DEFAULT_CONFIG = {
     "tmux": {"cli": ""},
     "windows_terminal": {"cli": "", "wsl": ""},
     "env_patterns": DEFAULT_ENV_PATTERNS,
-    "restore": {"pre": DEFAULT_RESTORE_PRE},
+    "restore": {"pre": DEFAULT_RESTORE_PRE, "spawn_delay": 0.5},
     "programs": {
         "claude": {
             "continue": ["rtk", "claude", "--continue", "--dangerously-skip-permissions"],
@@ -743,10 +744,14 @@ def resolve_record_program(r, cfg):
 
     Some launchers record a wrapper key such as `rtk` while storing the actual
     tool in argv. Prefer the concrete tool config when it can be inferred.
+    If the original key has use_sentinel_argv=true, use the recorded argv directly.
     """
     programs = cfg["programs"]
     key = r.get("key")
     prog = programs.get(key)
+    # If the original key has use_sentinel_argv, prefer the recorded argv
+    if prog and prog.get("use_sentinel_argv"):
+        return key, "using recorded argv (use_sentinel_argv)"
     inferred = argv_program_key(r.get("argv") or [], programs)
     if inferred and (not prog or prog.get("use_sentinel_argv")):
         if key and key != inferred:
@@ -755,8 +760,12 @@ def resolve_record_program(r, cfg):
     return key, ""
 
 
-def sentinel_restore_argv(r, key):
+def sentinel_restore_argv(r, key, prog=None):
     argv = list(r.get("argv") or [])
+    # If the program has use_sentinel_argv, don't prepend the key
+    # Just return the argv as-is (it already contains the full command)
+    if prog and prog.get("use_sentinel_argv"):
+        return argv
     if key and (not argv or Path(argv[0]).name != key):
         return [key] + argv
     return argv
@@ -791,7 +800,7 @@ def build_plan(crashed, cfg, repair=False):
                 note = r.get("_plan_note") or "using recorded argv"
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "recorded",
-                    "argv": sentinel_restore_argv(r, key), "note": note,
+                    "argv": sentinel_restore_argv(r, key, prog), "note": note,
                     "env": r.get("env", {}),
                 })
             continue
@@ -1513,7 +1522,8 @@ def cmd_restore(args):
     print("  -> terminal backend: %s (%s)\n" % (backend, ctx["label"]))
 
     ok = 0
-    for item in selected:
+    spawn_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
+    for i, item in enumerate(selected):
         if not item["argv"]:
             print("  skip %s (%s)" % (item["key"], item.get("note", "")))
             continue
@@ -1527,6 +1537,8 @@ def cmd_restore(args):
         if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
             archive_sentinel(item["rec"])
         ok += 1
+        if i < len(selected) - 1 and spawn_delay > 0:
+            time.sleep(spawn_delay)
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
     if backend == "tmux" and ok:
