@@ -172,6 +172,17 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def _deep_merge(base, override):
+    """Recursively merge override into base, preserving base values for missing keys."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def load_config():
     if CFG_FILE.exists():
         try:
@@ -181,18 +192,11 @@ def load_config():
             cfg = {}
     else:
         cfg = {}
-    programs = cfg.setdefault("programs", {})
+    # Deep merge with defaults to ensure all nested keys exist
+    cfg = _deep_merge(DEFAULT_CONFIG, cfg)
+    # Ensure programs dict has all default programs (user can add more)
     for key, prog in DEFAULT_CONFIG["programs"].items():
-        programs.setdefault(key, prog)
-    cfg.setdefault("env_patterns", DEFAULT_ENV_PATTERNS)
-    cfg.setdefault("terminal", DEFAULT_CONFIG["terminal"])
-    cfg.setdefault("wezterm", {})
-    cfg.setdefault("ghostty", {})
-    cfg.setdefault("kitty", {})
-    cfg.setdefault("tmux", {})
-    cfg.setdefault("windows_terminal", {})
-    cfg.setdefault("restore", {"pre": DEFAULT_RESTORE_PRE})
-    cfg["restore"].setdefault("pre", DEFAULT_RESTORE_PRE)
+        cfg["programs"].setdefault(key, prog)
     return cfg
 
 
@@ -762,11 +766,14 @@ def resolve_record_program(r, cfg):
 
 def sentinel_restore_argv(r, key, prog=None):
     argv = list(r.get("argv") or [])
+    if not argv:
+        # Empty argv - cannot restore, return sentinel key as fallback
+        return [key] if key else []
     # If the program has use_sentinel_argv, don't prepend the key
     # Just return the argv as-is (it already contains the full command)
     if prog and prog.get("use_sentinel_argv"):
         return argv
-    if key and (not argv or Path(argv[0]).name != key):
+    if key and Path(argv[0]).name != key:
         return [key] + argv
     return argv
 
@@ -1320,14 +1327,28 @@ def cmd_history(args):
 def cmd_excise(args):
     ensure_dirs()
     cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=args.older_than)
-    events = read_history_events()
-    keep, drop = [], []
-    for ev in events:
-        ev_time = parse_time(ev.get("at"))
-        if ev_time and ev_time < cutoff:
-            drop.append(ev)
-        else:
-            keep.append(ev)
+
+    # Count events without loading all into memory
+    total_events = 0
+    drop_count = 0
+    keep_lines = []
+    if HISTORY_FILE.exists():
+        with HISTORY_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                total_events += 1
+                try:
+                    ev = json.loads(line)
+                    ev_time = parse_time(ev.get("at"))
+                    if ev_time and ev_time < cutoff:
+                        drop_count += 1
+                    else:
+                        keep_lines.append(line)
+                except Exception:
+                    # Keep malformed lines
+                    keep_lines.append(line)
 
     archive_drop = []
     if ARCH_DIR.exists():
@@ -1339,7 +1360,7 @@ def cmd_excise(args):
     archive_bytes = sum(p.stat().st_size for p in archive_drop)
     print("crash-guard excise dry-run")
     print("  cutoff: records older than %d day(s) (%s)" % (args.older_than, cutoff.strftime("%Y-%m-%d %H:%M:%S %z")))
-    print("  history events affected: %d/%d" % (len(drop), len(events)))
+    print("  history events affected: %d/%d" % (drop_count, total_events))
     print("  archive files affected: %d" % len(archive_drop))
     print("  history file size: %d bytes" % history_bytes)
     print("  archive bytes reclaimable: %d bytes" % archive_bytes)
@@ -1353,17 +1374,18 @@ def cmd_excise(args):
         print("aborted; the ghosts keep their bunks.")
         return 1
 
+    # Write kept lines to temp file, then atomic replace
     tmp = HISTORY_FILE.with_suffix(".jsonl.tmp-%d" % os.getpid())
     with tmp.open("w", encoding="utf-8") as f:
-        for ev in keep:
-            f.write(json.dumps(ev, separators=(",", ":")) + "\n")
+        for line in keep_lines:
+            f.write(line + "\n")
     os.replace(str(tmp), str(HISTORY_FILE))
     for p in archive_drop:
         try:
             p.unlink()
         except Exception as e:
             sys.stderr.write("excise: failed to remove %s: %s\n" % (p, e))
-    print("excised %d history event(s) and %d archive file(s)." % (len(drop), len(archive_drop)))
+    print("excised %d history event(s) and %d archive file(s)." % (drop_count, len(archive_drop)))
     return 0
 
 
@@ -1519,10 +1541,40 @@ def cmd_restore(args):
     if ctx.get("error"):
         sys.stderr.write("crash-guard: %s.\n" % ctx["error"])
         return 2
+    # Validate backend CLI works before spawning
+    if backend == "wezterm":
+        test = subprocess.run([cli, "cli", "list", "--format", "json"], capture_output=True, timeout=5)
+        if test.returncode != 0:
+            sys.stderr.write("crash-guard: wezterm CLI not responding (is WezTerm running?)\n")
+            return 2
+    elif backend == "kitty":
+        test = subprocess.run([cli, "@", "ls"], capture_output=True, timeout=5)
+        if test.returncode != 0:
+            sys.stderr.write("crash-guard: kitty remote control not enabled (set 'allow_remote_control yes' in kitty.conf)\n")
+            return 2
+    elif backend == "ghostty":
+        test = subprocess.run([cli, "--version"], capture_output=True, timeout=5)
+        if test.returncode != 0:
+            sys.stderr.write("crash-guard: ghostty not found or not working\n")
+            return 2
+    elif backend == "windows-terminal":
+        test = subprocess.run([cli, "--help"], capture_output=True, timeout=5)
+        if test.returncode != 0:
+            sys.stderr.write("crash-guard: wt.exe not found or not working\n")
+            return 2
     print("  -> terminal backend: %s (%s)\n" % (backend, ctx["label"]))
 
     ok = 0
     spawn_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
+    # Validate spawn_delay
+    try:
+        spawn_delay = float(spawn_delay)
+        if spawn_delay < 0:
+            spawn_delay = 0.5
+        elif spawn_delay > 30:
+            spawn_delay = 30.0
+    except (ValueError, TypeError):
+        spawn_delay = 0.5
     for i, item in enumerate(selected):
         if not item["argv"]:
             print("  skip %s (%s)" % (item["key"], item.get("note", "")))

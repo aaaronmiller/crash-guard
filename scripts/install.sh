@@ -21,24 +21,49 @@ BIN_DIR="$HOME/.local/bin"
 CFG_DIR="$HOME/.config/crash-guard"
 mkdir -p "$BIN_DIR" "$CFG_DIR"
 
-# --- copy the tool + shell integration from alongside this installer ---------
+# --- verify source files ----------------------------------------------------
 if [ ! -f "$SRC_DIR/bin/crash-guard" ] || [ ! -f "$SRC_DIR/shell/crash-guard.sh" ]; then
   echo "error: expected bin/crash-guard and shell/crash-guard.sh under $SRC_DIR." >&2
   echo "       (found in: $SRC_DIR)" >&2
   exit 1
 fi
+if [ ! -x "$SRC_DIR/bin/crash-guard" ]; then
+  echo "error: $SRC_DIR/bin/crash-guard is not executable" >&2
+  exit 1
+fi
+
+# --- verify python3 ---------------------------------------------------------
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 not found in PATH" >&2
+  exit 1
+fi
+
+# --- copy the tool + shell integration --------------------------------------
 install -m 0755 "$SRC_DIR/bin/crash-guard" "$BIN_DIR/crash-guard"
 install -m 0644 "$SRC_DIR/shell/crash-guard.sh" "$CFG_DIR/crash-guard.sh"
 
 # --- write default config (idempotent; never clobbers an existing one) -------
-PATH="$BIN_DIR:$PATH" python3 "$BIN_DIR/crash-guard" init >/dev/null 2>&1 || true
+echo "Initializing config..."
+if ! PATH="$BIN_DIR:$PATH" python3 "$BIN_DIR/crash-guard" init; then
+  echo "warning: config initialization had issues (continuing)" >&2
+fi
+
+# --- verify installation ----------------------------------------------------
+if ! "$BIN_DIR/crash-guard" --help >/dev/null 2>&1; then
+  echo "error: installed crash-guard binary failed to run" >&2
+  exit 1
+fi
 
 echo ""
-echo "crash-guard installed."
+echo "crash-guard installed successfully."
 echo "  binary : $BIN_DIR/crash-guard"
 echo "  shell  : $CFG_DIR/crash-guard.sh"
 echo "  config : $CFG_DIR/programs.json"
 echo ""
-echo "Next: add the README shell integration block to your shell rc, then open a new shell."
+echo "Next steps:"
+echo "  1. Add the README shell integration block to your shell rc (~/.zshrc or ~/.bashrc)"
+echo "  2. Ensure \$HOME/.local/bin is in your PATH"
+echo "  3. Open a new shell or run: source ~/.zshrc"
+echo ""
 echo "Verified resume flags: claude, codex, opencode, hermes, pi. ante = relaunch (memory-based)."
 echo "After a crash, run:  crash-guard    (preview periods: cgh, live status: cgs)"

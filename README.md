@@ -9,16 +9,18 @@ tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
 # crash-guard
 
 ```
-   ____               __       ______                     __
-  / __/______ ____  / /  ___ / ___/_ _____ _________ ___/ /
- _\ \/ __/ _ `/ _ \/ _ \/ -_) (_ / // / _ `/ __/ _ `/ _  /
-/___/\__/\_,_/_//_/_//_/\__/\___/\_,_/\_,_/_/  \_,_/\_,_/
+  _____ _____ _____ _____     _____ _____ _____ _____ 
+ |  _  |  _  |  _  |  _  |   |  _  |  _  |  _  |  _  |
+ | |_| | |_| | |_| | |_| |   | |_| | |_| | |_| | |_| |
+ |_____|_____|_____|_____|   |_____|_____|_____|_____|
+|_____|_____|_____|_____|   |_____|_____|_____|_____|
 ```
 
 Crash-guard keeps a durable recovery ledger for agentic CLI / TUI sessions and
 restores them after WSL restarts, terminal crashes, or failed restore attempts.
 It tracks Claude, Codex, opencode, Hermes, pi, Kilo, ante, and wrapper-launched
-commands such as `rtk`/`xx`.
+commands such as `rtk`/`xx`. The built-in program configs cover:
+`claude`, `codex`, `opencode`, `hermes`, `pi`, `kilo`, `ante`, `rtk`.
 
 It is not a PTY recorder. It stores enough metadata to relaunch the right
 continue/resume command in the right working directory, through the same
@@ -194,7 +196,47 @@ Default config lives at:
 ```
 
 It controls terminal backend selection, per-tool continue/resume commands,
-session-store locations, captured environment patterns, and the restore pre-hook.
+session-store locations, captured environment patterns, the restore pre-hook,
+and restore spawn delay.
+
+Key config options:
+
+- `terminal.backend` — `auto` (default), `tmux`, `wezterm`, `kitty`, `ghostty`, `windows-terminal`
+- `terminal.order` — preference order for auto-detection
+- `restore.pre` — shell command to run before each restore (default: `_proxy_stack_auto_start`)
+- `restore.spawn_delay` — seconds between session restores (default: `0.5`, prevents OOM)
+- `programs.<name>.continue` — command to continue a session in a directory
+- `programs.<name>.resume_by_id` — command to resume by session ID (with `{id}` placeholder)
+- `programs.<name>.store` — session store location for Tier 2 resume (`claude`, `codex`)
+- `programs.<name>.use_sentinel_argv` — if true, replay recorded argv exactly (for wrappers like `rtk`)
+- `env_patterns` — glob patterns for environment variables to capture per-session
+
+## Troubleshooting
+
+**`crash-guard: no wezterm CLI found`**
+- Install WezTerm (`wezterm` or `wezterm.exe` on PATH) or configure `wezterm.cli` in config
+- Or use `--terminal tmux` / `--terminal ghostty` to force a different backend
+
+**`crash-guard: no supported terminal CLI found`**
+- Ensure at least one terminal backend is installed: `tmux`, `wezterm`, `kitty`, `ghostty`, or Windows Terminal (`wt.exe`)
+- Check `crash-guard status` to see current boot's tracked sessions
+
+**Restore spawns too many sessions / system OOM**
+- Reduce `restore.spawn_delay` in config (default 0.5s)
+- Use `crash-guard restore --select` to pick specific sessions
+- Use `crash-guard restore --dry-run` to preview without spawning
+
+**Sessions show as `rtk` instead of actual tool**
+- Ensure `rtk` program config has `use_sentinel_argv: true` (default in v2.0+)
+- Run `crash-guard init` to update config with latest defaults
+
+**`cg_run` alias not found**
+- Ensure `source ~/.config/crash-guard/crash-guard.sh` is in your `~/.zshrc` or `~/.bashrc`
+- Verify `~/.local/bin` is in PATH before sourcing
+
+**History grows too large**
+- Run `crash-guard excise --older-than 90 --apply` to remove old records
+- Adjust retention period as needed
 
 ## Production Notes
 

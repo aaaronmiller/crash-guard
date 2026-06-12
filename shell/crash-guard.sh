@@ -29,6 +29,12 @@ cg_run() {
   local inv
   inv="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
   [ -z "$inv" ] && inv="cg-$$-${RANDOM}-$(date +%s)"
+  # Validate crash-guard is available
+  if ! command -v crash-guard >/dev/null 2>&1; then
+    echo "cg_run: crash-guard not found in PATH" >&2
+    "$@"
+    return $?
+  fi
   command crash-guard start --key "$key" --inv-id "$inv" \
       --cwd "$PWD" --shell-pid "$$" -- "$@" 2>/dev/null
   "$@"

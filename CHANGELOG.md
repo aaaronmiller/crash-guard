@@ -16,6 +16,11 @@
 - Added OS boot-period browsing to `crash-guard history`.
 - Added `crash-guard restore --boot` for restoring groups from older boot periods.
 - Added colorized terminal headings and an ASCII project title for interactive recovery views.
+- Added `restore.spawn_delay` config (default 0.5s) to prevent OOM when restoring multiple sessions.
+- Added recursive config merge so user configs receive all new default keys automatically.
+- Added terminal backend validation before spawning (WezTerm, Kitty, Ghostty, Windows Terminal).
+- Added troubleshooting section to README.
+- Added config documentation for `spawn_delay`, `use_sentinel_argv`, and all program options.
 
 ### Changed
 - Reworked README structure around install, restore workflow, terminal backends, config, and limitations.
@@ -26,9 +31,16 @@
 - Changed interactive restore into a two-step arrow-key picker for recovery group and session selection.
 - Moved executable, shell integration, and installer into `bin/`, `shell/`, and `scripts/` for a cleaner repository root.
 - Changed `scripts/install.sh` to install files only and leave shell rc edits to documented setup steps.
+- Updated ASCII banner to clear "CRASH GUARD" block letters.
+- Improved installer with verification, python3 check, and binary test.
+- Improved `cg_run` with crash-guard PATH validation.
+- Improved excise to process history line-by-line (memory efficient).
 
 ### Fixed
 - Fixed restore planning for wrapper-keyed sentinels such as `rtk` by inferring the concrete tool from recorded argv.
 - Fixed default config merging so existing user configs receive new built-in program entries without overwriting local entries.
 - Added `restore --from-archive` so sentinels archived by a failed restore can be recovered.
 - Fixed archived failed-restore sessions being split apart by preserved file mtimes; archive filename timestamps now group them correctly.
+- Fixed empty argv handling in sentinel restore (returns key as fallback).
+- Fixed spawn_delay validation (clamps to 0-30s range).
+- Fixed config deep merge for nested sections (terminal, restore, wezterm, etc.).
