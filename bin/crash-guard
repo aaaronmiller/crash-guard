@@ -56,9 +56,38 @@ EXCISE_PHRASE = "Jettison the ghosts"
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
+# Named color styles
+_COLOR_NAMES = {
+    # semantic
+    "ok": "32",         # green
+    "warn": "33",       # yellow
+    "fail": "31",       # red
+    "info": "36",       # cyan
+    "highlight": "35",  # magenta
+    "muted": "2;37",    # dim white
+    # direct
+    "green": "32",
+    "yellow": "33",
+    "red": "31",
+    "cyan": "36",
+    "magenta": "35",
+    "white": "37",
+    "bold": "1",
+    "dim": "2",
+    "underline": "4",
+}
+
 
 def color(code, text):
-    return "\033[%sm%s\033[0m" % (code, text) if USE_COLOR else text
+    if not USE_COLOR:
+        return text
+    resolved = _COLOR_NAMES.get(code, code)
+    return "\033[%sm%s\033[0m" % (resolved, text)
+
+
+def colorize(status, text):
+    """Convenience: apply a semantic color in one call."""
+    return color(status, text)
 
 
 def title():
@@ -271,7 +300,9 @@ def parse_time(value):
 
 
 def iso_from_ts(ts):
-    return dt.datetime.fromtimestamp(ts, dt.datetime.now().astimezone().tzinfo).strftime("%Y-%m-%dT%H:%M:%S%z")
+    """Convert a Unix timestamp to ISO 8601 with timezone offset."""
+    tz = dt.datetime.now().astimezone().tzinfo
+    return dt.datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def pid_alive(pid):
@@ -355,18 +386,21 @@ def read_archived_sentinels():
         try:
             rec = json.loads(p.read_text())
             rec["_path"] = str(p)
-            parts = p.name.split(".")
+            # Parse archive timestamp from filename: <stem>.<YYYYMMDD-HHMMSS>.json
             archive_at = None
-            if len(parts) >= 3:
+            for candidate in reversed(p.name.replace(".json", "").split(".")):
+                candidate = candidate.strip()
                 try:
-                    parsed = dt.datetime.strptime(parts[-2], "%Y%m%d-%H%M%S")
+                    parsed = dt.datetime.strptime(candidate, "%Y%m%d-%H%M%S")
                     archive_at = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo).strftime("%Y-%m-%dT%H:%M:%S%z")
-                except Exception:
-                    archive_at = None
+                    break
+                except (ValueError, IndexError):
+                    continue
             rec["_archive_at"] = archive_at or iso_from_ts(p.stat().st_mtime)
+            rec["_archive_sort"] = archive_at or p.stat().st_mtime
             out.append(rec)
-        except Exception:
-            sys.stderr.write("crash-guard: skipping unreadable archive %s\n" % p)
+        except Exception as e:
+            sys.stderr.write("crash-guard: skipping unreadable archive %s: %s\n" % (p, e))
     return out
 
 
@@ -478,7 +512,7 @@ def restore_groups(include_closed=True, boot_id=None):
             rec["_path"] = sess["archive_path"]
         rec["_history_status"] = status or "unknown"
         rec["_history_reason"] = sess.get("reason") or status or "unknown"
-        rec["_history_time"] = sess.get("ended_at") or sess.get("started_at") or ""
+        rec["_history_time"] = sess.get("ended_at") or sess.get("started_at") or None
         sessions.append((inv_id, sess, rec))
 
     groups = []
@@ -555,17 +589,19 @@ def fmt_period_time(value):
 
 def print_boot_periods(periods):
     title()
-    print(color("1;33", "OS boot periods (%d):\n" % len(periods)))
+    print(color("bold", "OS boot periods (%d):\n" % len(periods)))
     for i, p in enumerate(periods, 1):
-        print("  %s %s -> %s  records=%s recoverable=%s closed=%s running=%s boot=%s" % (
-            color("1;32", "%2d." % i),
-            fmt_period_time(p.get("start")),
-            fmt_period_time(p.get("end")),
-            p["records"],
-            p["recoverable"],
-            p["closed"],
-            p["running"],
-            short(p["boot_id"], 8),
+        recoverable_color = "ok" if p["recoverable"] > 0 else "muted"
+        running_color = "ok" if p["running"] > 0 else "muted"
+        print("  %s %s -> %s  %s  %s  %s  %s boot=%s" % (
+            colorize("ok", "%2d." % i),
+            colorize("info", fmt_period_time(p.get("start"))),
+            colorize("info", fmt_period_time(p.get("end"))),
+            colorize("bold", "%d records" % p["records"]),
+            colorize(recoverable_color, "%d recoverable" % p["recoverable"]),
+            colorize(running_color, "%d running" % p["running"]),
+            colorize("muted", "%d closed" % p["closed"]),
+            colorize("muted", short(p["boot_id"], 8)),
         ))
     print("")
 
@@ -614,16 +650,62 @@ def arrow_select(options, title, default=0):
         sys.stdout.flush()
 
 
+def _resolve_display_key(r, cfg):
+    """Return a display label for a sentinel record, showing the resolved
+    program name and, when the raw key differs, noting the original key.
+
+    When the recorded argv includes a wrapper (e.g. ``rtk``) before the
+    actual tool, the wrapper is shown in the label as well.
+    """
+    key, note = resolve_record_program(r, cfg)
+    raw_key = r.get("key", "?")
+    # If both the resolved key and raw key point at the same configured
+    # program (or there was no inference at all), show just the key.
+    if key == raw_key and not note:
+        return key
+    # Show "program (was raw_key)" when inference found a different tool.
+    if note:
+        # Build a wrapper-chain label from the recorded argv when possible.
+        argv = r.get("argv") or []
+        wrappers = []
+        for a in argv:
+            w = Path(a).name
+            if w == key:
+                break
+            if w and w != key:
+                wrappers.append(w)
+        if wrappers:
+            return " → ".join(wrappers) + " → " + key
+        return key
+    return raw_key
+
+
 def print_restore_groups(groups):
+    cfg = load_config()
     title()
-    print(color("1;33", "recovery groups (%d):\n" % len(groups)))
+    print(color("bold", "recovery groups (%d):\n" % len(groups)))
     for i, g in enumerate(groups, 1):
         when = g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown time"
         status = g.get("status") or "unknown"
-        status_color = {"stale": "1;31", "crashed": "1;31", "archived": "1;35", "closed": "1;34"}.get(status, "1;37")
-        print("  %s %-9s %s  (%d session(s))" % (color("1;32", "%2d." % i), color(status_color, status), when, len(g["records"])))
+        status_colors = {"stale": "warn", "crashed": "fail", "archived": "highlight", "closed": "muted"}
+        sc = status_colors.get(status, "info")
+        print("  %s %s %s  (%d session(s))" % (
+            colorize("ok", "%2d." % i),
+            colorize(sc, "%-9s" % status),
+            colorize("info", when),
+            len(g["records"])))
         for j, r in enumerate(g["records"], 1):
-            print("      %s  %-10s %s" % (color("2;37", "%d.%d" % (i, j)), r.get("key", "?"), r.get("cwd", "?")))
+            display = _resolve_display_key(r, cfg)
+            wrap = ""
+            argv = r.get("argv") or []
+            if argv:
+                wrap = "→ " + next((Path(a).name for a in argv if Path(a).name != display.split(" → ")[0] and Path(a).name != display.split(" → ")[-1]), "")
+            print("      %s  %-15s %s%s" % (
+                colorize("muted", "%d.%d" % (i, j)),
+                colorize("bold", display),
+                r.get("cwd", "?"),
+                colorize("muted", "  " + wrap) if wrap else "",
+            ))
     print("")
 
 
@@ -743,6 +825,56 @@ def argv_program_key(argv, programs):
     return None
 
 
+def argv_extra_args(recorded_argv, program_argv, tool_name):
+    """Extract tool-specific user args from recorded argv beyond what the program config supplies.
+
+    The program config command already includes the canonical flags for the tool
+    (e.g. ``--provider openai`` for pi).  If the user passed extra flags at launch
+    (e.g. ``-c`` for continue, ``--model gpt4``), those are appended so restore
+    matches the original invocation as closely as possible.
+
+    Returns a list of argument strings that were present in the recorded argv
+    *after* the tool name but are *not* already supplied by the program config.
+    """
+    if not recorded_argv:
+        return []
+
+    # Locate the tool name in the recorded argv.
+    rec_idx = None
+    for i, a in enumerate(recorded_argv):
+        if Path(a).name == tool_name:
+            rec_idx = i
+            break
+    if rec_idx is None:                     # tool not found — no extra args
+        return []
+
+    rec_tail = recorded_argv[rec_idx + 1:]   # everything after the tool
+
+    if not program_argv:
+        return rec_tail                     # no baseline → everything is "extra"
+
+    # Locate the tool name in the program command.
+    prog_idx = None
+    for i, a in enumerate(program_argv):
+        if Path(a).name == tool_name:
+            prog_idx = i
+            break
+    if prog_idx is None:                    # tool not in program command
+        return rec_tail
+
+    prog_tail = program_argv[prog_idx + 1:]
+
+    # Remove each default arg from the recorded tail (first occurrence only).
+    # What remains are the truly extra flags the user added at launch.
+    extra = list(rec_tail)
+    for a in prog_tail:
+        try:
+            extra.remove(a)
+        except ValueError:
+            pass
+    return extra
+
+
 def resolve_record_program(r, cfg):
     """Return (plan_key, note) for a sentinel record.
 
@@ -753,10 +885,14 @@ def resolve_record_program(r, cfg):
     programs = cfg["programs"]
     key = r.get("key")
     prog = programs.get(key)
+    raw_argv = r.get("argv") or []
+
     # If the original key has use_sentinel_argv, prefer the recorded argv
     if prog and prog.get("use_sentinel_argv"):
         return key, "using recorded argv (use_sentinel_argv)"
-    inferred = argv_program_key(r.get("argv") or [], programs)
+
+    inferred = argv_program_key(raw_argv, programs)
+
     if inferred and (not prog or prog.get("use_sentinel_argv")):
         if key and key != inferred:
             return inferred, "recorded as '%s'; inferred from argv" % key
@@ -795,11 +931,19 @@ def build_plan(crashed, cfg, repair=False):
                 note = "no config entry for '%s'" % key
                 if r.get("_plan_note"):
                     note = "%s; %s" % (r["_plan_note"], note)
-                plan.append({
-                    "key": key, "cwd": cwd, "rec": r, "tier": "skip",
-                    "argv": None, "note": note,
-                    "env": r.get("env", {}),
-                })
+                replay_argv = list(r.get("argv") or [])
+                if replay_argv:
+                    plan.append({
+                        "key": key, "cwd": cwd, "rec": r, "tier": "replay",
+                        "argv": replay_argv, "note": note,
+                        "env": r.get("env", {}),
+                    })
+                else:
+                    plan.append({
+                        "key": key, "cwd": cwd, "rec": r, "tier": "skip",
+                        "argv": None, "note": note,
+                        "env": r.get("env", {}),
+                    })
             continue
 
         if prog.get("use_sentinel_argv"):
@@ -818,15 +962,17 @@ def build_plan(crashed, cfg, repair=False):
 
         for i, r in enumerate(recs):
             env = r.get("env", {})
+            recorded_argv = r.get("argv") or []
             if i < len(sessions):
                 sid, spath = sessions[i]
                 status = verify_artifact(spath, repair=repair)
                 if status in ("ok", "repaired"):
-                    argv = [a.replace("{id}", sid).replace("{cwd}", cwd)
-                            for a in prog["resume_by_id"]]
+                    base_argv = [a.replace("{id}", sid).replace("{cwd}", cwd)
+                                 for a in prog["resume_by_id"]]
+                    extra = argv_extra_args(recorded_argv, base_argv, key)
                     plan.append({
                         "key": key, "cwd": cwd, "rec": r, "tier": "id",
-                        "argv": argv, "session": sid, "verify": status,
+                        "argv": base_argv + extra, "session": sid, "verify": status,
                         "note": "" if status == "ok" else "artifact repaired",
                         "env": env,
                     })
@@ -835,9 +981,11 @@ def build_plan(crashed, cfg, repair=False):
                 note = "session %s %s; using continue" % (sid[:8], status)
                 if r.get("_plan_note"):
                     note = "%s; %s" % (r["_plan_note"], note)
+                base_argv = prog["continue"]
+                extra = argv_extra_args(recorded_argv, base_argv, key)
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "continue",
-                    "argv": prog["continue"], "verify": status,
+                    "argv": base_argv + extra, "verify": status,
                     "note": note,
                     "env": env,
                 })
@@ -846,9 +994,11 @@ def build_plan(crashed, cfg, repair=False):
                 if n > 1 and i > 0:
                     extra = "multiple in same dir, no distinct id; may collapse"
                     note = "%s; %s" % (note, extra) if note else extra
+                base_argv = prog["continue"]
+                uxtra = argv_extra_args(recorded_argv, base_argv, key)
                 plan.append({
                     "key": key, "cwd": cwd, "rec": r, "tier": "continue",
-                    "argv": prog["continue"], "note": note, "env": env,
+                    "argv": base_argv + uxtra, "note": note, "env": env,
                 })
     return plan
 
@@ -872,6 +1022,55 @@ def _env_is(name):
     return (os.environ.get("TERM_PROGRAM") or "").lower() == name.lower()
 
 
+# --------------------------------------------------------------------------
+# cass integration helpers
+# --------------------------------------------------------------------------
+
+def _cass_available():
+    """Return True if the cass binary is on PATH and reachable."""
+    return shutil.which("cass") is not None
+
+
+def _cass_workspace_sessions(workspace, limit=5):
+    """Return a list of cass session dicts for the given workspace, or empty list."""
+    if not _cass_available():
+        return []
+    try:
+        res = subprocess.run(
+            ["cass", "sessions", "--workspace", workspace,
+             "--limit", str(limit), "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if res.returncode != 0:
+            return []
+        data = json.loads(res.stdout)
+        return data.get("sessions") or data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _cass_format_session(s):
+    """One-line summary of a cass session dict."""
+    agent = s.get("agent", "?")
+    title = (s.get("title") or "no title")[:60]
+    human = s.get("human_turns", 0)
+    msgs = s.get("message_count", 0)
+    return "  %-12s %-60s  (%d msgs, %d turns)" % (agent, title, msgs, human)
+
+
+def _cass_workspace_summary(workspace):
+    """Return a multi-line summary string of cass sessions for *workspace*,
+    or empty string if cass is unavailable or no sessions are found."""
+    sessions = _cass_workspace_sessions(workspace, limit=5)
+    if not sessions:
+        return ""
+    lines = []
+    lines.append("       cass:        %d session(s) in this workspace:" % len(sessions))
+    for s in sessions:
+        lines.append("                   %s" % _cass_format_session(s))
+    return "\n".join(lines)
+
+
 def terminal_title(item):
     base = os.path.basename(item["cwd"].rstrip("/")) or "/"
     return "%s @ %s" % (item["key"], base)
@@ -879,6 +1078,228 @@ def terminal_title(item):
 
 def shell_join(argv):
     return " ".join(shlex.quote(a) for a in argv)
+
+
+# --------------------------------------------------------------------------
+# detailed plan display / arg editing
+# --------------------------------------------------------------------------
+
+_SHORT_WIDTH = 48
+
+
+def _short_path(path, maxlen=_SHORT_WIDTH):
+    """Truncate *path* in the middle when it exceeds *maxlen* chars."""
+    s = str(path)
+    if len(s) <= maxlen:
+        return s
+    half = (maxlen - 3) // 2
+    return s[:half] + "..." + s[-half:]
+
+
+def _fmt_env_table(env):
+    """Format an env dict into compact lines, wrapping when lines get long."""
+    if not env:
+        return ""
+    lines = []
+    items = sorted(env.items())
+    buf = ""
+    for k, v in items:
+        piece = "%s=%s" % (k, v)
+        sep = "  " if buf else ""
+        trial = buf + sep + piece
+        if len(trial) > 72 and buf:
+            lines.append(buf)
+            buf = piece
+        else:
+            buf = trial
+    if buf:
+        lines.append(buf)
+    return lines
+
+
+def _recorded_argv(rec):
+    """Safely return a string representation of the original recorded argv."""
+    argv = rec.get("argv") or []
+    if argv:
+        return " ".join(shlex.quote(a) for a in argv)
+    return "(empty)"
+
+
+def format_plan_item(item, cfg, idx, detail=True):
+    """Return a richly formatted multi-line string for one plan item.
+
+    Includes the resolved program, original recorded argv, the restore
+    command, the full shell command that will be executed, and additional
+    metadata (invocation id, boot id, pid, env, note).
+    """
+    key = item["key"]
+    cwd = item["cwd"]
+    tier = item["tier"]
+    note = item.get("note", "")
+    rec = item.get("rec") or {}
+    short_id = (rec.get("inv_id") or "?")[:8]
+    boot_short = (rec.get("boot_id") or "?")[:8]
+    pid = rec.get("shell_pid") or "?"
+    when = rec.get("launched_at") or ""
+
+    # ---- tier color ----
+    tier_colors = {"continue": "ok", "id": "info", "replay": "warn", "recorded": "info", "skip": "muted"}
+    tier_color = tier_colors.get(tier, "muted")
+
+    # ---- header line ----
+    lines = []
+    lines.append("  %2s. %s %s" % (idx, colorize("bold", "%-12s" % key), cwd))
+
+    # ---- tier ----
+    tier_str = "       Tier:        %s" % colorize(tier_color, tier)
+    if item.get("session"):
+        tier_str += "  %s" % colorize("info", "id=%s" % short(item["session"], 8))
+    lines.append(tier_str)
+
+    # ---- recorded argv (what was originally captured) ----
+    recorded_str = _recorded_argv(rec)
+    lines.append("       Recorded:    %s" % colorize("muted", recorded_str))
+
+    # ---- restore cmd (what will be executed after cg_run --) ----
+    if item["argv"]:
+        restore_str = " ".join(shlex.quote(a) for a in item["argv"])
+        lines.append("       Restore cmd: %s" % colorize("bold", restore_str))
+    else:
+        lines.append("       Restore cmd: %s" % colorize("muted", "(skipped)"))
+
+    # ---- full shell command (the actual command that gets spawned) ----
+    if detail and item["argv"]:
+        shell = os.environ.get("SHELL", "/bin/zsh")
+        exports = ""
+        for k, v in (item.get("env") or {}).items():
+            exports += "export %s=%s; " % (k, shlex.quote(v))
+        pre = (cfg.get("restore") or {}).get("pre", "")
+        pre_part = (pre.rstrip() + " ") if pre else ""
+        payload = "cd %s; %s%scg_run %s -- %s" % (
+            shlex.quote(item["cwd"]),
+            exports,
+            pre_part,
+            shlex.quote(item["key"]),
+            " ".join(shlex.quote(a) for a in item["argv"]),
+        )
+        lines.append("       Full shell:  %s" % colorize("dim", _short_path(payload)))
+        if len(payload) > _SHORT_WIDTH:
+            lines.append("                    %s" % colorize("dim", payload))
+
+    # ---- metadata: inv, boot, pid, launched_at ----
+    meta_parts = []
+    meta_parts.append("inv_%-8s" % short_id)
+    meta_parts.append("boot_%-8s" % boot_short)
+    meta_parts.append("pid_%s" % pid)
+    if when:
+        meta_parts.append("@ %s" % when)
+    lines.append("       Sent:        %s" % "  ".join(meta_parts))
+
+    # ---- verify status (for "id" tier) ----
+    if item.get("verify") and item["verify"] not in ("ok", ""):
+        verify_color = "ok" if item["verify"] == "repaired" else "fail"
+        lines.append("       Verify:      %s" % colorize(verify_color, item["verify"]))
+    if item.get("session"):
+        lines.append("       Session ID:  %s" % colorize("highlight", item["session"]))
+
+    # ---- env ----
+    env_lines = _fmt_env_table(item.get("env") or {})
+    if env_lines:
+        lines.append("       Env:         %s" % colorize("muted", env_lines[0]))
+        for el in env_lines[1:]:
+            lines.append("                     %s" % colorize("muted", el))
+
+    # ---- note ----
+    if note:
+        lines.append("       Note:        %s" % colorize("warn", note))
+
+    # ---- cass hint (when cass binary is on PATH) ----
+    cass_summary = item.get("_cass_summary", "")
+    if cass_summary:
+        lines.append(cass_summary)
+    elif _cass_available() and cwd:
+        lines.append("       cass:        %s" % colorize("muted",
+            'cass sessions --workspace "%s" --limit 3' % cwd))
+
+    return "\n".join(lines) + "\n"
+
+
+def edit_plan_interactive(plan, cfg):
+    """Walk the user through modifying extra args for each plan item.
+
+    Returns a new *plan* list with updated ``argv`` values.  The original
+    plan items are not mutated (shallow copy).
+    """
+    plan = [dict(item) for item in plan]   # shallow copy
+    print("")
+    print("== Argument Edit Mode ==")
+    print("For each session, you can replace the full restore argv.")
+    print("  %s Keep the current command as-is." % colorize("muted", "• Enter"))
+    print("  %s Type new argument tokens to replace the restore argv." % colorize("ok", "• <args>"))
+    print("  %s Use the base command only (strip extras)." % colorize("warn", "• clear"))
+    print("  %s Exclude this session from the restore." % colorize("fail", "• skip"))
+    print("  %s Finish editing early." % colorize("info", "• done"))
+    print("")
+
+    for i, item in enumerate(plan, 1):
+        if not item["argv"]:
+            continue
+        key = item["key"]
+        cwd_path = item["cwd"]
+        base_argv = " ".join(shlex.quote(a) for a in item["argv"])
+        print("  [%d/%d] %s @ %s" % (i, len(plan), colorize("bold", key), cwd_path))
+        print("    current: %s" % base_argv)
+        raw = input("    new args [Enter=keep]: ").strip()
+        if raw.lower() in ("done", "done()"):
+            break
+        if raw.lower() == "skip":
+            item["argv"] = None
+            print("    %s" % colorize("muted", "    -> skipped"))
+            continue
+        if raw == "":
+            print("    %s" % colorize("muted", "    -> kept"))
+            continue
+        if raw.lower() == "clear":
+            # Recompute from program config without extra args
+            prog = cfg["programs"].get(item["key"])
+            if prog:
+                item["argv"] = list(prog.get("continue") or prog.get("resume_by_id") or [])
+            else:
+                # No config — use just the tool name from recorded argv
+                rec_argv = (item.get("rec") or {}).get("argv") or []
+                item["argv"] = list(rec_argv) if rec_argv else None
+            restored = " ".join(shlex.quote(a) for a in (item["argv"] or []))
+            print("    %s" % colorize("info", "    -> base only: %s" % restored))
+            continue
+        # Replace with user-typed args
+        item["argv"] = shlex.split(raw)
+        print("    %s" % colorize("ok", "    -> updated: %s" % raw))
+
+    print("")
+    return plan
+
+
+def print_detailed_plan(plan, cfg):
+    """Print the full detailed plan header + all items."""
+    if not plan:
+        return
+    # Gather cass context for each unique workspace (one subprocess per workspace)
+    cass_cache = {}
+    if _cass_available():
+        cwds = sorted(set(item["cwd"] for item in plan if item.get("cwd")))
+        for cwd in cwds:
+            summary = _cass_workspace_summary(cwd)
+            if summary:
+                cass_cache[cwd] = summary
+        for item in plan:
+            if item.get("cwd") in cass_cache:
+                item["_cass_summary"] = cass_cache[item["cwd"]]
+
+    print("crash-guard restore plan (%d session(s)):\n" % len(plan))
+    for i, item in enumerate(plan, 1):
+        print(format_plan_item(item, cfg, i, detail=True))
+    plansig = sum(len(item.get("argv") or []) for item in plan)
+    print("  total arguments across %d item(s): %d\n" % (len(plan), plansig))
 
 
 def resolve_terminal_backend(cfg, requested="auto"):
@@ -1213,28 +1634,36 @@ def short(s, n=8):
     return (s or "")[:n]
 
 
-def fmt_row(r, status):
-    return "  [%s] %-12s %s" % (status, r.get("key", "?"), r.get("cwd", "?"))
+def fmt_row(r, status, cfg=None):
+    label = r.get("key", "?")
+    if cfg:
+        resolved, _ = resolve_record_program(r, cfg)
+        if resolved and resolved != label:
+            label = resolved
+    color_map = {"run": "ok", "stl": "warn", "crx": "fail"}
+    status_display = colorize(color_map.get(status, "muted"), "%-4s" % status)
+    return "  [%s] %s %s" % (status_display, colorize("bold", "%-12s" % label), r.get("cwd", "?"))
 
 
 def cmd_status(args):
     cur = boot_id()
     recs = read_sentinels()
     running, stale, crashed = classify(recs, cur)
-    print("crash-guard status  (boot %s)" % short(cur, 8))
+    print("crash-guard status  (boot %s)" % colorize("muted", short(cur, 8)))
     print("  tracked sentinels: %d" % len(recs))
+    cfg = load_config()
     if running:
-        print("\nrunning (%d):" % len(running))
+        print(colorize("ok", "\nrunning (%d):" % len(running)))
         for r in running:
-            print(fmt_row(r, "run"))
+            print(fmt_row(r, "run", cfg))
     if stale:
-        print("\nstale this boot (%d) -- launcher died, tool gone:" % len(stale))
+        print(colorize("warn", "\nstale this boot (%d) -- launcher died, tool gone:" % len(stale)))
         for r in stale:
-            print(fmt_row(r, "stl"))
+            print(fmt_row(r, "stl", cfg))
     if crashed:
-        print("\ncrashed / from a previous boot (%d) -- restorable:" % len(crashed))
+        print(colorize("fail", "\ncrashed / from a previous boot (%d) -- restorable:" % len(crashed)))
         for r in crashed:
-            print(fmt_row(r, "crx"))
+            print(fmt_row(r, "crx", cfg))
     if not (running or stale or crashed):
         print("  nothing tracked.")
     return 0
@@ -1303,6 +1732,25 @@ def cmd_history(args):
         print("crash-guard: no history recorded.")
         return 0
     print_boot_periods(periods)
+    if args.cass:
+        # Show cass session context for all workspaces across all groups
+        all_cwds = sorted(set(
+            r.get("cwd")
+            for p in periods
+            for g in restore_groups(include_closed=True, boot_id=p["boot_id"])
+            for r in g["records"] if r.get("cwd")
+        ))
+        if all_cwds:
+            print(colorize("bold", "\ncass session context:"))
+            for cwd in all_cwds:
+                summary = _cass_workspace_summary(cwd)
+                if summary:
+                    print("  %s" % colorize("muted", cwd))
+                    print(summary)
+                else:
+                    print("  %s: %s" % (colorize("muted", cwd),
+                                        colorize("muted", "\u2014 no cass sessions")))
+            print("")
     if args.list or not sys.stdin.isatty():
         return 0
     opts = [
@@ -1469,6 +1917,44 @@ def select_group_records(groups, args):
     return records
 
 
+def _print_restore_help():
+    print("")
+    print("  Commands:")
+    print("    Y / Enter   — restore all sessions with current args")
+    print("    n / no      — abort")
+    print("    e / edit    — interactively edit extra arguments per session")
+    print("    ? / help    — show this help")
+    print("")
+
+
+def _apply_args_from_cli(plan, cfg, spec):
+    """Parse *spec* (e.g. ``1:--model gpt4``) and update *plan* argv.
+
+    Multiple specs can be given by repeating ``--apply-args``.
+    """
+    if ":" not in spec:
+        return
+    idx_part, _, remainder = spec.partition(":")
+    try:
+        idx = int(idx_part) - 1   # 1-based → 0-based
+    except ValueError:
+        return
+    if idx < 0 or idx >= len(plan):
+        return
+    tokens = shlex.split(remainder.strip())
+    if tokens:
+        plan[idx]["argv"] = tokens
+    else:
+        # No tokens → use base command (clear extras)
+        item = plan[idx]
+        prog = cfg.get("programs", {}).get(item["key"])
+        if prog:
+            plan[idx]["argv"] = list(prog.get("continue") or prog.get("resume_by_id") or [])
+        else:
+            rec_argv = (item.get("rec") or {}).get("argv") or []
+            plan[idx]["argv"] = list(rec_argv) if rec_argv else None
+
+
 def cmd_restore(args):
     ensure_dirs()
     cfg = load_config()
@@ -1493,18 +1979,15 @@ def cmd_restore(args):
 
     plan = build_plan(targets, cfg, repair=args.repair)
 
-    print("crash-guard restore plan (%d session(s)):\n" % len(plan))
-    for i, item in enumerate(plan, 1):
-        tier = item["tier"]
-        cmd = " ".join(item["argv"]) if item["argv"] else "(skipped)"
-        print("  %2d. %-12s %s" % (i, item["key"], item["cwd"]))
-        meta = "tier=%s  ->  %s" % (tier, cmd)
-        if item.get("session"):
-            meta += "  [id %s]" % short(item["session"], 8)
-        print("      " + meta)
-        if item.get("note"):
-            print("      note: %s" % item["note"])
-    print("")
+    # --apply-args (CLI override, applied before showing the plan)
+    if args.apply_args:
+        for spec in args.apply_args:
+            _apply_args_from_cli(plan, cfg, spec)
+
+    # Inherit --yes into the history prompt when it was used for the login check.
+    args._history_prompted = getattr(args, "_history_prompted", False)
+
+    print_detailed_plan(plan, cfg)
 
     if args.dry_run:
         print("dry-run: nothing spawned.")
@@ -1518,11 +2001,27 @@ def cmd_restore(args):
             return 0
         if raw not in ("all", "a"):
             selected = _select(plan, raw)
-    elif not args.yes and not getattr(args, "_history_prompted", False):
-        ans = input("Restore all %d session(s)? [Y/n] " % len(plan)).strip().lower()
-        if ans in ("n", "no"):
-            print("aborted.")
-            return 0
+    elif not args.yes and not args._history_prompted:
+        prompt = ("Restore all %d session(s)? [Y/n/e/?] " % len(plan))
+        while True:
+            ans = input(prompt).strip().lower()
+            if ans in ("y", "yes", ""):
+                break
+            if ans in ("n", "no"):
+                print("aborted.")
+                return 0
+            if ans in ("e", "edit", "a", "args"):
+                plan = edit_plan_interactive(plan, cfg)
+                selected = plan
+                print_detailed_plan(plan, cfg)
+                prompt = "Restore all %d session(s) with updated args? [Y/n/?] " % len(plan)
+                continue
+            if ans in ("?", "help"):
+                _print_restore_help()
+                continue
+            # unknown — re-prompt
+            _print_restore_help()
+            prompt = "Restore all %d session(s)? [Y/n/e/?] " % len(plan)
 
     if args.no_spawn:
         print("no-spawn: printing commands only.\n")
@@ -1623,6 +2122,50 @@ def cmd_init(args):
     return 0
 
 
+def cmd_context(args):
+    """Show a unified view: crash-guard sentinel status + cass session data for a path."""
+    target = Path(args.path or os.getcwd()).resolve()
+    print("crash-guard context for %s" % target)
+
+    # ---- crash-guard sentinels ----
+    recs = read_sentinels()
+    cur = boot_id()
+    running, stale, crashed = classify(recs, cur)
+
+    print(colorize("bold", "\ncrash-guard:"))
+    matching = [r for r in recs
+                if Path(r.get("cwd", "")).resolve() == target]
+    if matching:
+        for r in matching:
+            status = "running" if r in running else ("stale" if r in stale else "crashed")
+            sc = {"running": "ok", "stale": "warn", "crashed": "fail"}.get(status, "muted")
+            print("  %s %s %s  (pid %s, boot %s)" % (
+                colorize(sc, "%-8s" % status),
+                colorize("bold", r.get("key", "?")),
+                r.get("cwd", "?"),
+                r.get("shell_pid", "?"),
+                short(r.get("boot_id", ""), 8),
+            ))
+    else:
+        print("  %s no tracked sentinels for this path." % colorize("muted", "\u2014"))
+
+    # ---- cass sessions ----
+    if _cass_available():
+        print(colorize("bold", "\ncass:"))
+        sessions = _cass_workspace_sessions(str(target), limit=args.limit or 10)
+        if sessions:
+            for s in sessions:
+                print(_cass_format_session(s))
+        else:
+            print("  %s no sessions indexed for this workspace." % colorize("muted", "\u2014"))
+    else:
+        print(colorize("bold", "\ncass:"))
+        print("  %s cass binary not found on PATH." % colorize("muted", "\u2014"))
+        print("  Install from https://github.com/ice-ninja/cass")
+
+    return 0
+
+
 def cmd_genid(args):
     try:
         print(Path("/proc/sys/kernel/random/uuid").read_text().strip())
@@ -1667,7 +2210,17 @@ def main():
     s.add_argument("--json", action="store_true")
     s.add_argument("--list", action="store_true",
                    help="list OS boot periods without interactive selection")
+    s.add_argument("--cass", action="store_true",
+                   help="enrich with cass session data for each workspace")
     s.set_defaults(func=cmd_history)
+
+    s = sub.add_parser("context",
+                       help="unified view: crash-guard sentinels + cass sessions for a path")
+    s.add_argument("path", nargs="?", default=None,
+                   help="directory path (default: current working directory)")
+    s.add_argument("--limit", type=int, default=10,
+                   help="max cass sessions to show per workspace (default: 10)")
+    s.set_defaults(func=cmd_context)
 
     s = sub.add_parser("excise")
     s.add_argument("--older-than", type=int, default=365,
@@ -1699,6 +2252,9 @@ def main():
     s.add_argument("--include-stale", action="store_true")
     s.add_argument("--from-archive", action="store_true",
                    help="restore previously archived sentinel records")
+    s.add_argument("--apply-args", action="append", default=None,
+                   help="Override extra arguments for a session (e.g. 1:--model gpt4);"
+                        " can be repeated")
     s.set_defaults(func=cmd_restore)
 
     s = sub.add_parser("init")
