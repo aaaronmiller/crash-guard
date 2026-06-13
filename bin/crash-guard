@@ -2132,7 +2132,7 @@ def archive_sentinel(r):
             extra = {"reason": r.get("_history_reason") or "restored", "archive_path": str(dst)}
             if dur is not None:
                 extra["duration_secs"] = round(dur, 1)
-            src.rename(dst)
+            shutil.move(str(src), str(dst))
             append_history("archive", r, **extra)
     except Exception as e:
         sys.stderr.write("archive: %s\n" % e)
