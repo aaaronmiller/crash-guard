@@ -91,6 +91,7 @@ fi
 # (Shown here for documentation; the live copies live in ~/.zshrc.)
 #
 #   # claude (proxy :8082, Anthropic protocol)
+#   # NOTE: _proxy_stack_auto_start is external — define it in your own shell rc
 #   alias cc='_proxy_stack_auto_start && ANTHROPIC_BASE_URL=http://127.0.0.1:8082 ANTHROPIC_API_KEY=pass cg_run claude -- rtk claude --dangerously-skip-permissions'
 #   alias ccc='_proxy_stack_auto_start && ANTHROPIC_BASE_URL=http://127.0.0.1:8082 ANTHROPIC_API_KEY=pass cg_run claude -- rtk claude --continue --dangerously-skip-permissions'
 #

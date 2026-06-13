@@ -119,7 +119,6 @@ Open a new shell or run:
 ```bash
 source ~/.zshrc
 ```
-
 ## Daily Use
 
 Run tracked aliases normally. Each launcher writes a live sentinel before the
@@ -161,6 +160,7 @@ crash-guard restore --no-spawn
 crash-guard restore --include-closed   # also show cleanly closed sessions
 crash-guard restore --include-closed --list-groups  # preview only
 ```
+
 
 ## History
 

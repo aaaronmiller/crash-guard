@@ -3069,9 +3069,9 @@ def main():
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-spawn", action="store_true")
     s.add_argument("--group", type=int, default=0,
-                   help="restore a numbered recovery group from crash-guard history")
+                   help="restore recovery group N (run --list-groups to see groups)")
     s.add_argument("--boot", default="",
-                   help="limit restore groups to a specific boot id")
+                   help="restore groups from a specific boot (run 'crash-guard history --list' to see boot IDs)")
     s.add_argument("--item", default="",
                    help="restore one or more item numbers from the selected group")
     s.add_argument("--list-groups", action="store_true",
@@ -3086,7 +3086,7 @@ def main():
     s.add_argument("--batch", action="store_true",
                    help="non-interactive mode: auto-confirm + group 1")
     s.add_argument("--repair", action="store_true",
-                   help="truncate null/partial tails in session files (backs up first)")
+                   help="repair truncated Claude/Codex session artifacts before resuming (backs up originals)")
     # --include-stale was intentionally removed: stale sessions from the
     # current boot are already included by default in restore groups.
     s.add_argument("--from-archive", action="store_true",
