@@ -1630,10 +1630,13 @@ def tmux_spawn(cli, ctx, cwd, title, inner):
     else:
         argv = [cli, "new-window", "-P", "-F", "#{session_name}:#{window_id}",
                 "-t", ctx["session"], "-n", title, "-c", cwd, command]
-    res = subprocess.run(argv, capture_output=True, text=True)
-    if res.returncode != 0:
-        return None, res.stderr.strip()
-    return res.stdout.strip() or "tmux window", None
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if res.returncode != 0:
+            return None, res.stderr.strip()
+        return res.stdout.strip() or "tmux window", None
+    except subprocess.TimeoutExpired:
+        return "tmux window (timeout)", None
 
 
 def tmux_attach(cli, ctx):
@@ -1650,15 +1653,21 @@ def kitty_spawn(cli, cwd, title, inner):
         "--tab-title", title,
         "--cwd", cwd,
     ] + inner
-    res = subprocess.run(argv, capture_output=True, text=True)
-    if res.returncode == 0:
-        return res.stdout.strip() or "kitty tab", None
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            return res.stdout.strip() or "kitty tab", None
+        err = res.stderr.strip()
+    except subprocess.TimeoutExpired:
+        err = "kitty @ launch timed out (remote control may not be enabled)"
+    except Exception as e:
+        err = str(e)
 
     fallback = [cli, "--directory", cwd, "--title", title] + inner
     try:
         proc = subprocess.Popen(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        return None, "%s; fallback failed: %s" % (res.stderr.strip(), e)
+        return None, "%s; fallback failed: %s" % (err, e)
     return "kitty pid %s" % proc.pid, None
 
 
@@ -1700,10 +1709,13 @@ def wt_spawn(cli, wsl, cwd, title, inner):
         wsl_argv += ["-d", distro]
     wsl_argv += ["--cd", cwd, "--exec"] + inner
     argv = [cli, "-w", "0", "new-tab", "--title", title] + wsl_argv
-    res = subprocess.run(argv, capture_output=True, text=True)
-    if res.returncode != 0:
-        return None, res.stderr.strip()
-    return "wt tab", None
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        if res.returncode != 0:
+            return None, res.stderr.strip()
+        return "wt tab", None
+    except subprocess.TimeoutExpired:
+        return "wt tab (timeout)", None
 
 
 # --------------------------------------------------------------------------
