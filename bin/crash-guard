@@ -2922,6 +2922,12 @@ def cmd_analytics(args):
 
 
 def main():
+    # Handle --version at the top level before argparse touches subparsers
+    if len(sys.argv) == 2 and sys.argv[1] == "--version":
+        print("crash-guard version 2.1.0")
+        print("Python %s" % sys.version.split()[0])
+        sys.exit(0)
+
     p = argparse.ArgumentParser(prog="crash-guard", description="WSL2 agentic session recovery")
     if len(sys.argv) == 1 or (len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help")):
         sys.argv.insert(1, "restore")
@@ -3001,7 +3007,8 @@ def main():
                    help="non-interactive mode: auto-confirm + group 1")
     s.add_argument("--repair", action="store_true",
                    help="truncate null/partial tails in session files (backs up first)")
-    s.add_argument("--include-stale", action="store_true")
+    # --include-stale was intentionally removed: stale sessions from the
+    # current boot are already included by default in restore groups.
     s.add_argument("--from-archive", action="store_true",
                    help="restore previously archived sentinel records")
     s.add_argument("--apply-args", action="append", default=None,
