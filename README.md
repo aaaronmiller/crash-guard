@@ -259,6 +259,20 @@ Key config options:
 - Run `crash-guard excise --older-than 90 --apply` to remove old records
 - Adjust retention period as needed
 
+**Security: what crash-guard stores**
+- `cwd` (working directory) is recorded in every sentinel — full filesystem paths
+  appear in analytics and metrics. If your path contains sensitive information
+  (e.g. `/home/me/code/client-acme-corp`), it will be visible in the history log
+  and analytics output.
+- `argv` (command arguments) is recorded in every sentinel. **Do not pass secrets
+  as command-line arguments** (e.g. `--api-key sk-xxx`). Use environment
+  variables or config files instead.
+- `env` captures only proxy-routing environment variables (URLs, base endpoints,
+  non-secret placeholders). Real API keys and auth tokens are explicitly dropped
+  by `env_snapshot()`.
+- History files are stored in plaintext under `~/.local/share/crash-guard/`. They
+  are not encrypted. Protect your home directory accordingly.
+
 **Session naming**
 - Use `cg_run --name "my-label" key -- cmd` to tag sessions with a human-readable name
 - Names appear in restore groups in `[brackets]` and in the detailed plan

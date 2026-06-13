@@ -2228,6 +2228,12 @@ def cmd_restore(args):
     ensure_dirs()
     cfg = load_config()
     cur = boot_id()
+    # Unique restore_id for correlating all events in this invocation
+    try:
+        restore_id = Path("/proc/sys/kernel/random/uuid").read_text().strip()[:8]
+    except Exception:
+        import uuid
+        restore_id = str(uuid.uuid4())[:8]
     if args.from_archive:
         targets = read_archived_sentinels()
         # Skip ephemeral archive sessions (< 5s)
@@ -2382,6 +2388,7 @@ def cmd_restore(args):
         backend=backend,
         plan=plan_summary,
         system=_system_snapshot(),
+        restore_id=restore_id,
         flush=True,
     )
 
@@ -2408,7 +2415,7 @@ def cmd_restore(args):
         inner = build_inner(item, cfg)
         # Log each item before spawning for crash tracing
         append_history("restore_attempt", item["rec"], backend=backend, spawn_idx=i,
-                        cmd=item.get("argv", []), flush=True)
+                        cmd=item.get("argv", []), restore_id=restore_id, flush=True)
         spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
         # Fallback: if tmux fails and ghostty is available, try ghostty once
         if spawned is None and backend == "tmux" and shutil.which("ghostty"):
@@ -2418,10 +2425,10 @@ def cmd_restore(args):
             spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
-            append_history("restore_fail", item["rec"], backend=backend, error=err, flush=True)
+            append_history("restore_fail", item["rec"], backend=backend, error=err, restore_id=restore_id, flush=True)
             continue
         print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
-        append_history("restore_ok", item["rec"], backend=backend, flush=True)
+        append_history("restore_ok", item["rec"], backend=backend, restore_id=restore_id, flush=True)
         if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
             archive_sentinel(item["rec"])
         ok += 1
@@ -2433,6 +2440,7 @@ def cmd_restore(args):
         "restore_done", None,
         ok=ok, total=len(selected), backend=backend,
         system=_system_snapshot(),
+        restore_id=restore_id,
         flush=True,
     )
     if backend == "tmux" and ok and ctx.get("inside"):
@@ -2532,9 +2540,19 @@ def cmd_metrics(args):
     cfg = load_config()
     cur = boot_id()
 
+    def _prom_esc(v):
+        """Escape a Prometheus label value: backslash, double-quote, newline."""
+        return str(v).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
     def _emit():
         lines = []
         ts = int(time.time())
+
+        # ---- build info ----
+        lines.append("# HELP crash_guard_build_info Build metadata for crash-guard")
+        lines.append("# TYPE crash_guard_build_info gauge")
+        lines.append('crash_guard_build_info{version="2.1.0",python="%s"} 1 %d' % (
+            _prom_esc(sys.version.split()[0]), ts))
 
         # ---- live sentinel gauges ----
         live = read_sentinels()
@@ -2542,7 +2560,7 @@ def cmd_metrics(args):
         lines.append("# HELP crash_guard_live_sessions Current tracked sessions by status")
         lines.append("# TYPE crash_guard_live_sessions gauge")
         for status_name, recs in [("running", running), ("stale", stale), ("crashed", crashed)]:
-            lines.append('crash_guard_live_sessions{status="%s"} %d %d' % (status_name, len(recs), ts))
+            lines.append('crash_guard_live_sessions{status="%s"} %d %d' % (_prom_esc(status_name), len(recs), ts))
         lines.append('crash_guard_live_sessions{status="total"} %d %d' % (len(live), ts))
 
         # ---- tool usage gauge ----
@@ -2553,7 +2571,7 @@ def cmd_metrics(args):
         lines.append("# HELP crash_guard_sessions_by_tool Live sessions by tool key")
         lines.append("# TYPE crash_guard_sessions_by_tool gauge")
         for k, c in sorted(tool_counts.items()):
-            lines.append('crash_guard_sessions_by_tool{tool="%s"} %d %d' % (k, c, ts))
+            lines.append('crash_guard_sessions_by_tool{tool="%s"} %d %d' % (_prom_esc(k), c, ts))
 
         # ---- history event counters ----
         events = read_history_events()
@@ -2574,13 +2592,14 @@ def cmd_metrics(args):
         lines.append("# HELP crash_guard_history_events_total Count of history events by type")
         lines.append("# TYPE crash_guard_history_events_total counter")
         for e, c in sorted(counters.items()):
-            lines.append('crash_guard_history_events_total{event="%s"} %d %d' % (e, c, ts))
+            lines.append('crash_guard_history_events_total{event="%s"} %d %d' % (_prom_esc(e), c, ts))
 
         lines.append("# HELP crash_guard_restore_by_backend Restore events by backend")
         lines.append("# TYPE crash_guard_restore_by_backend counter")
         for ev_type, backends in sorted(restore_by_backend.items()):
             for bk, c in sorted(backends.items()):
-                lines.append('crash_guard_restore_by_backend{event="%s",backend="%s"} %d %d' % (ev_type, bk, c, ts))
+                lines.append('crash_guard_restore_by_backend{event="%s",backend="%s"} %d %d' % (
+                    _prom_esc(ev_type), _prom_esc(bk), c, ts))
 
         # ---- session duration summary from history ----
         durations = []
@@ -2621,6 +2640,22 @@ def cmd_metrics(args):
         lines.append("# HELP crash_guard_crashed_sentinels_total Crashed sentinels from prior boots")
         lines.append("# TYPE crash_guard_crashed_sentinels_total gauge")
         lines.append('crash_guard_crashed_sentinels_total %d %d' % (len(crashed), ts))
+
+        # ---- last restore timestamp ----
+        for ev in reversed(events):
+            if ev.get("event") == "restore_done":
+                at = ev.get("at", "")
+                if at:
+                    try:
+                        from datetime import datetime as _dt
+                        parsed = _dt.strptime(at[:19], "%Y-%m-%dT%H:%M:%S")
+                        epoch = int(parsed.timestamp())
+                        lines.append("# HELP crash_guard_last_restore_timestamp_seconds Unix epoch of last restore_done")
+                        lines.append("# TYPE crash_guard_last_restore_timestamp_seconds gauge")
+                        lines.append('crash_guard_last_restore_timestamp_seconds %d %d' % (epoch, ts))
+                    except Exception:
+                        pass
+                break
 
         return "\n".join(lines) + "\n"
 
