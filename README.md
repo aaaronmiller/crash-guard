@@ -1,6 +1,6 @@
 ---
-date: 2026-06-02 00:00:00 PT
-ver: 2.0.0
+date: 2026-06-13 00:00:00 PT
+ver: 2.1.0
 author: Ice-ninja
 model: claude-opus-4-8
 tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
@@ -58,6 +58,16 @@ alias cgr='crash-guard restore'                                      # crash-gua
 alias cgs='crash-guard status'                                       # crash-guard status/preview
 alias cgr-archive='crash-guard restore --from-archive --terminal ghostty' # recover archived restore via Ghostty/tmux tabs
 alias cgh='crash-guard history'                                      # crash-guard OS boot history browser
+```
+
+#### Session naming (optional)
+
+You can tag a session with a human-readable name at launch. Names appear in
+restore groups and the detailed plan, helping distinguish multiple sessions
+in the same directory:
+
+```bash
+alias my-pi='cg_run --name "pi-on-crash-guard" rtk -- pi -c'
 ```
 
 Then add tracked launcher aliases. On this machine, the active proxy aliases use
@@ -127,6 +137,15 @@ numbers to select a group. It then lets you select all sessions in that group or
 one individual session. Pressing Enter on the defaults restores the newest
 recoverable group.
 
+Restore groups show:
+- **Session duration** (e.g. `(8h35m)`, `(51s)`) — sessions that ran < 5 seconds
+  are automatically filtered out (they're test launches or missing commands, not
+  worth restoring).
+- **Git context** — branch name and dirty✓/dirty✗ indicator for each session's
+  working directory.
+- **Session name** — if set via `cg_run --name "my-label"`, shown in `[brackets]`.
+- **Ephemeral filtering** — sessions that ran < 5 seconds are never shown.
+
 Useful non-interactive forms:
 
 ```bash
@@ -136,6 +155,8 @@ crash-guard restore --group 2 --item 3
 crash-guard restore --boot <boot-id> --group 1
 crash-guard restore --from-archive --terminal ghostty
 crash-guard restore --no-spawn
+crash-guard restore --include-closed   # also show cleanly closed sessions
+crash-guard restore --include-closed --list-groups  # preview only
 ```
 
 ## History
@@ -237,6 +258,30 @@ Key config options:
 **History grows too large**
 - Run `crash-guard excise --older-than 90 --apply` to remove old records
 - Adjust retention period as needed
+
+**Session naming**
+- Use `cg_run --name "my-label" key -- cmd` to tag sessions with a human-readable name
+- Names appear in restore groups in `[brackets]` and in the detailed plan
+- Helps distinguish multiple sessions running in the same directory
+
+**Crash diagnostics**
+- After a system crash mid-restore, the next login shows a one-line diagnostic:
+  `restored 2/3 via ghostty (1 failed) — critically low memory: ~500MB available`
+- This reads `history.jsonl` events which are fsynced to disk before each spawn
+- The `restore_start` event includes a system snapshot (memory, process count),
+  the full plan summary, and the terminal backend being used
+- If you see memory warnings, reduce `restore.spawn_delay` or restore fewer sessions
+
+**Diagnostic history events (advanced)**
+
+The append-only `history.jsonl` now records detailed restore lifecycle:
+```
+restore_start: plan summary, backend, system memory/process snapshot
+restore_attempt: per-item, logged BEFORE spawn (survives OOM kill)
+restore_ok / restore_fail: per-item result
+restore_done: final counts, system snapshot (compare before/after)
+```
+All restore events use `flush=True` + `os.fsync()` so they survive process kill.
 
 ## Production Notes
 

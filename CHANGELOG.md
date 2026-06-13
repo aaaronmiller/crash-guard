@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- Added `append_history(flush=True)` with `os.fsync()` for restore-related events so the log survives OOM kill.
+- Added `_system_snapshot()` helper: logs `mem_total_kb`, `mem_avail_kb`, `live_sentinels`, `user_procs` in `restore_start`/`restore_done` events for crash diagnosis.
+- Added `restore_start`/`restore_attempt`/`restore_ok`/`restore_fail`/`restore_done` history events for full restore traceability (replaces single `restore` event).
+- Added `restore_start` includes full plan summary (key, cwd, inv_id, argv, tier per session) and system snapshot.
+- Added session duration tracking: `cmd_stop` and `archive_sentinel` now compute `duration_secs` from `launched_at`.
+- Added session duration display in recovery groups (e.g. `(8h35m)`, `(51s)`).
+- Added ephemeral session filtering: sessions that ran < 5 seconds are never shown in restore groups (they're single-shot commands that exited immediately, not worth restoring).
+- Added `_last_restore_diagnostic()` and enhanced `cmd_notify` to show a one-line diagnostic after a restore attempt, including memory pressure warnings (e.g. "critically low memory before crash: ~500MB available").
+- Added clarifying restore output: "archiving old sentinel(s) and spawning fresh sessions (new inv_id per restore)" so the archive/new-session relationship is clear.
+- Added command-existence check before spawning: warns when the first token of restore argv is not on PATH.
+- Added `--include-closed` flag (opt-in) to show cleanly closed sessions in recovery groups.
 - Added terminal backend restore support for tmux, Ghostty, kitty, Windows Terminal, and existing WezTerm behavior.
 - Added `crash-guard restore --terminal` to force a restore backend when auto-detection is not desired.
 - Added MIT license and repository ignore rules for generated/local files.
@@ -24,7 +35,7 @@
 
 ### Changed
 - Reworked README structure around install, restore workflow, terminal backends, config, and limitations.
-- Changed Ghostty restore behavior to use tmux windows in the current Ghostty tab instead of opening Ghostty OS windows.
+- Changed Ghostty restore behavior to use tmux windows in the current Ghostty tab instead of opening Ghostty OS windows (was still opening new OS windows).
 - Clarified that tmux restore uses tmux windows, not split panes.
 - Changed default restore to derive targets from durable recovery groups instead of only currently crashed live sentinels.
 - Changed `history` from a flat group list into a boot-period browser with number/arrow-key selection.
@@ -37,6 +48,11 @@
 - Improved excise to process history line-by-line (memory efficient).
 
 ### Fixed
+- **Fixed catastrophic OOM crash on restore**: Ghostty backend was opening new OS windows via `+new-window` instead of using tmux tabs inside the current window. When restoring multiple crashed AI-agent sessions (e.g. claude+hermes+codex), each got a new Ghostty OS window running a heavy agent, rapidly exhausting memory and crashing the desktop session. Now auto-detects when running in Ghostty and prefers tmux (with Ghostty as fallback only when tmux is absent).
+- **Fixed `ghostty_spawn` blocking the spawn loop**: Changed from `subprocess.run` to `subprocess.Popen` so the spawn loop doesn't block until the inner command exits.
+- **Fixed default restore showing all-time sessions**: Default `--boot` now filters to the current boot ID only, so sessions from old boots don't clutter the restore list.
+- **Fixed archived sessions appearing in default restore**: Archived sentinels (already restored) no longer show up as restore targets. Use `--from-archive` to include them.
+- **Fixed `--no-closed` flipped semantics**: Replaced with `--include-closed` (opt-in, default False) so closed sessions don't clutter the default restore view.
 - Fixed restore planning for wrapper-keyed sentinels such as `rtk` by inferring the concrete tool from recorded argv.
 - Fixed default config merging so existing user configs receive new built-in program entries without overwriting local entries.
 - Added `restore --from-archive` so sentinels archived by a failed restore can be recovered.

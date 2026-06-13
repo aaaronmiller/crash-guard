@@ -1,6 +1,6 @@
 # ---
-# date: 2026-06-02 00:00:00 PT
-# ver: 2.0.0
+# date: 2026-06-13 00:00:00 PT
+# ver: 2.1.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, shell-integration, zsh, bash, session-recovery, terminal]
@@ -25,7 +25,15 @@
 #       cc foo  ->  ... cg_run claude -- rtk claude --flags foo
 cg_run() {
   local key="$1"; shift
-  if [ "${1:-}" = "--" ]; then shift; fi
+  local name=""
+  # Parse optional --name/-n before the -- separator
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name|-n) name="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
   local inv
   inv="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
   [ -z "$inv" ] && inv="cg-$$-${RANDOM}-$(date +%s)"
@@ -35,8 +43,9 @@ cg_run() {
     "$@"
     return $?
   fi
-  command crash-guard start --key "$key" --inv-id "$inv" \
-      --cwd "$PWD" --shell-pid "$$" -- "$@" 2>/dev/null
+  local start_args="start --key \"$key\" --inv-id \"$inv\" --cwd \"$PWD\" --shell-pid \"$$\""
+  [ -n "$name" ] && start_args="$start_args --name \"$name\""
+  command crash-guard $start_args -- "$@" 2>/dev/null
   "$@"
   local rc=$?
   command crash-guard stop --inv-id "$inv" 2>/dev/null

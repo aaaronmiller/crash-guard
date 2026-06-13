@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ---
-# date: 2026-06-02 00:00:00 PT
-# ver: 2.0.0
+# date: 2026-06-13 00:00:00 PT
+# ver: 2.1.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, python]
@@ -251,6 +251,66 @@ def _value_is_nonsecret(v):
     return len(v) <= 8
 
 
+def _system_snapshot():
+    """Return a compact dict of system resources relevant to crash diagnosis.
+
+    Used in restore_start / restore_done logging to help diagnose OOM or
+    resource-exhaustion crashes.
+    """
+    snap = {}
+    # memory
+    try:
+        mem = Path("/proc/meminfo").read_text().splitlines()
+        for line in mem:
+            if line.startswith("MemTotal:"):
+                snap["mem_total_kb"] = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                snap["mem_avail_kb"] = int(line.split()[1])
+    except Exception:
+        pass
+    # count of tracked AI processes from crash-guard live sentinels
+    try:
+        snap["live_sentinels"] = len(list(LIVE_DIR.glob("*.json")))
+    except Exception:
+        pass
+    # count of all user processes (excluding kernel)
+    try:
+        snap["user_procs"] = sum(
+            1 for p in Path("/proc").iterdir()
+            if p.name.isdigit()
+        )
+    except Exception:
+        pass
+    return snap
+
+
+def _git_context(path):
+    """Return a compact dict with git branch, short commit, and dirty flag
+    for *path*, or empty dict if not a git repo or git is unavailable."""
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        if not branch or "fatal" in branch:
+            return {}
+        commit = subprocess.run(
+            ["git", "-C", str(path), "log", "--oneline", "-1"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        return {
+            "branch": branch,
+            "commit": commit,
+            "dirty": bool(dirty),
+        }
+    except Exception:
+        return {}
+
+
 def env_snapshot(patterns):
     """Capture proxy-routing env only. Never persist real credentials.
 
@@ -273,8 +333,21 @@ def atomic_write(path, text):
     os.replace(str(tmp), str(path))
 
 
-def append_history(event, rec=None, **extra):
-    """Append one durable history event. Best-effort, never blocks launchers."""
+def _history_flush(f):
+    """Flush and fsync a history file handle to disk. Best-effort."""
+    try:
+        f.flush()
+        os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def append_history(event, rec=None, flush=False, **extra):
+    """Append one durable history event. Best-effort, never blocks launchers.
+
+    Sets ``flush=True`` for restore-related events so the record survives an
+    OOM kill or session crash mid-restore.
+    """
     try:
         ensure_dirs()
         payload = {
@@ -282,10 +355,15 @@ def append_history(event, rec=None, **extra):
             "at": now_iso(),
         }
         if rec is not None:
-            payload["record"] = {k: v for k, v in rec.items() if k != "_path"}
+            # Strip internal-only fields; never write _path (may contain 
+            # live/archive distinction that's meaningless on a different boot)
+            clean = {k: v for k, v in rec.items() if not k.startswith("_")}
+            payload["record"] = clean
         payload.update(extra)
         with HISTORY_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            if flush:
+                _history_flush(f)
     except Exception as e:
         sys.stderr.write("crash-guard history: %s\n" % e)
 
@@ -338,6 +416,8 @@ def cmd_start(args):
             "launched_at": now_iso(),
             "host": os.uname().nodename,
         }
+        if args.name:
+            rec["name"] = args.name
         atomic_write(LIVE_DIR / (args.inv_id + ".json"), json.dumps(rec) + "\n")
         append_history("start", rec)
     except Exception as e:
@@ -353,7 +433,17 @@ def cmd_stop(args):
                 rec = json.loads(p.read_text())
             except Exception:
                 rec = {"inv_id": args.inv_id}
-            append_history("stop", rec, reason="closed")
+            # Compute session duration from launched_at to now
+            launched = rec.get("launched_at")
+            dur = None
+            if launched:
+                lt = parse_time(launched)
+                if lt:
+                    dur = max(0, (dt.datetime.now(lt.tzinfo) - lt).total_seconds())
+            extra = {"reason": "closed"}
+            if dur is not None:
+                extra["duration_secs"] = round(dur, 1)
+            append_history("stop", rec, **extra)
             p.unlink()
     except Exception as e:
         sys.stderr.write("crash-guard stop: %s\n" % e)
@@ -398,6 +488,16 @@ def read_archived_sentinels():
                     continue
             rec["_archive_at"] = archive_at or iso_from_ts(p.stat().st_mtime)
             rec["_archive_sort"] = archive_at or p.stat().st_mtime
+            # Compute duration from launched_at to archive time for ephemeral detection
+            launched = rec.get("launched_at")
+            if launched:
+                lt = parse_time(launched)
+                at = parse_time(rec["_archive_at"])
+                if lt and at:
+                    dur = max(0, (at - lt).total_seconds())
+                    rec["_duration_secs"] = dur
+                    if dur < 5:
+                        rec["_ephemeral"] = True
             out.append(rec)
         except Exception as e:
             sys.stderr.write("crash-guard: skipping unreadable archive %s: %s\n" % (p, e))
@@ -487,6 +587,31 @@ def history_sessions():
         cur["live_path"] = rec.get("_path")
         if status in ("stale", "crashed"):
             cur.setdefault("ended_at", now_iso())
+
+    # Compute session duration for all sessions with known start/end.
+    # Sessions that ran < 5 seconds are "ephemeral" (single-command that
+    # immediately exited, or a command not found on PATH).
+    for inv_id, cur in sessions.items():
+        started = cur.get("started_at") or (cur.get("record") or {}).get("launched_at")
+        ended = cur.get("ended_at")
+        if started and ended:
+            # Try to get duration from the stop/archive event first
+            dur = None
+            for ev in cur.get("events", []):
+                if ev.get("event") in ("stop", "archive") and ev.get("duration_secs") is not None:
+                    dur = ev["duration_secs"]
+                    break
+            if dur is None:
+                # Compute from timestamps
+                st = parse_time(started)
+                en = parse_time(ended)
+                if st and en:
+                    dur = max(0, (en - st).total_seconds())
+            if dur is not None:
+                cur["_duration_secs"] = dur
+                if dur < 5:
+                    cur["_ephemeral"] = True
+
     return sessions
 
 
@@ -494,13 +619,22 @@ def session_sort_time(sess):
     return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
 
-def restore_groups(include_closed=True, boot_id=None):
+def restore_groups(include_closed=True, boot_id=None, include_archived=False):
     sessions = []
     for inv_id, sess in history_sessions().items():
         status = sess.get("status")
         if status == "running":
             continue
         if status == "closed" and not include_closed:
+            continue
+        # Skip archived-only sessions unless explicitly requested
+        # (archive_path set but no live_path means it's been archived and
+        #  the original live sentinel is gone)
+        if sess.get("archive_path") and not sess.get("live_path") and not include_archived:
+            continue
+        # Skip ephemeral sessions that ran < 5 seconds (e.g. command not found,
+        # test invocations, accidental launches). These are never useful to restore.
+        if sess.get("_ephemeral"):
             continue
         rec = dict(sess.get("record") or {})
         if boot_id and rec.get("boot_id") != boot_id:
@@ -513,6 +647,7 @@ def restore_groups(include_closed=True, boot_id=None):
         rec["_history_status"] = status or "unknown"
         rec["_history_reason"] = sess.get("reason") or status or "unknown"
         rec["_history_time"] = sess.get("ended_at") or sess.get("started_at") or None
+        rec["_duration_secs"] = sess.get("_duration_secs")
         sessions.append((inv_id, sess, rec))
 
     groups = []
@@ -684,6 +819,8 @@ def print_restore_groups(groups):
     cfg = load_config()
     title()
     print(color("bold", "recovery groups (%d):\n" % len(groups)))
+    # Cache git context per cwd to avoid repeated subprocess calls
+    git_cache = {}
     for i, g in enumerate(groups, 1):
         when = g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown time"
         status = g.get("status") or "unknown"
@@ -700,11 +837,41 @@ def print_restore_groups(groups):
             argv = r.get("argv") or []
             if argv:
                 wrap = "→ " + next((Path(a).name for a in argv if Path(a).name != display.split(" → ")[0] and Path(a).name != display.split(" → ")[-1]), "")
-            print("      %s  %-15s %s%s" % (
+            # Duration label
+            dur_label = ""
+            dur = r.get("_duration_secs")
+            if dur is not None:
+                if dur < 60:
+                    dur_label = "  (%.0fs)" % dur
+                elif dur < 3600:
+                    dur_label = "  (%dm%ds)" % (dur // 60, dur % 60)
+                else:
+                    dur_label = "  (%dh%dm)" % (dur // 3600, (dur % 3600) // 60)
+            # Session name (optional, set via cg_run --name)
+            name_label = ""
+            sname = r.get("name") or ""
+            if sname:
+                name_label = "  [%s]" % colorize("highlight", sname)
+            # Git context (cached per cwd)
+            cwd = r.get("cwd", "")
+            git_label = ""
+            if cwd and cwd not in git_cache:
+                git_cache[cwd] = _git_context(cwd)
+            gc = git_cache.get(cwd, {})
+            if gc:
+                git_label = "  %s" % gc.get("branch", "")
+                if gc.get("dirty"):
+                    git_label += colorize("warn", "✗")
+                else:
+                    git_label += colorize("ok", "✓")
+            print("      %s  %-15s %s%s%s%s%s" % (
                 colorize("muted", "%d.%d" % (i, j)),
                 colorize("bold", display),
-                r.get("cwd", "?"),
+                cwd,
                 colorize("muted", "  " + wrap) if wrap else "",
+                colorize("muted", dur_label) if dur_label else "",
+                name_label if name_label else "",
+                colorize("muted", git_label) if git_label else "",
             ))
     print("")
 
@@ -1150,6 +1317,17 @@ def format_plan_item(item, cfg, idx, detail=True):
     lines = []
     lines.append("  %2s. %s %s" % (idx, colorize("bold", "%-12s" % key), cwd))
 
+    # ---- session name (optional) ----
+    sname = rec.get("name") or ""
+    if sname:
+        lines.append("       Name:        %s" % colorize("highlight", sname))
+
+    # ---- git context ----
+    git = _git_context(cwd)
+    if git:
+        flag = colorize("warn", "✗") if git.get("dirty") else colorize("ok", "✓")
+        lines.append("       Git:         %s  %s" % (git.get("branch", "?"), flag))
+
     # ---- tier ----
     tier_str = "       Tier:        %s" % colorize(tier_color, tier)
     if item.get("session"):
@@ -1339,10 +1517,19 @@ def resolve_terminal_backend(cfg, requested="auto"):
         current.append("wezterm")
     if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
         current.append("kitty")
-    if _env_is("ghostty"):
-        current.append("ghostty")
     if os.environ.get("WT_SESSION"):
         current.append("windows-terminal")
+
+    # NOTE: Ghostty on Linux (GTK) opens separate OS windows via +new-window.
+    # Opening many Ghostty OS windows with heavy AI agents can OOM the system.
+    # When running inside Ghostty AND tmux is available, prefer tmux windows
+    # (which appear as tabs in the current Ghostty window). Only fall back to
+    # opening new Ghostty OS windows when tmux is not installed.
+    in_ghostty = _env_is("ghostty")
+    if in_ghostty and shutil.which("tmux"):
+        current.append("tmux")
+    elif in_ghostty:
+        current.append("ghostty")
 
     order = (cfg.get("terminal") or {}).get("order") or DEFAULT_CONFIG["terminal"]["order"]
     for backend in current + [b for b in order if b not in current]:
@@ -1447,15 +1634,20 @@ def kitty_spawn(cli, cwd, title, inner):
 
 
 def ghostty_spawn(cli, cwd, title, inner):
+    # Use Popen (non-blocking) for both +new-window and the plain fallback.
+    # subprocess.run would block the spawn loop until the inner command exits,
+    # which could be hours for an AI agent session.
     argv = [
         cli, "+new-window",
         "--working-directory=%s" % cwd,
         "--title=%s" % title,
         "-e",
     ] + inner
-    res = subprocess.run(argv, capture_output=True, text=True)
-    if res.returncode == 0:
-        return res.stdout.strip() or "ghostty window", None
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "ghostty pid %s" % proc.pid, None
+    except Exception as e:
+        primary_err = str(e)
 
     # Older or platform-specific Ghostty builds may not support +new-window.
     # Plain ghostty -e still creates a surface and returns immediately via Popen.
@@ -1468,7 +1660,7 @@ def ghostty_spawn(cli, cwd, title, inner):
     try:
         proc = subprocess.Popen(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        return None, "%s; fallback failed: %s" % (res.stderr.strip(), e)
+        return None, "%s; fallback failed: %s" % (primary_err, e)
     return "ghostty pid %s" % proc.pid, None
 
 
@@ -1668,6 +1860,51 @@ def cmd_status(args):
     return 0
 
 
+def _last_restore_diagnostic():
+    """Scan history for the most recent restore_done event and return a
+    one-line diagnostic string, or empty string if none found."""
+    if not HISTORY_FILE.exists():
+        return ""
+    last_restore = None
+    last_start = None
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get("event") == "restore_done":
+                    last_restore = ev
+                elif ev.get("event") == "restore_start":
+                    last_start = ev
+    except Exception:
+        pass
+    if not last_restore:
+        return ""
+    ok = last_restore.get("ok", 0)
+    total = last_restore.get("total", 0)
+    backend = last_restore.get("backend", "?")
+    system = last_restore.get("system") or {}
+    avail = system.get("mem_avail_kb", 0)
+    parts = []
+    if total > 0:
+        if ok == total:
+            parts.append("restored %d/%d OK via %s" % (ok, total, backend))
+        else:
+            parts.append("restored %d/%d via %s (%d failed)" % (ok, total, backend, total - ok))
+    if avail:
+        avail_mb = avail / 1024
+        if avail_mb < 500:
+            parts.append("critically low memory before crash: ~%dMB available" % round(avail_mb))
+        elif avail_mb < 2000:
+            parts.append("low memory: ~%dMB available before restore" % round(avail_mb))
+    return " ".join(parts)
+
+
 def cmd_notify(args):
     """One-line, once-per-boot hint when crashed sessions exist. Login hook."""
     cur = boot_id()
@@ -1682,12 +1919,19 @@ def cmd_notify(args):
         marker.touch()
     except Exception:
         pass
+    lines = []
     if crashed:
-        sys.stdout.write(
+        lines.append(
             "\033[33mcrash-guard:\033[0m %d crashed session(s) from a previous "
-            "boot -- run \033[1mcgr\033[0m to restore (\033[1mcgs\033[0m to preview).\n"
+            "boot -- run \033[1mcgr\033[0m to restore (\033[1mcgs\033[0m to preview)."
             % len(crashed)
         )
+    # Append restore diagnostic if available
+    diag = _last_restore_diagnostic()
+    if diag:
+        lines.append("  \033[2m%s\033[0m" % diag)
+    if lines:
+        sys.stdout.write("\n".join(lines) + "\n")
     return 0
 
 
@@ -1736,7 +1980,7 @@ def cmd_history(args):
         all_cwds = sorted(set(
             r.get("cwd")
             for p in periods
-            for g in restore_groups(include_closed=True, boot_id=p["boot_id"])
+            for g in restore_groups(include_closed=True, boot_id=p["boot_id"], include_archived=True)
             for r in g["records"] if r.get("cwd")
         ))
         if all_cwds:
@@ -1765,7 +2009,7 @@ def cmd_history(args):
         return 1
     print("")
     period = periods[idx]
-    groups = restore_groups(include_closed=True, boot_id=period["boot_id"])
+    groups = restore_groups(include_closed=True, boot_id=period["boot_id"], include_archived=True)
     print_restore_groups(groups)
     print("Restore from this period with: crash-guard restore --boot %s --group N" % period["boot_id"])
     return 0
@@ -1842,15 +2086,31 @@ def archive_sentinel(r):
         if src.exists():
             ts = time.strftime("%Y%m%d-%H%M%S")
             dst = ARCH_DIR / ("%s.%s.json" % (src.stem, ts))
+            # Compute session duration from launched_at to archive time
+            launched = r.get("launched_at")
+            dur = None
+            if launched:
+                lt = parse_time(launched)
+                if lt:
+                    dur = max(0, (dt.datetime.now(lt.tzinfo) - lt).total_seconds())
+            extra = {"reason": r.get("_history_reason") or "restored", "archive_path": str(dst)}
+            if dur is not None:
+                extra["duration_secs"] = round(dur, 1)
             src.rename(dst)
-            append_history("archive", r, reason=r.get("_history_reason") or "restored", archive_path=str(dst))
+            append_history("archive", r, **extra)
     except Exception as e:
         sys.stderr.write("archive: %s\n" % e)
 
 
 def select_group_records(groups, args):
     if args.from_archive:
-        return read_archived_sentinels()
+        targets = read_archived_sentinels()
+        # Skip ephemeral archive sessions (< 5s — test launches, missing commands)
+        filtered = [r for r in targets if not r.get("_ephemeral")]
+        skipped = len(targets) - len(filtered)
+        if skipped:
+            print("  (%d ephemeral archive session(s) filtered out)\n" % skipped)
+        return filtered
     if not groups:
         return []
     if args.group:
@@ -1972,8 +2232,22 @@ def cmd_restore(args):
     cur = boot_id()
     if args.from_archive:
         targets = read_archived_sentinels()
+        # Skip ephemeral archive sessions (< 5s)
+        filtered = [r for r in targets if not r.get("_ephemeral")]
+        skipped = len(targets) - len(filtered)
+        if skipped:
+            print("  (%d ephemeral archive session(s) filtered out)\n" % skipped)
+        targets = filtered
     else:
-        groups = restore_groups(include_closed=args.include_closed, boot_id=args.boot)
+        # Default to current boot only (crashed from previous boot or stale this boot).
+        # When --boot is not specified, use the current boot. This prevents accidentally
+        # restoring sessions from many boots ago.
+        effective_boot = args.boot if args.boot else cur
+        groups = restore_groups(
+            include_closed=args.include_closed,
+            boot_id=effective_boot,
+            include_archived=args.from_archive,
+        )
         if args.list_groups:
             print_restore_groups(groups)
             return 0
@@ -2084,6 +2358,29 @@ def cmd_restore(args):
             sys.stderr.write("crash-guard: wt.exe not found or not working\n")
             return 2
     print("  -> terminal backend: %s (%s)\n" % (backend, ctx["label"]))
+    print("  -> archiving old sentinel(s) and spawning fresh sessions (new inv_id per restore)")
+    print("     (a new crash will find the new sessions, not the old archives)\n")
+
+    # Log restore_start with system snapshot and plan details before spawning
+    # — if the system crashes mid-restore we need evidence of what was attempted.
+    plan_summary = []
+    for s in selected:
+        rec = s.get("rec") or {}
+        plan_summary.append({
+            "key": s["key"],
+            "cwd": s.get("cwd", ""),
+            "inv_id": rec.get("inv_id", ""),
+            "argv": s.get("argv", []),
+            "tier": s.get("tier", ""),
+        })
+    append_history(
+        "restore_start", None,
+        plan_count=len(selected),
+        backend=backend,
+        plan=plan_summary,
+        system=_system_snapshot(),
+        flush=True,
+    )
 
     ok = 0
     spawn_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
@@ -2100,13 +2397,22 @@ def cmd_restore(args):
         if not item["argv"]:
             print("  skip %s (%s)" % (item["key"], item.get("note", "")))
             continue
+        # Warn if the first command in the restore argv doesn't exist on PATH
+        cmd_name = Path(item["argv"][0]).name if item["argv"] else ""
+        if cmd_name and not shutil.which(cmd_name):
+            print("  %s %s: command '%s' not found on PATH; spawning anyway" % (
+                colorize("warn", "WARN"), item["key"], cmd_name))
         inner = build_inner(item, cfg)
+        # Log each item before spawning for crash tracing
+        append_history("restore_attempt", item["rec"], backend=backend, spawn_idx=i,
+                        cmd=item.get("argv", []), flush=True)
         spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
+            append_history("restore_fail", item["rec"], backend=backend, error=err, flush=True)
             continue
         print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
-        append_history("restore", item["rec"], backend=backend)
+        append_history("restore_ok", item["rec"], backend=backend, flush=True)
         if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
             archive_sentinel(item["rec"])
         ok += 1
@@ -2114,6 +2420,12 @@ def cmd_restore(args):
             time.sleep(spawn_delay)
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
+    append_history(
+        "restore_done", None,
+        ok=ok, total=len(selected), backend=backend,
+        system=_system_snapshot(),
+        flush=True,
+    )
     if backend == "tmux" and ok and ctx.get("inside"):
         attach_rc = tmux_attach(cli, ctx)
         if attach_rc != 0:
@@ -2208,6 +2520,8 @@ def main():
     s.add_argument("--inv-id", required=True)
     s.add_argument("--cwd", default="")
     s.add_argument("--shell-pid", type=int, default=0)
+    s.add_argument("--name", default="",
+                   help="human-readable session name (shown in restore groups)")
     s.add_argument("argv", nargs=argparse.REMAINDER)
     s.set_defaults(func=cmd_start)
 
@@ -2264,8 +2578,8 @@ def main():
                    help="restore one or more item numbers from the selected group")
     s.add_argument("--list-groups", action="store_true",
                    help="list recovery groups without restoring")
-    s.add_argument("--no-closed", dest="include_closed", action="store_false", default=True,
-                   help="hide cleanly closed sessions from recovery history")
+    s.add_argument("--include-closed", dest="include_closed", action="store_true", default=False,
+                   help="also include cleanly closed sessions in recovery groups")
     s.add_argument("--terminal", default=None,
                    choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
                    help="terminal backend for spawning restored sessions")
