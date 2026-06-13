@@ -47,12 +47,13 @@ cg_run() {
     "$@"
     return $?
   fi
-  local start_args="start --key \"$key\" --inv-id \"$inv\" --cwd \"$PWD\" --shell-pid \"$$\""
-  [ -n "$name" ] && start_args="$start_args --name \"$name\""
-  command crash-guard $start_args -- "$@" 2>/dev/null
+  # Build start args as array to handle spaces in key/name/cwd safely
+  local start_args=(start --key "$key" --inv-id "$inv" --cwd "$PWD" --shell-pid "$$")
+  [ -n "$name" ] && start_args+=(--name "$name")
+  command crash-guard "${start_args[@]}" -- "$@"
   "$@"
   local rc=$?
-  command crash-guard stop --inv-id "$inv" 2>/dev/null
+  command crash-guard stop --inv-id "$inv"
   return $rc
 }
 
