@@ -2262,12 +2262,16 @@ def cmd_restore(args):
         if not args.group:
             args.group = 1
         args.yes = True
-    # Unique restore_id for correlating all events in this invocation
+    # Unique restore_id for correlating all events in this invocation.
+    # Full UUID (36 chars) — no collision risk across machines or time.
     try:
-        restore_id = Path("/proc/sys/kernel/random/uuid").read_text().strip()[:8]
+        restore_id = Path("/proc/sys/kernel/random/uuid").read_text().strip()
     except Exception:
-        import uuid
-        restore_id = str(uuid.uuid4())[:8]
+        try:
+            import uuid
+            restore_id = str(uuid.uuid4())
+        except Exception:
+            restore_id = "fallback-%.0f-%d" % (time.time(), os.getpid())
     if args.from_archive:
         targets = read_archived_sentinels()
         # Skip ephemeral archive sessions (< 5s)
@@ -2314,6 +2318,9 @@ def cmd_restore(args):
     # Inherit --yes into the history prompt when it was used for the login check.
     args._history_prompted = getattr(args, "_history_prompted", False)
 
+    # Print the restore_id in the plan header so users can correlate
+    # dry-run output to actual history events after the restore
+    print("  restore_id: %s\n" % restore_id)
     print_detailed_plan(plan, cfg, detail=args.verbose)
 
     if args.dry_run:
@@ -2709,8 +2716,8 @@ def cmd_metrics(args):
         lines.append("# TYPE crash_guard_restore_by_backend counter")
         for ev_type, backends in sorted(restore_by_backend.items()):
             for bk, c in sorted(backends.items()):
-                lines.append('crash_guard_restore_by_backend{event="%s",backend="%s"} %d %d' % (
-                    _prom_esc(ev_type), _prom_esc(bk), c, ts))
+                lines.append('crash_guard_restore_by_backend{result="%s",backend="%s"} %d %d' % (
+                    _prom_esc(ev_type.replace("restore_", "")), _prom_esc(bk), c, ts))
 
         # ---- session duration summary from history ----
         durations = []
