@@ -285,28 +285,26 @@ def _system_snapshot():
 
 
 def _git_context(path):
-    """Return a compact dict with git branch, short commit, and dirty flag
-    for *path*, or empty dict if not a git repo or git is unavailable."""
+    """Return a compact dict with git branch and dirty flag for *path*, or
+    empty dict if not a git repo or git is unavailable.
+
+    Uses a single ``git status --porcelain -b`` call (branch + dirty status
+    in one invocation, 2s timeout)."""
     try:
-        branch = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-        if not branch or "fatal" in branch:
+        res = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain", "-b"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if res.returncode != 0 or "fatal" in (res.stderr + res.stdout):
             return {}
-        commit = subprocess.run(
-            ["git", "-C", str(path), "log", "--oneline", "-1"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "-C", str(path), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout.strip()
-        return {
-            "branch": branch,
-            "commit": commit,
-            "dirty": bool(dirty),
-        }
+        lines = res.stdout.strip().split("\n")
+        branch_line = lines[0] if lines else ""
+        branch = branch_line.replace("## ", "").split("...")[0].split(" ")[0] if branch_line else ""
+        if not branch:
+            return {}
+        # Dirty if any line after the first exists and is non-empty
+        dirty = bool("".join(lines[1:]).strip()) if len(lines) > 1 else False
+        return {"branch": branch, "dirty": dirty}
     except Exception:
         return {}
 
@@ -338,8 +336,8 @@ def _history_flush(f):
     try:
         f.flush()
         os.fsync(f.fileno())
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write("crash-guard history: fsync failed: %s\n" % e)
 
 
 def append_history(event, rec=None, flush=False, **extra):
@@ -2359,7 +2357,12 @@ def cmd_restore(args):
             return 2
     print("  -> terminal backend: %s (%s)\n" % (backend, ctx["label"]))
     print("  -> archiving old sentinel(s) and spawning fresh sessions (new inv_id per restore)")
-    print("     (a new crash will find the new sessions, not the old archives)\n")
+    print("     (a new crash will find the new sessions, not the old archives)")
+    if backend == "tmux" and not ctx.get("inside"):
+        sess_name = ctx.get("session", "crash-guard-???")
+        print("  -> tmux session \033[1m%s\033[0m will be created in detached mode." % sess_name)
+        print("     After restore, attach with:  \033[1mtmux attach -t %s\033[0m" % sess_name)
+        print("     (or use \033[1m--terminal ghostty\033[0m to open OS windows instead)\n")
 
     # Log restore_start with system snapshot and plan details before spawning
     # — if the system crashes mid-restore we need evidence of what was attempted.
@@ -2407,6 +2410,12 @@ def cmd_restore(args):
         append_history("restore_attempt", item["rec"], backend=backend, spawn_idx=i,
                         cmd=item.get("argv", []), flush=True)
         spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
+        # Fallback: if tmux fails and ghostty is available, try ghostty once
+        if spawned is None and backend == "tmux" and shutil.which("ghostty"):
+            print("  %s tmux failed, falling back to ghostty..." % colorize("warn", "WARN"))
+            ghostty_cli = shutil.which("ghostty")
+            ghostty_ctx = {"label": "Ghostty window"}
+            spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             append_history("restore_fail", item["rec"], backend=backend, error=err, flush=True)
