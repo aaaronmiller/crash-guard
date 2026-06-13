@@ -2635,6 +2635,9 @@ def _cmd_validate(args):
         if key not in known:
             issues.append("unknown top-level key: '%s'" % key)
 
+    # (List-key replacement vs merge is standard deep-merge behavior;
+    #  terminal.order and env_patterns are intentionally replaced.)
+
     if issues:
         print("\nFound %d issue(s):" % len(issues))
         for iss in issues:
