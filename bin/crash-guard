@@ -2509,6 +2509,274 @@ def cmd_genid(args):
     return 0
 
 
+def cmd_metrics(args):
+    """Emit Prometheus text-format metrics from history + live sentinels.
+
+    Designed to be scraped by Prometheus (either via a tiny HTTP endpoint
+    wrapping this command, or via the ``prometheus_text`` format that
+    node_exporter's textfile collector can consume).
+
+    Usage:
+        crash-guard metrics                  # print to stdout
+        crash-guard metrics --watch 5        # print every 5 seconds (for HTTP serving)
+    """
+    cfg = load_config()
+    cur = boot_id()
+
+    def _emit():
+        lines = []
+        ts = int(time.time())
+
+        # ---- live sentinel gauges ----
+        live = read_sentinels()
+        running, stale, crashed = classify(live, cur)
+        lines.append("# HELP crash_guard_live_sessions Current tracked sessions by status")
+        lines.append("# TYPE crash_guard_live_sessions gauge")
+        for status_name, recs in [("running", running), ("stale", stale), ("crashed", crashed)]:
+            lines.append('crash_guard_live_sessions{status="%s"} %d %d' % (status_name, len(recs), ts))
+        lines.append('crash_guard_live_sessions{status="total"} %d %d' % (len(live), ts))
+
+        # ---- tool usage gauge ----
+        tool_counts = {}
+        for r in running + stale + crashed:
+            k = r.get("key", "unknown")
+            tool_counts[k] = tool_counts.get(k, 0) + 1
+        lines.append("# HELP crash_guard_sessions_by_tool Live sessions by tool key")
+        lines.append("# TYPE crash_guard_sessions_by_tool gauge")
+        for k, c in sorted(tool_counts.items()):
+            lines.append('crash_guard_sessions_by_tool{tool="%s"} %d %d' % (k, c, ts))
+
+        # ---- history event counters ----
+        events = read_history_events()
+        counters = {
+            "start": 0, "stop": 0, "restore_ok": 0, "restore_fail": 0,
+            "restore_attempt": 0, "archive": 0,
+        }
+        restore_by_backend = {}
+        for ev in events:
+            e = ev.get("event", "")
+            if e in counters:
+                counters[e] += 1
+            if e in ("restore_ok", "restore_attempt", "restore_fail"):
+                bk = ev.get("backend", "unknown")
+                restore_by_backend.setdefault(e, {}).setdefault(bk, 0)
+                restore_by_backend[e][bk] += 1
+
+        lines.append("# HELP crash_guard_history_events_total Count of history events by type")
+        lines.append("# TYPE crash_guard_history_events_total counter")
+        for e, c in sorted(counters.items()):
+            lines.append('crash_guard_history_events_total{event="%s"} %d %d' % (e, c, ts))
+
+        lines.append("# HELP crash_guard_restore_by_backend Restore events by backend")
+        lines.append("# TYPE crash_guard_restore_by_backend counter")
+        for ev_type, backends in sorted(restore_by_backend.items()):
+            for bk, c in sorted(backends.items()):
+                lines.append('crash_guard_restore_by_backend{event="%s",backend="%s"} %d %d' % (ev_type, bk, c, ts))
+
+        # ---- session duration summary from history ----
+        durations = []
+        for ev in events:
+            dur = ev.get("duration_secs")
+            if dur is not None:
+                durations.append(dur)
+        if durations:
+            lines.append("# HELP crash_guard_session_duration_seconds Session lifetime from stop/archive events")
+            lines.append("# TYPE crash_guard_session_duration_seconds gauge")
+            sorted_d = sorted(durations)
+            n = len(sorted_d)
+            for p, label in [(50, "p50"), (90, "p90"), (95, "p95"), (99, "p99")]:
+                idx = min(int(n * p / 100), n - 1)
+                lines.append('crash_guard_session_duration_seconds{percentile="%s"} %d %d' % (label, sorted_d[idx], ts))
+            lines.append('crash_guard_session_duration_seconds{percentile="max"} %d %d' % (sorted_d[-1], ts))
+
+        # ---- system snapshot from last restore events ----
+        for ev in reversed(events):
+            snap = ev.get("system")
+            if snap:
+                lines.append("# HELP crash_guard_system_memory_kb Memory at last restore event")
+                lines.append("# TYPE crash_guard_system_memory_kb gauge")
+                avail = snap.get("mem_avail_kb")
+                total = snap.get("mem_total_kb")
+                if avail:
+                    lines.append('crash_guard_system_memory_kb{type="available"} %d %d' % (avail, ts))
+                if total:
+                    lines.append('crash_guard_system_memory_kb{type="total"} %d %d' % (total, ts))
+                procs = snap.get("user_procs")
+                if procs:
+                    lines.append("# HELP crash_guard_user_processes User process count at restore")
+                    lines.append("# TYPE crash_guard_user_processes gauge")
+                    lines.append('crash_guard_user_processes %d %d' % (procs, ts))
+                break
+
+        # ---- orphaned sentinel counter (crashed from prior boots) ----
+        lines.append("# HELP crash_guard_crashed_sentinels_total Crashed sentinels from prior boots")
+        lines.append("# TYPE crash_guard_crashed_sentinels_total gauge")
+        lines.append('crash_guard_crashed_sentinels_total %d %d' % (len(crashed), ts))
+
+        return "\n".join(lines) + "\n"
+
+    if args.watch:
+        import time as _time
+        try:
+            while True:
+                sys.stdout.write(_emit())
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                _time.sleep(args.watch)
+        except KeyboardInterrupt:
+            pass
+    else:
+        sys.stdout.write(_emit())
+    return 0
+
+
+def cmd_analytics(args):
+    """Export structured analytics as JSON for web UI / Grafana integration.
+
+    Outputs pre-computed statistics drawn from history, live sentinels, and
+    archives. Designed to be consumed by the claude-code-proxy web interface
+    or any analytics dashboard.
+
+    Use ``--format prometheus`` to get Prometheus text format instead.
+    """
+    events = read_history_events()
+    cfg = load_config()
+    cur = boot_id()
+    live = read_sentinels()
+    running, stale, crashed = classify(live, cur)
+    archived = read_archived_sentinels()
+
+    analytics = {}
+
+    # ---- session summary ----
+    analytics["sessions"] = {
+        "live": {"running": len(running), "stale": len(stale), "crashed": len(crashed), "total": len(live)},
+        "archived": len(archived),
+        "history_events": len(events),
+    }
+
+    # ---- per-tool breakdown ----
+    tool_stats = {}
+    for r in running + stale + crashed:
+        k = r.get("key", "unknown")
+        s = tool_stats.setdefault(k, {"running": 0, "stale": 0, "crashed": 0, "cwd": set()})
+        if r in running:
+            s["running"] += 1
+        elif r in stale:
+            s["stale"] += 1
+        else:
+            s["crashed"] += 1
+        s["cwd"].add(r.get("cwd", ""))
+    # Convert sets to counts for JSON
+    for k, s in tool_stats.items():
+        s["directories"] = len(s.pop("cwd"))
+    analytics["tools"] = tool_stats
+
+    # ---- time-series: events per day ----
+    from collections import Counter
+    from datetime import datetime as _dt
+    day_counts = Counter()
+    for ev in events:
+        at = ev.get("at", "")
+        if at:
+            day = at[:10]  # YYYY-MM-DD
+            day_counts[day] += 1
+    analytics["events_per_day"] = sorted(({"date": d, "count": c} for d, c in day_counts.items()), key=lambda x: x["date"])
+
+    # ---- event type breakdown ----
+    event_types = Counter(ev.get("event", "unknown") for ev in events)
+    analytics["event_types"] = dict(event_types)
+
+    # ---- event counts by boot ----
+    boot_counts = Counter()
+    for ev in events:
+        rec = ev.get("record") or {}
+        bid = rec.get("boot_id", "unknown") or "unknown"
+        boot_counts[bid[:8]] += 1
+    analytics["events_by_boot"] = sorted(({"boot": b, "count": c} for b, c in boot_counts.items()), key=lambda x: x["boot"])
+
+    # ---- restore success/fail by backend ----
+    restore_stats = {}
+    for ev in events:
+        e = ev.get("event", "")
+        if e not in ("restore_ok", "restore_fail", "restore_attempt"):
+            continue
+        bk = ev.get("backend", "unknown")
+        rs = restore_stats.setdefault(bk, {"attempts": 0, "ok": 0, "fail": 0})
+        rs["attempts"] += 1
+        if e == "restore_ok":
+            rs["ok"] += 1
+        elif e == "restore_fail":
+            rs["fail"] += 1
+    for bk, rs in restore_stats.items():
+        if rs["attempts"] > 0:
+            rs["success_rate"] = round(rs["ok"] / rs["attempts"] * 100, 1)
+    analytics["restore_by_backend"] = restore_stats
+
+    # ---- session duration percentiles ----
+    durations = []
+    for ev in events:
+        dur = ev.get("duration_secs")
+        if dur is not None:
+            durations.append(dur)
+    if durations:
+        sorted_d = sorted(durations)
+        n = len(sorted_d)
+        analytics["session_duration_seconds"] = {
+            "count": n,
+            "min": sorted_d[0],
+            "max": sorted_d[-1],
+            "p50": sorted_d[min(int(n * 0.50), n - 1)],
+            "p90": sorted_d[min(int(n * 0.90), n - 1)],
+            "p95": sorted_d[min(int(n * 0.95), n - 1)],
+            "p99": sorted_d[min(int(n * 0.99), n - 1)],
+        }
+
+    # ---- system snapshot summary (last known) ----
+    for ev in reversed(events):
+        snap = ev.get("system")
+        if snap:
+            analytics["last_system_snapshot"] = snap
+            break
+
+    # ---- ephemeral session ratio ----
+    sessions = history_sessions()
+    ephemeral_count = sum(1 for s in sessions.values() if s.get("_ephemeral"))
+    total_known = sum(1 for s in sessions.values() if s.get("_duration_secs") is not None)
+    analytics["ephemeral_ratio"] = {
+        "ephemeral": ephemeral_count,
+        "total_with_duration": total_known,
+        "ratio": round(ephemeral_count / total_known, 3) if total_known > 0 else 0,
+    }
+
+    # ---- boot periods summary ----
+    periods = boot_periods()
+    analytics["boot_periods"] = []
+    for p in periods:
+        analytics["boot_periods"].append({
+            "boot_id": p["boot_id"][:8],
+            "start": fmt_period_time(p.get("start")),
+            "end": fmt_period_time(p.get("end")),
+            "records": p["records"],
+            "running": p["running"],
+            "closed": p["closed"],
+            "recoverable": p["recoverable"],
+        })
+
+    # ---- cwd concentration ----
+    cwd_counts = Counter()
+    for r in live:
+        cwd = r.get("cwd", "")
+        cwd_counts[cwd] += 1
+    analytics["cwd_concentration"] = [{"cwd": c, "sessions": n} for c, n in cwd_counts.most_common(20)]
+
+    if args.output == "pretty":
+        print(json.dumps(analytics, indent=2, default=str))
+    else:
+        print(json.dumps(analytics, default=str))
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="crash-guard", description="WSL2 agentic session recovery")
     if len(sys.argv) == 1 or (len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help")):
@@ -2595,6 +2863,18 @@ def main():
 
     s = sub.add_parser("init")
     s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("metrics",
+                       help="export Prometheus-formatted metrics for scraping")
+    s.add_argument("--watch", type=int, default=0,
+                   help="re-emit every N seconds (for HTTP serving)")
+    s.set_defaults(func=cmd_metrics)
+
+    s = sub.add_parser("analytics",
+                       help="export structured analytics as JSON")
+    s.add_argument("--output", choices=("json", "pretty"), default="json",
+                   help="output format: json (compact) or pretty (indented)")
+    s.set_defaults(func=cmd_analytics)
 
     s = sub.add_parser("genid")
     s.set_defaults(func=cmd_genid)

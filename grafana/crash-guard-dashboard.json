@@ -1,0 +1,247 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "title": "crash-guard: Session Analytics",
+  "description": "Agentic CLI/TUI session recovery dashboard. Tracks live sessions, crash rates, restore success, memory pressure, and tool usage.",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Live Sessions by Status",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 4, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "crash_guard_live_sessions{status=\"running\"}",
+        "legendFormat": "Running",
+        "refId": "A"
+      }, {
+        "expr": "crash_guard_live_sessions{status=\"stale\"}",
+        "legendFormat": "Stale",
+        "refId": "B"
+      }, {
+        "expr": "crash_guard_live_sessions{status=\"crashed\"}",
+        "legendFormat": "Crashed",
+        "refId": "C"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 0 }
+          ]}
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Crashed" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byName", "options": "Stale" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] },
+          { "matcher": { "id": "byName", "options": "Running" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "title": "Session Duration Distribution",
+      "type": "bargauge",
+      "gridPos": { "h": 6, "w": 4, "x": 4, "y": 0 },
+      "targets": [{
+        "expr": "crash_guard_session_duration_seconds",
+        "legendFormat": "{{percentile}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 3600 },
+            { "color": "red", "value": 86400 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Sessions by Tool",
+      "type": "piechart",
+      "gridPos": { "h": 6, "w": 4, "x": 8, "y": 0 },
+      "targets": [{
+        "expr": "crash_guard_sessions_by_tool",
+        "legendFormat": "{{tool}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "pieType": "donut", "legend": { "displayMode": "list" } }
+    },
+    {
+      "id": 4,
+      "title": "History Events Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [{
+        "expr": "rate(crash_guard_history_events_total[5m])",
+        "legendFormat": "{{event}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" } }
+    },
+    {
+      "id": 5,
+      "title": "Restore Success Rate by Backend",
+      "type": "bargauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 14 },
+      "targets": [{
+        "expr": "crash_guard_restore_by_backend{event=\"restore_ok\"}",
+        "legendFormat": "{{backend}} OK",
+        "refId": "A"
+      }, {
+        "expr": "crash_guard_restore_by_backend{event=\"restore_fail\"}",
+        "legendFormat": "{{backend}} FAIL",
+        "refId": "B"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "thresholds": { "mode": "percentage", "steps": [
+            { "color": "red", "value": null },
+            { "color": "orange", "value": 60 },
+            { "color": "green", "value": 85 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Memory Available at Last Restore",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 3, "x": 6, "y": 14 },
+      "targets": [{
+        "expr": "crash_guard_system_memory_kb{type=\"available\"}",
+        "legendFormat": "Available",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kbytes",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "orange", "value": 1048576 },
+            { "color": "green", "value": 2097152 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Crashed Sentinels",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 3, "x": 9, "y": 14 },
+      "targets": [{
+        "expr": "crash_guard_crashed_sentinels_total",
+        "legendFormat": "Crashed",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "User Process Count",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 3, "x": 12, "y": 14 },
+      "targets": [{
+        "expr": "crash_guard_user_processes",
+        "legendFormat": "Processes",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 300 },
+            { "color": "red", "value": 500 }
+          ]}
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Session Duration by Tool (from analytics)",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 20 },
+      "targets": [{
+        "expr": "crash_guard_session_duration_seconds",
+        "legendFormat": "{{percentile}}",
+        "refId": "A"
+      }],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true } } }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "align": "right" }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Boot Periods Summary",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 20 },
+      "targets": [{
+        "expr": "crash_guard_live_sessions",
+        "legendFormat": "{{status}}",
+        "refId": "A"
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "right" }
+        }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "backend",
+        "type": "custom",
+        "query": "tmux, ghostty, wezterm, kitty, windows-terminal",
+        "current": { "text": "All", "value": "" },
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Restore Events",
+        "datasource": { "type": "prometheus", "uid": "PROM" },
+        "expr": "rate(crash_guard_restore_by_backend{event=\"restore_attempt\"}[1m]) > 0",
+        "enable": true,
+        "iconColor": "blue",
+        "title": "Restore",
+        "textFormat": "{{backend}}"
+      }
+    ]
+  }
+}

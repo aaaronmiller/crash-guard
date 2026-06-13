@@ -14,6 +14,10 @@
 - Added clarifying restore output: "archiving old sentinel(s) and spawning fresh sessions (new inv_id per restore)" so the archive/new-session relationship is clear.
 - Added command-existence check before spawning: warns when the first token of restore argv is not on PATH.
 - Added `--include-closed` flag (opt-in) to show cleanly closed sessions in recovery groups.
+- Added `crash-guard metrics` command: Prometheus-format metrics (counters, gauges, percentiles) for Prometheus scraping.
+- Added `crash-guard analytics` command: structured JSON with pre-computed stats (session distributions, restore rates, memory, tool usage, boot periods).
+- Added `ANALYTICS.md` — full documentation of all data streams, 12 pre-built visualization use cases, Grafana dashboard JSON, and web UI integration guide.
+- Added `grafana/crash-guard-dashboard.json` — importable Grafana dashboard with 10+ panels covering all key metrics.
 - Added terminal backend restore support for tmux, Ghostty, kitty, Windows Terminal, and existing WezTerm behavior.
 - Added `crash-guard restore --terminal` to force a restore backend when auto-detection is not desired.
 - Added MIT license and repository ignore rules for generated/local files.
