@@ -428,7 +428,10 @@ def cmd_start(args):
         }
         if args.name:
             rec["name"] = args.name
-        atomic_write(LIVE_DIR / (args.inv_id + ".json"), json.dumps(rec) + "\n")
+        sentinel_path = LIVE_DIR / (args.inv_id + ".json")
+        if sentinel_path.exists():
+            sys.stderr.write("crash-guard start: warning — sentinel %s already exists (overwriting)\n" % args.inv_id)
+        atomic_write(sentinel_path, json.dumps(rec) + "\n")
         append_history("start", rec)
     except Exception as e:
         sys.stderr.write("crash-guard start: %s\n" % e)
