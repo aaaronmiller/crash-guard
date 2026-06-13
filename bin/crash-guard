@@ -2299,7 +2299,9 @@ def cmd_restore(args):
         msg = "no archived sessions to restore" if args.from_archive else "no recovery sessions to restore"
         print("crash-guard: %s." % msg)
         if not args.from_archive:
-            print("  (try \033[1m--include-closed\033[0m for closed sessions or \033[1m--from-archive\033[0m for archived ones)")
+            print("  (try \033[1m--include-closed\033[0m for closed sessions,")
+            print("   \033[1m--from-archive\033[0m for archived ones, or")
+            print("   \033[1mcrash-guard history\033[0m to browse older boot periods)")
         return 0
 
     plan = build_plan(targets, cfg, repair=args.repair)
@@ -2408,6 +2410,18 @@ def cmd_restore(args):
         print("     After restore, attach with:  \033[1mtmux attach -t %s\033[0m" % sess_name)
         print("     (or use \033[1m--terminal ghostty\033[0m to open OS windows instead)\n")
 
+    # Pre-spawn disk-space check: warn if < 10MB free on data volume
+    try:
+        st = os.statvfs(str(DATA_DIR))
+        free_mb = st.f_frsize * st.f_bavail / 1048576
+        if free_mb < 10:
+            print("  %s critical: only ~%dMB free on data volume (%s)" % (
+                colorize("fail", "DISK"), round(free_mb), DATA_DIR))
+            print("  Restore may fail silently. Free space and run again,")
+            print("  or use \033[1m--no-spawn\033[0m to preview without executing.")
+    except Exception:
+        pass
+
     # Log restore_start with system snapshot and plan details before spawning
     # — if the system crashes mid-restore we need evidence of what was attempted.
     plan_summary = []
@@ -2460,6 +2474,7 @@ def cmd_restore(args):
         # Fallback: if tmux fails and ghostty is available, try ghostty once
         if spawned is None and backend == "tmux" and shutil.which("ghostty"):
             print("  %s tmux failed, falling back to ghostty..." % colorize("warn", "WARN"))
+            print("    (warning: ghostty will open a new OS window, which may contribute to OOM)")
             ghostty_cli = shutil.which("ghostty")
             ghostty_ctx = {"label": "Ghostty window"}
             spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
@@ -2479,9 +2494,9 @@ def cmd_restore(args):
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
     if ok_list:
-        print("  ok:   %s" % ", ".join(ok_list))
+        print("  ok:   %s" % "; ".join(ok_list))
     if fail_list:
-        print("  fail: %s" % ", ".join(fail_list))
+        print("  fail: %s" % "; ".join(fail_list))
     append_history(
         "restore_done", None,
         ok=ok, total=len(selected), backend=backend,
