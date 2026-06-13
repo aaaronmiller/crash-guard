@@ -1376,6 +1376,15 @@ def format_plan_item(item, cfg, idx, detail=True):
         lines.append("       Full shell:  %s" % colorize("dim", _short_path(payload)))
         if len(payload) > _SHORT_WIDTH:
             lines.append("                    %s" % colorize("dim", payload))
+    elif item["argv"] and not detail:
+        # Brief one-line summary when --verbose is not set
+        shell = os.environ.get("SHELL", "/bin/zsh")
+        brief = "cd %s; cg_run %s -- %s" % (
+            item["cwd"],
+            item["key"],
+            " ".join(shlex.quote(a) for a in item["argv"]),
+        )
+        lines.append("       Command:    %s" % colorize("dim", _short_path(brief)))
 
     # ---- metadata: inv, boot, pid, launched_at ----
     meta_parts = []
