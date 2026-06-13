@@ -1872,8 +1872,18 @@ def cmd_status(args):
         print(colorize("fail", "\ncrashed / from a previous boot (%d) -- restorable:" % len(crashed)))
         for r in crashed:
             print(fmt_row(r, "crx", cfg))
+    if stale:
+        print("  \033[2m(Hint: run 'crash-guard prune' to remove stale sentinels)\033[0m")
     if not (running or stale or crashed):
         print("  nothing tracked.")
+    # Check data directory disk space if available
+    try:
+        st = os.statvfs(str(DATA_DIR))
+        free_mb = st.f_frsize * st.f_bavail / 1048576
+        if free_mb < 100:
+            print("  \033[33m⚠\033[0m low disk space on data volume: ~%dMB free" % round(free_mb))
+    except Exception:
+        pass
     return 0
 
 
