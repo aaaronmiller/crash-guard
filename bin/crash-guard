@@ -2684,6 +2684,8 @@ def cmd_analytics(args):
     Use ``--format prometheus`` to get Prometheus text format instead.
     """
     events = read_history_events()
+    if args.limit and args.limit > 0:
+        events = events[-args.limit:]
     cfg = load_config()
     cur = boot_id()
     live = read_sentinels()
@@ -2792,6 +2794,18 @@ def cmd_analytics(args):
         "total_with_duration": total_known,
         "ratio": round(ephemeral_count / total_known, 3) if total_known > 0 else 0,
     }
+
+    # ---- last restore timestamp (from most recent restore_done) ----
+    for ev in reversed(events):
+        if ev.get("event") == "restore_done":
+            analytics["last_restore"] = {
+                "at": ev.get("at", ""),
+                "backend": ev.get("backend", ""),
+                "ok": ev.get("ok", 0),
+                "total": ev.get("total", 0),
+                "restore_id": ev.get("restore_id", ""),
+            }
+            break
 
     # ---- boot periods summary ----
     periods = boot_periods()
@@ -2918,6 +2932,8 @@ def main():
                        help="export structured analytics as JSON")
     s.add_argument("--output", choices=("json", "pretty"), default="json",
                    help="output format: json (compact) or pretty (indented)")
+    s.add_argument("--limit", type=int, default=0,
+                   help="max history events to process (0 = unlimited)")
     s.set_defaults(func=cmd_analytics)
 
     s = sub.add_parser("genid")
