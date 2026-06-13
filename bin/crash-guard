@@ -765,11 +765,12 @@ def arrow_select(options, title, default=0):
             if ch == "\x03":
                 raise KeyboardInterrupt
             if ch.isdigit():
+                # Jump cursor to the typed digit, waiting for Enter to confirm
                 val = int(ch)
                 if 1 <= val <= len(options):
-                    sys.stdout.write("\033[%dB\033[?25h" % (len(options) + 1))
-                    sys.stdout.flush()
-                    return val - 1
+                    idx = val - 1
+                    # Redraw immediately to show cursor at new position
+                    continue
             if ch == "\x1b":
                 seq = sys.stdin.read(2)
                 if seq == "[A":
@@ -871,6 +872,8 @@ def print_restore_groups(groups):
                 name_label if name_label else "",
                 colorize("muted", git_label) if git_label else "",
             ))
+    if groups:
+        print("  %s git branch shown per session: \u2713 clean  \u2717 dirty" % colorize("muted", "\u2014"))
     print("")
 
 
@@ -2264,6 +2267,8 @@ def cmd_restore(args):
     if not targets:
         msg = "no archived sessions to restore" if args.from_archive else "no recovery sessions to restore"
         print("crash-guard: %s." % msg)
+        if not args.from_archive:
+            print("  (try \033[1m--include-closed\033[0m for closed sessions or \033[1m--from-archive\033[0m for archived ones)")
         return 0
 
     plan = build_plan(targets, cfg, repair=args.repair)
@@ -2303,6 +2308,8 @@ def cmd_restore(args):
             selected = _select(plan, raw)
     elif not args.yes and not args._history_prompted:
         prompt = ("Restore all %d session(s)? [Y/n/e/?] " % len(plan))
+        # First time? show hint
+        sys.stderr.write("  %s \033[2mY=yes  n=no  e=edit-args  ?=help\033[0m\n" % colorize("muted", "\u2014"))
         while True:
             ans = input(prompt).strip().lower()
             if ans in ("y", "yes", ""):
@@ -2393,6 +2400,8 @@ def cmd_restore(args):
     )
 
     ok = 0
+    ok_list = []
+    fail_list = []
     spawn_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
     # Validate spawn_delay
     try:
@@ -2426,16 +2435,22 @@ def cmd_restore(args):
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             append_history("restore_fail", item["rec"], backend=backend, error=err, restore_id=restore_id, flush=True)
+            fail_list.append("%s @ %s" % (item["key"], item["cwd"]))
             continue
         print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
         append_history("restore_ok", item["rec"], backend=backend, restore_id=restore_id, flush=True)
         if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
             archive_sentinel(item["rec"])
         ok += 1
+        ok_list.append("%s @ %s" % (item["key"], item["cwd"]))
         if i < len(selected) - 1 and spawn_delay > 0:
             time.sleep(spawn_delay)
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
+    if ok_list:
+        print("  ok:   %s" % ", ".join(ok_list))
+    if fail_list:
+        print("  fail: %s" % ", ".join(fail_list))
     append_history(
         "restore_done", None,
         ok=ok, total=len(selected), backend=backend,
