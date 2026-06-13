@@ -50,10 +50,18 @@ cg_run() {
   # Build start args as array to handle spaces in key/name/cwd safely
   local start_args=(start --key "$key" --inv-id "$inv" --cwd "$PWD" --shell-pid "$$")
   [ -n "$name" ] && start_args+=(--name "$name")
-  command crash-guard "${start_args[@]}" -- "$@"
+  if [ "${CG_QUIET:-0}" = "1" ]; then
+    command crash-guard "${start_args[@]}" -- "$@" 2>/dev/null
+  else
+    command crash-guard "${start_args[@]}" -- "$@"
+  fi
   "$@"
   local rc=$?
-  command crash-guard stop --inv-id "$inv"
+  if [ "${CG_QUIET:-0}" = "1" ]; then
+    command crash-guard stop --inv-id "$inv" 2>/dev/null
+  else
+    command crash-guard stop --inv-id "$inv"
+  fi
   return $rc
 }
 
