@@ -1925,6 +1925,9 @@ def cmd_status(args):
             print("  \033[33m[WARN]\033[0m low disk space on data volume: ~%dMB free" % round(free_mb))
     except Exception:
         pass
+    # Check if repo marker exists and hint about self-update
+    if (CFG_DIR / ".crash-guard-repo").exists():
+        print("  \033[2m(Update: run 'crash-guard self-update' to pull latest)\033[0m")
     return 0
 
 
