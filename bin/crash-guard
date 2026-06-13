@@ -1869,9 +1869,26 @@ def cmd_status(args):
     cur = boot_id()
     recs = read_sentinels()
     running, stale, crashed = classify(recs, cur)
+    cfg = load_config()
+    if args.json:
+        # Machine-readable JSON output for claude-code-proxy integration
+        tools = {}
+        for recs_list, status in [(running, "running"), (stale, "stale"), (crashed, "crashed")]:
+            for r in recs_list:
+                k = r.get("key", "unknown")
+                s = tools.setdefault(k, {"running": 0, "stale": 0, "crashed": 0})
+                s[status] += 1
+        print(json.dumps({
+            "boot_id": cur[:8],
+            "tracked": len(recs),
+            "running": len(running),
+            "stale": len(stale),
+            "crashed": len(crashed),
+            "tools": tools,
+        }))
+        return 0
     print("crash-guard status  (boot %s)" % colorize("muted", short(cur, 8)))
     print("  tracked sentinels: %d" % len(recs))
-    cfg = load_config()
     if running:
         print(colorize("ok", "\nrunning (%d):" % len(running)))
         for r in running:
@@ -2609,6 +2626,46 @@ def cmd_context(args):
     return 0
 
 
+def _cmd_check(args):
+    """Run a self-test and report go/no-go status."""
+    issues = []
+    # Test 1: Python version
+    v = sys.version_info
+    if v.major < 3 or (v.major == 3 and v.minor < 8):
+        issues.append("Python %d.%d is too old (3.8+ required)" % (v.major, v.minor))
+    # Test 2: crash-guard binary integrity
+    try:
+        ensure_dirs()
+        test_id = "check-%.0f-%d" % (time.time(), os.getpid())
+        test_data = json.dumps({"test": True, "inv_id": test_id})
+        atomic_write(LIVE_DIR / (test_id + ".json"), test_data)
+        (LIVE_DIR / (test_id + ".json")).unlink()
+    except Exception as e:
+        issues.append("sentinel write test failed: %s" % e)
+    # Test 3: History file readability
+    try:
+        if HISTORY_FILE.exists():
+            with HISTORY_FILE.open("r", encoding="utf-8") as f:
+                f.readline()
+    except Exception as e:
+        issues.append("history file read test failed: %s" % e)
+    # Test 4: tmux availability
+    tmux_ok = shutil.which("tmux") is not None
+    # Test 5: Terminal detection
+    term = os.environ.get("TERM_PROGRAM", "unknown")
+    backend, _, _ = resolve_terminal_backend(load_config())
+
+    status = "\033[32mGO\033[0m" if not issues else "\033[31mNO-GO\033[0m"
+    print("crash-guard check: %s" % status)
+    print("  Python:   %d.%d.%d" % (v.major, v.minor, v.micro))
+    print("  Terminal: %s (backend: %s)" % (term, backend or "none"))
+    print("  tmux:     %s" % ("\033[32mavailable\033[0m" if tmux_ok else "\033[33mnot found\033[0m"))
+    print("  Data dir: %s" % DATA_DIR)
+    for iss in issues:
+        print("  \033[31m✗\033[0m %s" % iss)
+    return 0 if not issues else 1
+
+
 def _cmd_validate(args):
     """Validate the config file and report any issues."""
     issues = []
@@ -2795,6 +2852,16 @@ def cmd_metrics(args):
         lines.append("# TYPE crash_guard_crashed_sentinels_total gauge")
         lines.append('crash_guard_crashed_sentinels_total %d %d' % (len(crashed), ts))
 
+        # ---- last crash detection timestamp ----
+        if crashed:
+            crash_tss = [parse_time(r.get("launched_at")) for r in crashed]
+            crash_tss = [t for t in crash_tss if t is not None]
+            if crash_tss:
+                latest = max(crash_tss)
+                lines.append("# HELP crash_guard_last_crash_detected_timestamp_seconds Unix epoch when last crashed sentinel was launched")
+                lines.append("# TYPE crash_guard_last_crash_detected_timestamp_seconds gauge")
+                lines.append('crash_guard_last_crash_detected_timestamp_seconds %d %d' % (latest.timestamp(), ts))
+
         # ---- last restore timestamp ----
         for ev in reversed(events):
             if ev.get("event") == "restore_done":
@@ -2838,6 +2905,14 @@ def cmd_analytics(args):
     Use ``--format prometheus`` to get Prometheus text format instead.
     """
     events = read_history_events()
+    if args.preview:
+        hist_size = HISTORY_FILE.stat().st_size if HISTORY_FILE.exists() else 0
+        print("History file: %s (%d bytes)" % (HISTORY_FILE, hist_size))
+        print("Events: %d" % len(events))
+        print("Live sentinels: %d" % len(list(LIVE_DIR.glob("*.json"))))
+        est_secs = max(0.1, len(events) * 0.002)  # ~2ms per event
+        print("Estimated processing time: ~%.2fs" % est_secs)
+        return 0
     if args.limit and args.limit > 0:
         events = events[-args.limit:]
     cfg = load_config()
@@ -3031,6 +3106,8 @@ def main():
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true",
+                   help="machine-readable JSON output")
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("notify")
@@ -3114,9 +3191,15 @@ def main():
                    help="output format: json (compact) or pretty (indented)")
     s.add_argument("--limit", type=int, default=0,
                    help="max history events to process (0 = unlimited)")
+    s.add_argument("--preview", action="store_true",
+                   help="show history file size and estimated processing time before querying")
     s.add_argument("--anonymize-paths", action="store_true",
                    help="replace home directories with ~/ in path fields")
     s.set_defaults(func=cmd_analytics)
+
+    s = sub.add_parser("check",
+                       help="run self-test and report go/no-go status")
+    s.set_defaults(func=_cmd_check)
 
     s = sub.add_parser("validate",
                        help="validate config and report any issues")
