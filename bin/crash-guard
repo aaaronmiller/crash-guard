@@ -2315,6 +2315,8 @@ def cmd_restore(args):
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
             print("   \033[1m--from-archive\033[0m for archived ones, or")
             print("   \033[1mcrash-guard history\033[0m to browse older boot periods)")
+        if args.batch:
+            return 1
         return 0
 
     plan = build_plan(targets, cfg, repair=args.repair)
@@ -2509,6 +2511,8 @@ def cmd_restore(args):
             time.sleep(spawn_delay)
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
+    if args.batch and ok == 0:
+        return 1
     if ok_list:
         print("  ok:   %s" % "; ".join(ok_list))
     if fail_list:
@@ -2654,6 +2658,9 @@ def cmd_genid(args):
         import uuid
         print(str(uuid.uuid4()))
     return 0
+
+
+cmd_uuid = cmd_genid  # alias for discoverability
 
 
 def cmd_metrics(args):
@@ -3098,8 +3105,11 @@ def main():
                        help="validate config and report any issues")
     s.set_defaults(func=_cmd_validate)
 
-    s = sub.add_parser("genid")
-    s.set_defaults(func=cmd_genid)
+    s = sub.add_parser("uuid", help="generate a UUID (utility)")
+    s.set_defaults(func=cmd_uuid)
+
+    s = sub.add_parser("genid", help="alias for uuid (deprecated)")
+    s.set_defaults(func=cmd_uuid)
 
     args = p.parse_args()
     # strip a leading "--" left in REMAINDER for start
