@@ -1306,7 +1306,6 @@ def resolve_terminal_backend(cfg, requested="auto"):
     """Return (backend, cli, note) for the terminal used by restore."""
     requested = requested or "auto"
     aliases = {
-        "ghostty": "tmux",
         "windows_terminal": "windows-terminal",
         "wt": "windows-terminal",
     }
@@ -1341,7 +1340,7 @@ def resolve_terminal_backend(cfg, requested="auto"):
     if os.environ.get("KITTY_WINDOW_ID") or os.environ.get("KITTY_LISTEN_ON"):
         current.append("kitty")
     if _env_is("ghostty"):
-        current.append("tmux")
+        current.append("ghostty")
     if os.environ.get("WT_SESSION"):
         current.append("windows-terminal")
 
@@ -1870,20 +1869,32 @@ def select_group_records(groups, args):
             )
             for g in groups
         ]
-        gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
+        try:
+            gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
+        except (KeyboardInterrupt, EOFError):
+            print("\naborted.")
+            return []
         if gi is None:
             return []
         group_records = groups[gi]["records"]
         item_opts = ["all sessions in group %d" % (gi + 1)] + [
             "%s  %s" % (r.get("key", "?"), r.get("cwd", "?")) for r in group_records
         ]
-        ii = arrow_select(item_opts, "Select session (Enter = all):")
+        try:
+            ii = arrow_select(item_opts, "Select session (Enter = all):")
+        except (KeyboardInterrupt, EOFError):
+            print("\naborted.")
+            return []
         if ii is None:
             return []
         records = group_records if ii == 0 else [group_records[ii - 1]]
     else:
         args._history_prompted = True
-        raw = input("Restore group/item [1]? (1, 2.1, 2.1,3.2, all, none): ").strip().lower()
+        try:
+            raw = input("Restore group/item [1]? (1, 2.1, 2.1,3.2, all, none): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\naborted.")
+            return []
         if raw in ("", "1"):
             records = groups[0]["records"]
         elif raw in ("none", "n", "no"):
@@ -1993,6 +2004,17 @@ def cmd_restore(args):
         print("dry-run: nothing spawned.")
         return 0
 
+    if not args.no_spawn:
+        shell = os.environ.get("SHELL", "/bin/zsh")
+        test_rc = subprocess.run([shell, "-lic", "command -v cg_run >/dev/null 2>&1"], capture_output=True).returncode
+        if test_rc != 0:
+            print(colorize("fail", "\nERROR: cg_run not found in shell environment."))
+            print("The crash-guard shell integration must be sourced in your ~/.zshrc or ~/.bashrc:")
+            print("  source ~/.config/crash-guard/crash-guard.sh")
+            print("Then restart your shell or run: exec $SHELL")
+            print("\nRun with --no-spawn to see the commands without executing.")
+            return 2
+
     selected = plan
     if args.select:
         raw = input("Restore which? (e.g. 1,3-5 / all / none): ").strip().lower()
@@ -2092,7 +2114,7 @@ def cmd_restore(args):
             time.sleep(spawn_delay)
 
     print("\nrestored %d/%d session(s)." % (ok, len(selected)))
-    if backend == "tmux" and ok:
+    if backend == "tmux" and ok and ctx.get("inside"):
         attach_rc = tmux_attach(cli, ctx)
         if attach_rc != 0:
             return attach_rc

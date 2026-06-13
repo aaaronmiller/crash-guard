@@ -44,3 +44,8 @@
 - Fixed empty argv handling in sentinel restore (returns key as fallback).
 - Fixed spawn_delay validation (clamps to 0-30s range).
 - Fixed config deep merge for nested sections (terminal, restore, wezterm, etc.).
+- Fixed ghostty terminal backend detection: `_env_is("ghostty")` now correctly adds "ghostty" to backend candidates instead of "tmux".
+- Fixed `--terminal ghostty` alias mapping: removed erroneous `"ghostty": "tmux"` alias that forced tmux backend when ghostty was requested.
+- Fixed `tmux_attach` auto-attach behavior: now only attaches when already inside tmux (`ctx.get("inside")`), not when creating new sessions from other terminals.
+- Fixed `select_group_records` to handle KeyboardInterrupt/EOFError during interactive selection, ensuring terminal state is restored.
+- Added `cg_run` shell integration validation before spawning sessions, with clear error message if not sourced.
