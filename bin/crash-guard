@@ -227,6 +227,17 @@ def load_config():
     # Ensure programs dict has all default programs (user can add more)
     for key, prog in DEFAULT_CONFIG["programs"].items():
         cfg["programs"].setdefault(key, prog)
+    # Validate spawn_delay early so callers don't need to re-check
+    raw_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
+    try:
+        v = float(raw_delay)
+        if v < 0:
+            v = 0.5
+        elif v > 30:
+            v = 30.0
+        cfg.setdefault("restore", {})["spawn_delay"] = v
+    except (ValueError, TypeError):
+        cfg.setdefault("restore", {})["spawn_delay"] = 0.5
     return cfg
 
 
@@ -2542,6 +2553,56 @@ def cmd_context(args):
     return 0
 
 
+def _cmd_validate(args):
+    """Validate the config file and report any issues."""
+    issues = []
+    if not CFG_FILE.exists():
+        print("\033[32m✓\033[0m Config file: %s (using defaults)" % CFG_FILE)
+        return 0
+    try:
+        raw = json.loads(CFG_FILE.read_text())
+    except Exception as e:
+        print("\033[31m✗\033[0m Config file: %s — parse error: %s" % (CFG_FILE, e))
+        return 1
+    print("\033[32m✓\033[0m Config file: %s (valid JSON)" % CFG_FILE)
+
+    cfg = load_config()
+
+    # Check terminal backend
+    term = cfg.get("terminal") or {}
+    backend = term.get("backend", "auto")
+    if backend not in ("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal"):
+        issues.append("terminal.backend='%s' is not a valid backend" % backend)
+
+    # Check spawn_delay
+    delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
+    if not isinstance(delay, (int, float)) or delay < 0 or delay > 30:
+        issues.append("restore.spawn_delay=%s is out of range (0-30)" % delay)
+
+    # Check programs
+    progs = cfg.get("programs") or {}
+    for name, prog in progs.items():
+        if not isinstance(prog, dict):
+            issues.append("programs.%s: expected dict, got %s" % (name, type(prog).__name__))
+            continue
+        if not prog.get("use_sentinel_argv") and not prog.get("continue") and not prog.get("resume_by_id"):
+            issues.append("programs.%s: no continue or resume_by_id command defined" % name)
+
+    # Check unknown keys (top-level only)
+    known = set(DEFAULT_CONFIG.keys())
+    for key in raw:
+        if key not in known:
+            issues.append("unknown top-level key: '%s'" % key)
+
+    if issues:
+        print("\nFound %d issue(s):" % len(issues))
+        for iss in issues:
+            print("  \033[33m⚠\033[0m %s" % iss)
+        return 1
+    print("\033[32m✓\033[0m No issues found.")
+    return 0
+
+
 def cmd_genid(args):
     try:
         print(Path("/proc/sys/kernel/random/uuid").read_text().strip())
@@ -2964,6 +3025,10 @@ def main():
     s.add_argument("--limit", type=int, default=0,
                    help="max history events to process (0 = unlimited)")
     s.set_defaults(func=cmd_analytics)
+
+    s = sub.add_parser("validate",
+                       help="validate config and report any issues")
+    s.set_defaults(func=_cmd_validate)
 
     s = sub.add_parser("genid")
     s.set_defaults(func=cmd_genid)
