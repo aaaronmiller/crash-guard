@@ -62,6 +62,9 @@ cg_run() {
   else
     command crash-guard stop --inv-id "$inv"
   fi
+  if [ "$rc" -ne 0 ] && [ "${CG_QUIET:-0}" != "1" ]; then
+    echo "[cg_run] sentinel removed (exit code $rc)" >&2
+  fi
   return $rc
 }
 

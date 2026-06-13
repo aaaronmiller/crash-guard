@@ -1890,7 +1890,7 @@ def cmd_status(args):
         st = os.statvfs(str(DATA_DIR))
         free_mb = st.f_frsize * st.f_bavail / 1048576
         if free_mb < 100:
-            print("  \033[33m⚠\033[0m low disk space on data volume: ~%dMB free" % round(free_mb))
+            print("  \033[33m[WARN]\033[0m low disk space on data volume: ~%dMB free" % round(free_mb))
     except Exception:
         pass
     return 0
@@ -2309,7 +2309,7 @@ def cmd_restore(args):
             sys.stderr.write("crash-guard: %s\n" % e)
             return 2
     if not targets:
-        msg = "no archived sessions to restore" if args.from_archive else "no recovery sessions to restore"
+        msg = "no archived sessions to restore" if args.from_archive else "no sessions to restore"
         print("crash-guard: %s." % msg)
         if not args.from_archive:
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
@@ -2491,8 +2491,7 @@ def cmd_restore(args):
         spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
         # Fallback: if tmux fails and ghostty is available, try ghostty once
         if spawned is None and backend == "tmux" and shutil.which("ghostty"):
-            print("  %s tmux failed, falling back to ghostty..." % colorize("warn", "WARN"))
-            print("    (warning: ghostty will open a new OS window, which may contribute to OOM)")
+            print("  %s tmux failed, retrying with ghostty (new OS window)" % colorize("warn", "WARN"))
             ghostty_cli = shutil.which("ghostty")
             ghostty_ctx = {"label": "Ghostty window"}
             spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
@@ -2645,7 +2644,7 @@ def _cmd_validate(args):
     if issues:
         print("\nFound %d issue(s):" % len(issues))
         for iss in issues:
-            print("  \033[33m⚠\033[0m %s" % iss)
+            print("  \033[33m[WARN]\033[0m %s" % iss)
         return 1
     print("\033[32m✓\033[0m No issues found.")
     return 0
