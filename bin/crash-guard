@@ -2488,13 +2488,22 @@ def cmd_restore(args):
         # Log each item before spawning for crash tracing
         append_history("restore_attempt", item["rec"], backend=backend, spawn_idx=i,
                         cmd=item.get("argv", []), restore_id=restore_id, flush=True)
-        spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
+        try:
+            spawned, err = spawn_terminal(cfg, backend, cli, ctx, item, inner)
+        except KeyboardInterrupt:
+            print("\n  %s interrupted by user" % colorize("warn", "WARN"))
+            # Don't archive unspawned sessions — they remain in live dir for next restore
+            break
         # Fallback: if tmux fails and ghostty is available, try ghostty once
         if spawned is None and backend == "tmux" and shutil.which("ghostty"):
             print("  %s tmux failed, retrying with ghostty (new OS window)" % colorize("warn", "WARN"))
             ghostty_cli = shutil.which("ghostty")
             ghostty_ctx = {"label": "Ghostty window"}
-            spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
+            try:
+                spawned, err = spawn_terminal(cfg, "ghostty", ghostty_cli, ghostty_ctx, item, inner)
+            except KeyboardInterrupt:
+                print("\n  %s interrupted by user" % colorize("warn", "WARN"))
+                break
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             append_history("restore_fail", item["rec"], backend=backend, error=err, restore_id=restore_id, flush=True)
@@ -2631,6 +2640,12 @@ def _cmd_validate(args):
             continue
         if not prog.get("use_sentinel_argv") and not prog.get("continue") and not prog.get("resume_by_id"):
             issues.append("programs.%s: no continue or resume_by_id command defined" % name)
+
+    # Check user hasn't accidentally deleted a default program entry
+    raw_progs = raw.get("programs") or {}
+    for key in DEFAULT_CONFIG.get("programs", {}):
+        if key not in raw_progs:
+            issues.append("programs.%s: missing from config (will use default)" % key)
 
     # Check unknown keys (top-level only)
     known = set(DEFAULT_CONFIG.keys())
