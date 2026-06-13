@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---
-# date: 2026-06-02 00:00:00 PT
-# ver: 2.0.0
+# date: 2026-06-13 00:00:00 PT
+# ver: 2.1.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, installer, session-recovery, terminal, agentic-cli]
@@ -38,9 +38,26 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- version check: don't downgrade silently ---------------------------------
+INSTALLED_VER=""
+if [ -f "$BIN_DIR/crash-guard" ]; then
+  INSTALLED_VER="$(head -5 "$BIN_DIR/crash-guard" | grep '^# ver:' | sed 's/# ver: //')"
+fi
+SRC_VER="$(head -5 "$SRC_DIR/bin/crash-guard" | grep '^# ver:' | sed 's/# ver: //')"
+if [ -n "$INSTALLED_VER" ] && [ "$INSTALLED_VER" != "$SRC_VER" ]; then
+  echo "info: upgrading crash-guard $INSTALLED_VER → $SRC_VER"
+fi
+if [ -n "$INSTALLED_VER" ] && [ "$(printf '%s\n' "$INSTALLED_VER" "$SRC_VER" | sort -V | tail -1)" != "$SRC_VER" ]; then
+  echo "warning: installed version $INSTALLED_VER is newer than source $SRC_VER"
+  echo "  (the install dir may be behind the installed binary)"
+fi
+
 # --- copy the tool + shell integration --------------------------------------
 install -m 0755 "$SRC_DIR/bin/crash-guard" "$BIN_DIR/crash-guard"
 install -m 0644 "$SRC_DIR/shell/crash-guard.sh" "$CFG_DIR/crash-guard.sh"
+
+# --- write repo path marker for self-update ----------------------------------
+echo "$SRC_DIR" > "$CFG_DIR/.crash-guard-repo"
 
 # --- write default config (idempotent; never clobbers an existing one) -------
 echo "Initializing config..."

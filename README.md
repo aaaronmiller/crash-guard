@@ -48,12 +48,15 @@ cd ~/code/crash-guard
 bash scripts/install.sh
 ```
 
-Add this shell integration block to `~/.zshrc` or `~/.bashrc`:
+Add this shell integration block to `~/.zshrc` or `~/.bashrc`. The PATH
+export MUST come BEFORE the source line, and both should be BEFORE any
+tool aliases that use ``cg_run``:
 
 ```bash
-# crash-guard session recovery
-export PATH="$HOME/.local/bin:$PATH"
-source "$HOME/.config/crash-guard/crash-guard.sh"
+# --- crash-guard session recovery: insert BEFORE your tool aliases ---
+export PATH="$HOME/.local/bin:$PATH"      # MUST be before source line
+source "$HOME/.config/crash-guard/crash-guard.sh"   # defines cg_run()
+# Aliases using cg_run go AFTER the source line:
 alias cgr='crash-guard restore'                                      # crash-guard restore tracked sessions
 alias cgs='crash-guard status'                                       # crash-guard status/preview
 alias cgr-archive='crash-guard restore --from-archive --terminal ghostty' # recover archived restore via Ghostty/tmux tabs
