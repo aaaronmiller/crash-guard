@@ -2840,12 +2840,21 @@ def cmd_analytics(args):
     from collections import Counter
     from datetime import datetime as _dt
     day_counts = Counter()
+    day_counts_by_type = {}
     for ev in events:
         at = ev.get("at", "")
         if at:
             day = at[:10]  # YYYY-MM-DD
             day_counts[day] += 1
+            etype = ev.get("event", "unknown")
+            if etype not in day_counts_by_type:
+                day_counts_by_type[etype] = Counter()
+            day_counts_by_type[etype][day] += 1
     analytics["events_per_day"] = sorted(({"date": d, "count": c} for d, c in day_counts.items()), key=lambda x: x["date"])
+    analytics["events_per_day_by_type"] = {
+        etype: sorted(({"date": d, "count": c} for d, c in counter.items()), key=lambda x: x["date"])
+        for etype, counter in sorted(day_counts_by_type.items())
+    }
 
     # ---- event type breakdown ----
     event_types = Counter(ev.get("event", "unknown") for ev in events)
@@ -2939,12 +2948,18 @@ def cmd_analytics(args):
             "recoverable": p["recoverable"],
         })
 
-    # ---- cwd concentration ----
+    # ---- cwd concentration (optionally anonymized) ----
     cwd_counts = Counter()
     for r in live:
         cwd = r.get("cwd", "")
         cwd_counts[cwd] += 1
-    analytics["cwd_concentration"] = [{"cwd": c, "sessions": n} for c, n in cwd_counts.most_common(20)]
+    cwd_list = [{"cwd": c, "sessions": n} for c, n in cwd_counts.most_common(20)]
+    if args.anonymize_paths:
+        home = str(Path.home())
+        for item in cwd_list:
+            if item["cwd"].startswith(home):
+                item["cwd"] = "~" + item["cwd"][len(home):]
+    analytics["cwd_concentration"] = cwd_list
 
     if args.output == "pretty":
         print(json.dumps(analytics, indent=2, default=str))
@@ -3063,6 +3078,8 @@ def main():
                    help="output format: json (compact) or pretty (indented)")
     s.add_argument("--limit", type=int, default=0,
                    help="max history events to process (0 = unlimited)")
+    s.add_argument("--anonymize-paths", action="store_true",
+                   help="replace home directories with ~/ in path fields")
     s.set_defaults(func=cmd_analytics)
 
     s = sub.add_parser("validate",
