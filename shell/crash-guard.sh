@@ -40,6 +40,10 @@ cg_run() {
   # Validate crash-guard is available
   if ! command -v crash-guard >/dev/null 2>&1; then
     echo "cg_run: crash-guard not found in PATH" >&2
+    echo "  Ensure \"\$HOME/.local/bin\" is in PATH BEFORE sourcing crash-guard.sh" >&2
+    echo "  Example in ~/.zshrc:" >&2
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
+    echo "    source \"\$HOME/.config/crash-guard/crash-guard.sh\"" >&2
     "$@"
     return $?
   fi
@@ -53,6 +57,7 @@ cg_run() {
 }
 
 alias cgr='crash-guard restore'
+alias cgr-batch='crash-guard restore --batch'
 alias cgs='crash-guard status'
 alias cgr-archive='crash-guard restore --from-archive --terminal ghostty'
 alias cgh='crash-guard history'

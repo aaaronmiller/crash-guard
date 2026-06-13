@@ -1458,8 +1458,12 @@ def edit_plan_interactive(plan, cfg):
     return plan
 
 
-def print_detailed_plan(plan, cfg):
-    """Print the full detailed plan header + all items."""
+def print_detailed_plan(plan, cfg, detail=True):
+    """Print the full detailed plan header + all items.
+
+    Set ``detail=False`` to hide the verbose full shell command
+    (shown with ``--verbose``).
+    """
     if not plan:
         return
     # Gather cass context for each unique workspace (one subprocess per workspace)
@@ -1476,7 +1480,7 @@ def print_detailed_plan(plan, cfg):
 
     print("crash-guard restore plan (%d session(s)):\n" % len(plan))
     for i, item in enumerate(plan, 1):
-        print(format_plan_item(item, cfg, i, detail=True))
+        print(format_plan_item(item, cfg, i, detail=detail))
     plansig = sum(len(item.get("argv") or []) for item in plan)
     print("  total arguments across %d item(s): %d\n" % (len(plan), plansig))
 
@@ -2231,6 +2235,11 @@ def cmd_restore(args):
     ensure_dirs()
     cfg = load_config()
     cur = boot_id()
+    # --batch implies auto-select group 1 and skip prompts
+    if args.batch:
+        if not args.group:
+            args.group = 1
+        args.yes = True
     # Unique restore_id for correlating all events in this invocation
     try:
         restore_id = Path("/proc/sys/kernel/random/uuid").read_text().strip()[:8]
@@ -2281,7 +2290,7 @@ def cmd_restore(args):
     # Inherit --yes into the history prompt when it was used for the login check.
     args._history_prompted = getattr(args, "_history_prompted", False)
 
-    print_detailed_plan(plan, cfg)
+    print_detailed_plan(plan, cfg, detail=args.verbose)
 
     if args.dry_run:
         print("dry-run: nothing spawned.")
@@ -2320,7 +2329,7 @@ def cmd_restore(args):
             if ans in ("e", "edit", "a", "args"):
                 plan = edit_plan_interactive(plan, cfg)
                 selected = plan
-                print_detailed_plan(plan, cfg)
+                print_detailed_plan(plan, cfg, detail=args.verbose)
                 prompt = "Restore all %d session(s) with updated args? [Y/n/?] " % len(plan)
                 continue
             if ans in ("?", "help"):
@@ -2924,6 +2933,10 @@ def main():
     s.add_argument("--terminal", default=None,
                    choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
                    help="terminal backend for spawning restored sessions")
+    s.add_argument("--verbose", action="store_true",
+                   help="show full shell commands in plan (default: collapsed)")
+    s.add_argument("--batch", action="store_true",
+                   help="non-interactive mode: auto-confirm + group 1")
     s.add_argument("--repair", action="store_true",
                    help="truncate null/partial tails in session files (backs up first)")
     s.add_argument("--include-stale", action="store_true")
