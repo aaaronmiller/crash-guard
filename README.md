@@ -124,6 +124,25 @@ source ~/.zshrc
 Run tracked aliases normally. Each launcher writes a live sentinel before the
 tool starts and appends to durable history on start, stop, archive, and restore.
 
+### Staying updated
+
+```bash
+# On any machine where crash-guard is installed from a git clone:
+crash-guard self-update                      # auto-detect repo
+crash-guard self-update --repo ~/code/crash-guard  # explicit path
+```
+
+The first time you install, the installer writes a repo marker file. After that,
+`crash-guard self-update` handles stash, pull, reinstall, and version verification.
+No manual `git pull` or re-install needed.
+
+If you didn't install from a git clone, just clone and install once:
+```bash
+git clone https://github.com/aaaronmiller/crash-guard ~/code/crash-guard
+cd ~/code/crash-guard && bash scripts/install.sh
+```
+Future updates: `crash-guard self-update`.
+
 Common commands:
 
 ```bash
