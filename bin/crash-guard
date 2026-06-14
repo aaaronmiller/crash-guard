@@ -2755,13 +2755,26 @@ cmd_uuid = cmd_genid  # alias for discoverability
 def cmd_self_update(args):
     """Pull latest from git repo and reinstall crash-guard."""
     marker = CFG_DIR / ".crash-guard-repo"
-    if not marker.exists():
-        print("\033[31mNo repo marker found at %s\033[0m" % marker)
-        print("  Run the installer from your cloned repo:")
-        print("    git clone https://github.com/aaaronmiller/crash-guard ~/code/crash-guard")
-        print("    cd ~/code/crash-guard && bash scripts/install.sh")
-        return 1
-    repo = marker.read_text().strip()
+    # Priority: --repo flag > marker file > binary dir heuristic
+    if getattr(args, "repo", None):
+        repo = args.repo
+    elif marker.exists():
+        repo = marker.read_text().strip()
+    else:
+        # Try to auto-detect: check if crash-guard binary is inside a git repo
+        bin_path = Path(shutil.which("crash-guard") or "/nonexistent").resolve()
+        for parent in [bin_path] + list(bin_path.parents):
+            if (parent / ".git").exists():
+                repo = str(parent)
+                break
+        else:
+            print("\033[33mNo repo found.\033[0m")
+            print("  Set up updates by cloning and installing:")
+            print("    git clone https://github.com/aaaronmiller/crash-guard ~/code/crash-guard")
+            print("    cd ~/code/crash-guard && bash scripts/install.sh")
+            print("  Or specify the repo path:")
+            print("    crash-guard self-update --repo ~/path/to/crash-guard")
+            return 1
     if not Path(repo).exists():
         print("\033[31mRepo directory not found: %s\033[0m" % repo)
         return 1
@@ -3274,6 +3287,8 @@ def main():
 
     s = sub.add_parser("self-update",
                        help="pull latest from git repo and reinstall")
+    s.add_argument("--repo", default=None,
+                   help="path to crash-guard git repo (auto-detected if omitted)")
     s.set_defaults(func=cmd_self_update)
 
     s = sub.add_parser("uuid", help="generate a UUID (utility)")
