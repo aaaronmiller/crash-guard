@@ -624,8 +624,43 @@ def history_sessions():
                 cur["_duration_secs"] = dur
                 if dur < 5:
                     cur["_ephemeral"] = True
+            # Also mark sessions with tiny payload files as ephemeral
+            # This catches sessions that started and exited with no activity
+            if not cur.get("_ephemeral"):
+                payload = _find_session_payload(rec)
+                if payload and payload.exists() and payload.stat().st_size < 500:
+                    cur["_ephemeral"] = True
 
     return sessions
+
+
+def _find_session_payload(rec):
+    """Try to find the session artifact file for a sentinel record."""
+    cwd = rec.get("cwd", "")
+    if not cwd:
+        return None
+    # Claude: ~/.claude/projects/<encoded>/<uuid>.jsonl
+    key = rec.get("key", "")
+    if key == "claude":
+        encoded = "".join(c if c.isalnum() else "-" for c in cwd)
+        claude_root = Path.home() / ".claude" / "projects" / encoded
+        if claude_root.is_dir():
+            files = sorted(claude_root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if files:
+                return files[0]
+    # Codex: ~/.codex/<workspace>/rollouts/*.jsonl  
+    codex_root = Path.home() / ".codex"
+    if codex_root.is_dir():
+        # Search for rollouts matching this cwd
+        for workspace in codex_root.glob("*/rollouts/*.jsonl"):
+            try:
+                with open(workspace) as f:
+                    meta = json.loads(f.readline())
+                if meta.get("cwd") == cwd or (meta.get("git") or {}).get("cwd") == cwd:
+                    return workspace
+            except Exception:
+                continue
+    return None
 
 
 def session_sort_time(sess):
@@ -800,33 +835,41 @@ def arrow_select(options, title, default=0):
 
 
 def _resolve_display_key(r, cfg):
-    """Return a display label for a sentinel record, showing the resolved
-    program name and, when the raw key differs, noting the original key.
+    """Return a display label for a sentinel record.
 
-    When the recorded argv includes a wrapper (e.g. ``rtk``) before the
-    actual tool, the wrapper is shown in the label as well.
+    Shows the resolved tool name (claude, pi, kilo, etc.) derived from
+    the recorded argv. Wrapper/intermediary tools like rtk, hermes, and
+    headroom are shown as flags in brackets, not as the primary label.
+    
+    Examples:
+      argv=['rtk','claude','--continue']  ->  "claude [rtk]"
+      argv=['pi','-c']       key='rtk'    ->  "pi [rtk]"
+      argv=['pio']           key='rtk'    ->  "pio"
     """
     key, note = resolve_record_program(r, cfg)
     raw_key = r.get("key", "?")
-    # If both the resolved key and raw key point at the same configured
-    # program (or there was no inference at all), show just the key.
-    if key == raw_key and not note:
-        return key
-    # Show "program (was raw_key)" when inference found a different tool.
-    if note:
-        # Build a wrapper-chain label from the recorded argv when possible.
-        argv = r.get("argv") or []
-        wrappers = []
-        for a in argv:
-            w = Path(a).name
-            if w == key:
-                break
-            if w and w != key:
-                wrappers.append(w)
-        if wrappers:
-            return " → ".join(wrappers) + " → " + key
-        return key
-    return raw_key
+    argv = r.get("argv") or []
+    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+    
+    # Collect wrapper names from argv and find the actual tool
+    wrappers = []
+    tool_from_argv = None
+    for a in argv:
+        name = Path(a).name
+        if name in known_wrappers:
+            wrappers.append(name)
+        elif not tool_from_argv and name != "--":
+            tool_from_argv = name
+    
+    # If the sentinel key itself is a wrapper but not in argv, add it
+    if key in known_wrappers and key not in wrappers:
+        wrappers.insert(0, key)
+    
+    # Build display: tool-name [wrapper-flags]
+    display = tool_from_argv or (key if key not in known_wrappers else None) or raw_key
+    if wrappers:
+        display += " [%s]" % " ".join(wrappers)
+    return display
 
 
 def print_restore_groups(groups):
@@ -999,11 +1042,23 @@ def verify_artifact(path, repair=False):
 # --------------------------------------------------------------------------
 
 def argv_program_key(argv, programs):
-    """Infer the configured program from a recorded command argv."""
+    """Infer the configured program from a recorded command argv.
+    
+    Skips known wrapper/intermediary programs (rtk, hermes, etc.) to
+    find the actual tool (claude, pi, kilo, etc.).
+    """
     names = [Path(a).name for a in (argv or []) if a]
-    for name in names[:3]:
+    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+    for name in names[:5]:  # Check up to 5 positions to skip wrappers
+        if name in known_wrappers:
+            continue
         prog = programs.get(name)
         if prog and not prog.get("use_sentinel_argv"):
+            return name
+    # Fallback: if all names were wrappers, return the first one
+    for name in names[:3]:
+        prog = programs.get(name)
+        if prog:
             return name
     return None
 
@@ -1069,6 +1124,7 @@ def resolve_record_program(r, cfg):
     key = r.get("key")
     prog = programs.get(key)
     raw_argv = r.get("argv") or []
+    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
 
     # If the original key has use_sentinel_argv, prefer the recorded argv
     if prog and prog.get("use_sentinel_argv"):
@@ -1076,10 +1132,23 @@ def resolve_record_program(r, cfg):
 
     inferred = argv_program_key(raw_argv, programs)
 
-    if inferred and (not prog or prog.get("use_sentinel_argv")):
-        if key and key != inferred:
-            return inferred, "recorded as '%s'; inferred from argv" % key
-        return inferred, ""
+    # If we inferred a tool and it differs from the stored key, prefer it
+    # when the original key is a known wrapper (rtk, etc.)
+    if inferred:
+        if key != inferred:
+            if key in known_wrappers or not prog or prog.get("use_sentinel_argv"):
+                return inferred, "recorded as '%s'; inferred from argv" % key
+        else:
+            return inferred, ""
+    
+    # If key itself is a wrapper with an empty command, try to find
+    # something useful in argv anyway
+    if key in known_wrappers and not (prog and (prog.get("command") or prog.get("continue"))):
+        for a in raw_argv:
+            alt = Path(a).name
+            if alt not in known_wrappers and programs.get(alt):
+                return alt, "recorded as '%s'; inferred tool '%s' from argv" % (key, alt)
+    
     return key, ""
 
 
@@ -1867,11 +1936,7 @@ def short(s, n=8):
 
 
 def fmt_row(r, status, cfg=None):
-    label = r.get("key", "?")
-    if cfg:
-        resolved, _ = resolve_record_program(r, cfg)
-        if resolved and resolved != label:
-            label = resolved
+    label = _resolve_display_key(r, cfg) if cfg else r.get("key", "?")
     color_map = {"run": "ok", "stl": "warn", "crx": "fail"}
     status_display = colorize(color_map.get(status, "muted"), "%-4s" % status)
     return "  [%s] %s %s" % (status_display, colorize("bold", "%-12s" % label), r.get("cwd", "?"))
@@ -2263,8 +2328,10 @@ def _print_restore_help():
     print("")
     print("  Commands:")
     print("    Y / Enter   — restore all sessions with current args")
+    print("    #           — number(s) to select specific sessions (e.g. 1, 2, 1-3)")
     print("    n / no      — abort")
     print("    e / edit    — interactively edit extra arguments per session")
+    print("    a / archive  — show archived sessions and select from those")
     print("    ? / help    — show this help")
     print("")
 
