@@ -2324,6 +2324,174 @@ def select_group_records(groups, args):
     return records
 
 
+# multi_select function — inject into crash-guard via replace
+
+def multi_select(items, title, cfg=None):
+    """Interactive multi-select with arrow keys, space toggle, numbers, archive toggle, filter."""
+    if not items:
+        return []
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raw = input("%s (numbers/all/none): " % title).strip().lower()
+        if raw in ("all", "a"):
+            return list(range(len(items)))
+        if raw in ("none", "n", ""):
+            return []
+        selected = []
+        for part in raw.replace(" ", "").split(","):
+            if not part: continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                for idx in range(int(a), int(b) + 1):
+                    if 1 <= idx <= len(items):
+                        selected.append(idx - 1)
+            else:
+                idx = int(part)
+                if 1 <= idx <= len(items):
+                    selected.append(idx - 1)
+        return selected
+
+    sel = set()
+    idx = 0
+    old = termios.tcgetattr(sys.stdin)
+    show_archived = False
+    filter_text = ""
+    orig_items = list(items)
+
+    def _filtered():
+        out = list(orig_items)
+        if not show_archived:
+            out = [it for it in out if it.get("_history_status") != "archived"]
+        if filter_text:
+            f = filter_text.lower()
+            out = [it for it in out
+                   if f in (it.get("key") or "").lower()
+                   or f in (it.get("cwd") or "").lower()]
+        return out
+
+    try:
+        tty.setraw(sys.stdin.fileno())
+        while True:
+            display = _filtered()
+            n = max(len(display), 1)
+
+            # Mode bar
+            parts = ["MODE: restore"]
+            if show_archived:
+                parts.append("[ARCHIVE]")
+            if filter_text:
+                parts.append("filter: %s" % filter_text)
+            parts.append("%d/%d shown" % (len(display), len(orig_items)))
+            bar = " | ".join(parts) + "\n"
+            sys.stdout.write("\033[?25l\033[2K\r" + bar)
+
+            # Items
+            for i, it in enumerate(display):
+                key = it.get("key", "?")
+                cwd = it.get("cwd", "") or ""
+                status = it.get("_history_status", "?")
+                sc = {"crashed": "\033[31m", "stale": "\033[33m",
+                      "archived": "\033[2m", "closed": "\033[2m",
+                      "running": "\033[32m"}.get(status, "\033[0m")
+                # Find actual index
+                actual = orig_items.index(it)
+                cb = "\033[7m[x]\033[0m" if actual in sel else "   "
+                cursor = "\033[7m >\033[0m" if i == idx else "   "
+                line = ("%s %s %2d. \033[1m%s\033[0m %s(%s)\033[0m \033[2m%s\033[0m\n"
+                        % (cursor, cb, i + 1, key, sc, status, cwd))
+                sys.stdout.write("\033[2K\r" + line)
+
+            # Footer
+            sel_count = len(sel)
+            footer = ("\033[2mSelected: %d | arrows=move space=toggle enter=restore"
+                      " a=archive f=filter ?=help\033[0m\n" % sel_count)
+            sys.stdout.write(footer)
+            sys.stdout.write("\033[%dA" % (len(display) + 2))
+            sys.stdout.flush()
+
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                result = sorted(sel) if sel else list(range(len(orig_items)))
+                sys.stdout.write("\033[%dB\033[?25h" % (len(display) + 2))
+                sys.stdout.flush()
+                return result
+
+            if ch == "\x03":
+                raise KeyboardInterrupt
+
+            if ch == " " and display:
+                actual = orig_items.index(display[idx])
+                if actual in sel:
+                    sel.remove(actual)
+                else:
+                    sel.add(actual)
+                continue
+
+            if ch.isdigit() and display:
+                val = int(ch)
+                if 1 <= val <= len(display):
+                    idx = val - 1
+                continue
+
+            if ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A" and display:
+                    idx = (idx - 1) % len(display)
+                elif seq == "[B" and display:
+                    idx = (idx + 1) % len(display)
+                continue
+
+            if ch.lower() == "a":
+                show_archived = not show_archived
+                idx = 0
+                continue
+
+            if ch.lower() == "f":
+                sys.stdout.write("\033[%dB" % (len(display) + 2))
+                sys.stdout.write("\r\033[2Kfilter: ")
+                sys.stdout.flush()
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+                try:
+                    f_raw = sys.stdin.readline().strip()
+                except Exception:
+                    f_raw = ""
+                filter_text = f_raw
+                idx = 0
+                tty.setraw(sys.stdin.fileno())
+                continue
+
+            if ch.lower() == "?":
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+                sys.stdout.write("\033[%dB" % (len(display) + 2))
+                sys.stdout.write("\n  Commands:\n")
+                sys.stdout.write("    arrows  \u2014 move up/down\n")
+                sys.stdout.write("    space   \u2014 toggle selection\n")
+                sys.stdout.write("    #       \u2014 jump to item N\n")
+                sys.stdout.write("    enter   \u2014 restore selected (or all)\n")
+                sys.stdout.write("    a       \u2014 toggle archive mode\n")
+                sys.stdout.write("    f       \u2014 filter\n")
+                sys.stdout.write("    ?       \u2014 this help\n")
+                sys.stdout.write("    ctrl-c  \u2014 abort\n")
+                sys.stdout.write("\n  Press any key...")
+                sys.stdin.read(1)
+                sys.stdout.write("\033[J")
+                tty.setraw(sys.stdin.fileno())
+                continue
+
+            if ch.lower() == "n":
+                pass
+    except (KeyboardInterrupt, EOFError):
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        raise
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+    return list(sel) if sel else list(range(len(orig_items)))
+
+
+
 def _print_restore_help():
     print("")
     print("  Commands:")
@@ -2460,28 +2628,27 @@ def cmd_restore(args):
         if raw not in ("all", "a"):
             selected = _select(plan, raw)
     elif not args.yes and not args._history_prompted:
-        prompt = ("Restore all %d session(s)? [Y/n/e/?] " % len(plan))
-        # First time? show hint
-        sys.stderr.write("  %s \033[2mY=yes  n=no  e=edit-args  ?=help\033[0m\n" % colorize("muted", "\u2014"))
-        while True:
-            ans = input(prompt).strip().lower()
-            if ans in ("y", "yes", ""):
-                break
-            if ans in ("n", "no"):
-                print("aborted.")
-                return 0
-            if ans in ("e", "edit", "a", "args"):
-                plan = edit_plan_interactive(plan, cfg)
-                selected = plan
-                print_detailed_plan(plan, cfg, detail=args.verbose)
-                prompt = "Restore all %d session(s) with updated args? [Y/n/?] " % len(plan)
-                continue
-            if ans in ("?", "help"):
-                _print_restore_help()
-                continue
-            # unknown — re-prompt
-            _print_restore_help()
-            prompt = "Restore all %d session(s)? [Y/n/e/?] " % len(plan)
+        # Build items for multi-select interactive picker
+        select_items = []
+        for item in plan:
+            rec = item.get("rec") or {}
+            key = item.get("key", "?")
+            cwd = rec.get("cwd", "") or ""
+            status = rec.get("_history_status", "recoverable")
+            select_items.append({"key": key, "cwd": cwd, "_history_status": status})
+        try:
+            sel_idx = multi_select(select_items, "Select sessions to restore")
+        except (KeyboardInterrupt, EOFError):
+            print("\naborted.")
+            return 0
+        if not sel_idx:
+            print("aborted.")
+            return 0
+        selected = [plan[i] for i in sel_idx if i < len(plan)]
+        count_note = ""
+        if len(selected) < len(plan):
+            count_note = " (%d of %d)" % (len(selected), len(plan))
+        print("\n  %d session(s) selected for restore%s\n" % (len(selected), count_note))
 
     if args.no_spawn:
         print("no-spawn: printing commands only.\n")
