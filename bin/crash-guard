@@ -699,31 +699,45 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
         sessions.append((inv_id, sess, rec))
 
     groups = []
+    # Pre-sort sessions by time for proximity-based crash grouping
+    sessions.sort(key=lambda x: session_sort_time(x[1]) or dt.datetime.fromtimestamp(0, dt.timezone.utc))
+    
     for inv_id, sess, rec in sessions:
         status = rec.get("_history_status")
         when = session_sort_time(sess)
-        if status == "closed":
-            gkey = ("closed", inv_id)
-        else:
-            bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
-            gkey = (rec.get("boot_id"), status, bucket)
-        found = None
-        for g in groups:
-            if g["key"] == gkey:
-                found = g
-                break
-        if found is None:
+        
+        # For non-closed sessions, try to find a nearby crash group
+        # within the same boot (5 minute window)
+        matched = False
+        if status != "closed" and when:
+            for g in reversed(groups):
+                g_time = g.get("time")
+                g_status = g.get("status")
+                g_boot = g.get("key", ("",))[0] if isinstance(g.get("key"), tuple) else ""
+                if (g_status == status 
+                    and g_time 
+                    and abs((when - g_time).total_seconds()) < 300  # 5 min window
+                    and g_boot == rec.get("boot_id")):
+                    g["records"].append(rec)
+                    if when > g_time:
+                        g["time"] = when
+                    matched = True
+                    break
+        
+        if not matched:
+            if status == "closed":
+                gkey = ("closed", inv_id)
+            else:
+                bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
+                gkey = (rec.get("boot_id"), status, bucket)
             found = {
                 "key": gkey,
-                "time": when,
+                "time": when or dt.datetime.fromtimestamp(0, dt.timezone.utc),
                 "status": status,
                 "reason": rec.get("_history_reason"),
-                "records": [],
+                "records": [rec],
             }
             groups.append(found)
-        found["records"].append(rec)
-        if when > found["time"]:
-            found["time"] = when
 
     for g in groups:
         g["records"].sort(key=lambda r: r.get("cwd", ""))
@@ -2354,6 +2368,7 @@ def multi_select(items, title, cfg=None):
     idx = 0
     old = termios.tcgetattr(sys.stdin)
     show_archived = False
+    show_omitted = False
     filter_text = ""
     orig_items = list(items)
 
@@ -2361,6 +2376,8 @@ def multi_select(items, title, cfg=None):
         out = list(orig_items)
         if not show_archived:
             out = [it for it in out if it.get("_history_status") != "archived"]
+        if not show_omitted:
+            out = [it for it in out if not it.get("_ephemeral")]
         if filter_text:
             f = filter_text.lower()
             out = [it for it in out
@@ -2378,6 +2395,8 @@ def multi_select(items, title, cfg=None):
             parts = ["MODE: restore"]
             if show_archived:
                 parts.append("[ARCHIVE]")
+            if show_omitted:
+                parts.append("[OMITTED]")
             if filter_text:
                 parts.append("filter: %s" % filter_text)
             parts.append("%d/%d shown" % (len(display), len(orig_items)))
@@ -2403,7 +2422,7 @@ def multi_select(items, title, cfg=None):
             # Footer
             sel_count = len(sel)
             footer = ("\033[2mSelected: %d | arrows=move space=toggle enter=restore"
-                      " a=archive f=filter ?=help\033[0m\n" % sel_count)
+                      " a=archive o=omitted f=filter ?=help\033[0m\n" % sel_count)
             sys.stdout.write(footer)
             sys.stdout.write("\033[%dA" % (len(display) + 2))
             sys.stdout.flush()
@@ -2444,6 +2463,10 @@ def multi_select(items, title, cfg=None):
                 show_archived = not show_archived
                 idx = 0
                 continue
+            if ch.lower() == "o":
+                show_omitted = not show_omitted
+                idx = 0
+                continue
 
             if ch.lower() == "f":
                 sys.stdout.write("\033[%dB" % (len(display) + 2))
@@ -2469,6 +2492,7 @@ def multi_select(items, title, cfg=None):
                 sys.stdout.write("    enter   \u2014 restore selected (or all)\n")
                 sys.stdout.write("    a       \u2014 toggle archive mode\n")
                 sys.stdout.write("    f       \u2014 filter\n")
+                sys.stdout.write("    o       \u2014 toggle omitted/ephemeral sessions\n")
                 sys.stdout.write("    ?       \u2014 this help\n")
                 sys.stdout.write("    ctrl-c  \u2014 abort\n")
                 sys.stdout.write("\n  Press any key...")
