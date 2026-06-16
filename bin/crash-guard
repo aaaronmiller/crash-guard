@@ -2668,7 +2668,7 @@ def cmd_restore(args):
         if not sel_idx:
             print("aborted.")
             return 0
-        selected = [plan[i] for i in sel_idx if i < len(plan)]
+        selected = [plan[i] for i in sel_idx if 0 <= i < len(plan) and plan[i].get("argv") is not None]
         count_note = ""
         if len(selected) < len(plan):
             count_note = " (%d of %d)" % (len(selected), len(plan))
