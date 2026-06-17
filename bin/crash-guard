@@ -1754,6 +1754,26 @@ def kitty_spawn(cli, cwd, title, inner):
     return "kitty pid %s" % proc.pid, None
 
 
+def ghostty_preflight(cli):
+    """Verify ghostty can spawn a new window without crashing."""
+    try:
+        # Quick check: ghostty +list-windows returns quickly without UI
+        r = subprocess.run([cli, "+list-windows"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True, None
+        # Try version check as alternative
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True, None
+        return False, "ghostty not responding"
+    except FileNotFoundError:
+        return False, "ghostty binary not found"
+    except subprocess.TimeoutExpired:
+        return False, "ghostty pre-flight timed out"
+    except Exception as e:
+        return False, str(e)
+
+
 def ghostty_spawn(cli, cwd, title, inner):
     # Use Popen (non-blocking) for both +new-window and the plain fallback.
     # subprocess.run would block the spawn loop until the inner command exits,
@@ -2341,6 +2361,7 @@ def select_group_records(groups, args):
 # multi_select function — inject into crash-guard via replace
 
 def multi_select(items, title, cfg=None):
+    import signal as _signal
     """Interactive multi-select with arrow keys, space toggle, numbers, archive toggle, filter."""
     if not items:
         return []
@@ -2366,11 +2387,40 @@ def multi_select(items, title, cfg=None):
 
     sel = set()
     idx = 0
-    old = termios.tcgetattr(sys.stdin)
     show_archived = False
     show_omitted = False
     filter_text = ""
     orig_items = list(items)
+    
+    # Save terminal settings for safe restoration
+    _saved_tio = None
+    try:
+        _saved_tio = termios.tcgetattr(sys.stdin)
+    except Exception:
+        pass  # Not a TTY, non-interactive fallback
+    
+    # Register signal handlers to restore terminal on crash
+    _old_sig_handlers = {}
+    def _restore_tty():
+        if _saved_tio is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _saved_tio)
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+            except Exception:
+                pass
+    def _signal_handler(signum, frame):
+        _restore_tty()
+        sys.exit(128 + signum)
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
+        if hasattr(signal, sig):
+            try:
+                _old = signal.signal(getattr(signal, sig), _signal_handler)
+                _old_sig_handlers[sig] = _old
+            except Exception:
+                pass
+    
+    old = _saved_tio
 
     def _filtered():
         out = list(orig_items)
@@ -2508,7 +2558,14 @@ def multi_select(items, title, cfg=None):
         sys.stdout.flush()
         raise
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        _restore_tty()
+        # Restore signal handlers
+        for sig_name, handler in _old_sig_handlers.items():
+            if hasattr(signal, sig_name):
+                try:
+                    signal.signal(getattr(signal, sig_name), handler)
+                except Exception:
+                    pass
 
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
@@ -2682,6 +2739,16 @@ def cmd_restore(args):
         return 0
 
     backend, cli, note = resolve_terminal_backend(cfg, args.terminal or (cfg.get("terminal") or {}).get("backend", "auto"))
+    
+    # Pre-flight: verify ghostty can create windows before trying to spawn
+    if backend == "ghostty" and cli:
+        ok, err = ghostty_preflight(cli)
+        if not ok:
+            print(colorize("fail", "\nghostty pre-flight check failed: %s" % err))
+            print("  Try running with --no-spawn or use a different terminal backend.")
+            print("  Aborting to prevent session crash.\n")
+            return 2
+    
     if not cli:
         sys.stderr.write(
             "crash-guard: %s.\n"
