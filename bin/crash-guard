@@ -864,6 +864,15 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
             groups.append(found)
 
     for g in groups:
+        # Deduplicate: remove duplicate inv_id entries within each group
+        seen = set()
+        unique = []
+        for r in g["records"]:
+            inv = r.get("inv_id") or r.get("_path", "")
+            if inv not in seen:
+                seen.add(inv)
+                unique.append(r)
+        g["records"] = unique
         g["records"].sort(key=lambda r: r.get("cwd", ""))
         g["_session_count"] = len(g["records"])
         g["_multi_session"] = len(g["records"]) >= 3  # 3+ sessions = real crash group
@@ -2911,6 +2920,24 @@ def cmd_restore(args):
         if not ok:
             print(colorize("fail", "\nghostty pre-flight check failed: %s" % err))
             print("  Try running with --no-spawn or use a different terminal backend.")
+            print("  Aborting to prevent session crash.\n")
+            return 2
+        # Safe-spawn test: verify ghostty can actually execute a trivial command
+        # without crashing the Wayland session
+        try:
+            test_argv = [cli, "+new-window", "-e", "echo", "ok"]
+            test_proc = subprocess.Popen(test_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                test_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                test_proc.kill()
+                print(colorize("fail", "\nghostty spawn test timed out — aborting to prevent session crash"))
+                print("  Try: crash-guard restore --no-spawn\n")
+                return 2
+            if test_proc.returncode != 0 and test_proc.returncode != -15:
+                print(colorize("warn", "\nghostty spawn test returned code %d — may be unstable" % test_proc.returncode))
+        except Exception as e:
+            print(colorize("fail", "\nghostty spawn test crashed: %s" % e))
             print("  Aborting to prevent session crash.\n")
             return 2
     
