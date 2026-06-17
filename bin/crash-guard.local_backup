@@ -514,12 +514,8 @@ def read_archived_sentinels():
                 if lt and at:
                     dur = max(0, (at - lt).total_seconds())
                     rec["_duration_secs"] = dur
-                    # Use config threshold for ephemeral detection
-                    ephemeral_cfg = load_config().get("ephemeral", {})
-                    max_dur = ephemeral_cfg.get("max_duration_secs", 5)
-                    if dur < max_dur:
+                    if dur < 5:
                         rec["_ephemeral"] = True
-                        rec["_ephemeral_reason"] = f"duration {dur:.0f}s < {max_dur}s"
             out.append(rec)
         except Exception as e:
             sys.stderr.write("crash-guard: skipping unreadable archive %s: %s\n" % (p, e))
@@ -630,89 +626,27 @@ def history_sessions():
                 en = parse_time(ended)
                 if st and en:
                     dur = max(0, (en - st).total_seconds())
-            # Get ephemeral thresholds from config
-            ephemeral_cfg = cfg.get("ephemeral", {})
-            max_dur = ephemeral_cfg.get("max_duration_secs", 5)
-            max_payload = ephemeral_cfg.get("max_payload_bytes", 500)
-            min_turns = ephemeral_cfg.get("min_user_turns", 3)
-
-            # Resolve the actual tool key (not wrapper) once for payload checks
-            tool_key, _ = resolve_record_program(cur.get("record", {}), cfg)
-
             if dur is not None:
                 cur["_duration_secs"] = dur
-                if dur < max_dur:
+                if dur < 5:
                     cur["_ephemeral"] = True
-                    cur["_ephemeral_reason"] = f"duration {dur:.0f}s < {max_dur}s"
             # Also mark sessions with tiny payload files as ephemeral
             # This catches sessions that started and exited with no activity
             if not cur.get("_ephemeral"):
-                payload = _find_session_payload(rec, tool_key)
-                if payload and payload.exists() and payload.stat().st_size < max_payload:
+                payload = _find_session_payload(rec)
+                if payload and payload.exists() and payload.stat().st_size < 500:
                     cur["_ephemeral"] = True
-                    cur["_ephemeral_reason"] = f"payload {payload.stat().st_size}B < {max_payload}B"
-            # Low-activity detection: count messages/turns in session file
-            # Sessions with very few interactions are likely test/accidental launches
-            if not cur.get("_ephemeral"):
-                payload = _find_session_payload(rec, tool_key)
-                if payload and payload.exists():
-                    activity = _count_session_activity(payload, tool_key)
-                    if activity is not None and activity < min_turns:
-                        cur["_ephemeral"] = True
-                        cur["_ephemeral_reason"] = f"low activity ({activity} turns < {min_turns})"
 
     return sessions
 
 
-def _count_session_activity(payload_path, key):
-    """Count user turns/messages in a session file.
-    Returns number of user interactions, or None if unable to determine."""
-    try:
-        count = 0
-        with open(payload_path, "r", errors="replace") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except Exception:
-                    continue
-                # Different tools store user messages differently
-                if key == "claude":
-                    # Claude: {"type": "user", "message": {"role": "user", ...}}
-                    if data.get("type") == "user" or data.get("message", {}).get("role") == "user":
-                        count += 1
-                elif key == "codex":
-                    # Codex: check for user messages in rollout
-                    if data.get("role") == "user" or data.get("type") == "user":
-                        count += 1
-                elif key in ("pi", "hermes", "opencode", "qwen"):
-                    # Generic: look for role=user or type=user
-                    if data.get("role") == "user" or data.get("type") == "user":
-                        count += 1
-                    # Some tools have a messages array
-                    elif isinstance(data.get("messages"), list):
-                        for m in data["messages"]:
-                            if m.get("role") == "user":
-                                count += 1
-        return count
-    except Exception:
-        return None
-
-
-def _find_session_payload(rec, tool_key=None):
+def _find_session_payload(rec):
     """Try to find the session artifact file for a sentinel record."""
     cwd = rec.get("cwd", "")
     if not cwd:
         return None
-    # Use resolved key (actual tool, not wrapper) for payload detection
-    if tool_key is None:
-        key, _ = resolve_record_program(rec, load_config())
-    else:
-        key = tool_key
-    
     # Claude: ~/.claude/projects/<encoded>/<uuid>.jsonl
+    key = rec.get("key", "")
     if key == "claude":
         encoded = "".join(c if c.isalnum() else "-" for c in cwd)
         claude_root = Path.home() / ".claude" / "projects" / encoded
@@ -721,73 +655,20 @@ def _find_session_payload(rec, tool_key=None):
             if files:
                 return files[0]
     # Codex: ~/.codex/<workspace>/rollouts/*.jsonl  
-    if key == "codex":
-        codex_root = Path.home() / ".codex"
-        if codex_root.is_dir():
-            for workspace in codex_root.glob("*/rollouts/*.jsonl"):
-                try:
-                    with open(workspace) as f:
-                        meta = json.loads(f.readline())
-                    if meta.get("cwd") == cwd or (meta.get("git") or {}).get("cwd") == cwd:
-                        return workspace
-                except Exception:
-                    continue
-    # Pi: ~/.pi/sessions/<uuid>.jsonl or similar
-    if key == "pi":
-        pi_root = Path.home() / ".pi" / "sessions"
-        if pi_root.is_dir():
-            files = sorted(pi_root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for f in files:
-                try:
-                    with open(f) as fp:
-                        first = json.loads(fp.readline())
-                    if first.get("cwd") == cwd:
-                        return f
-                except Exception:
-                    continue
-    # Hermes: ~/.hermes/sessions/<uuid>.jsonl
-    if key == "hermes":
-        hermes_root = Path.home() / ".hermes" / "sessions"
-        if hermes_root.is_dir():
-            files = sorted(hermes_root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for f in files:
-                try:
-                    with open(f) as fp:
-                        first = json.loads(fp.readline())
-                    if first.get("cwd") == cwd:
-                        return f
-                except Exception:
-                    continue
-    # OpenCode: ~/.opencode/session/<uuid>.json or similar
-    if key == "opencode":
-        oc_root = Path.home() / ".opencode" / "session"
-        if oc_root.is_dir():
-            files = sorted(oc_root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for f in files:
-                try:
-                    with open(f) as fp:
-                        data = json.load(fp)
-                    if data.get("cwd") == cwd:
-                        return f
-                except Exception:
-                    continue
-    # Qwen: ~/.qwen/sessions/<uuid>.jsonl
-    if key == "qwen":
-        qwen_root = Path.home() / ".qwen" / "sessions"
-        if qwen_root.is_dir():
-            files = sorted(qwen_root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-            for f in files:
-                try:
-                    with open(f) as fp:
-                        first = json.loads(fp.readline())
-                    if first.get("cwd") == cwd:
-                        return f
-                except Exception:
-                    continue
-    # Ante: memory-based, no session files
-    if key == "ante":
-        return None
+    codex_root = Path.home() / ".codex"
+    if codex_root.is_dir():
+        # Search for rollouts matching this cwd
+        for workspace in codex_root.glob("*/rollouts/*.jsonl"):
+            try:
+                with open(workspace) as f:
+                    meta = json.loads(f.readline())
+                if meta.get("cwd") == cwd or (meta.get("git") or {}).get("cwd") == cwd:
+                    return workspace
+            except Exception:
+                continue
     return None
+
+
 def session_sort_time(sess):
     return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
@@ -850,10 +731,11 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
                     break
         
         if not matched:
-            # Group ALL non-running sessions by time proximity, not inv_id
-            # Closed sessions still get bucketed by boot+time so they merge
-            bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
-            gkey = (rec.get("boot_id"), status, bucket)
+            if status == "closed":
+                gkey = ("closed", inv_id)
+            else:
+                bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
+                gkey = (rec.get("boot_id"), status, bucket)
             found = {
                 "key": gkey,
                 "time": when or dt.datetime.fromtimestamp(0, dt.timezone.utc),
@@ -865,8 +747,6 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
 
     for g in groups:
         g["records"].sort(key=lambda r: r.get("cwd", ""))
-        g["_session_count"] = len(g["records"])
-        g["_multi_session"] = len(g["records"]) >= 3  # 3+ sessions = real crash group
     groups.sort(key=lambda g: g["time"], reverse=True)
     return groups
 
@@ -1015,23 +895,7 @@ def _resolve_display_key(r, cfg):
 def print_restore_groups(groups):
     cfg = load_config()
     title()
-    show_all = os.environ.get("CG_SHOW_ALL", "") == "1"
-    multi_groups = [g for g in groups if g.get("_multi_session")]
-    single_groups = [g for g in groups if not g.get("_multi_session")]
-    
-    if show_all:
-        display_groups = groups
-        subtitle = "%d groups (all)" % len(groups)
-    elif multi_groups:
-        display_groups = multi_groups
-        subtitle = "%d crash groups — %d single suppressed (press 'A' or --all to show)" % (
-            len(multi_groups), len(single_groups))
-    else:
-        display_groups = groups
-        subtitle = "%d groups" % len(groups)
-    
-    print(color("bold", "recovery %s:\n" % subtitle))
-    groups = display_groups  # Use the filtered list for display
+    print(color("bold", "recovery groups (%d):\n" % len(groups)))
     # Cache git context per cwd to avoid repeated subprocess calls
     git_cache = {}
     for i, g in enumerate(groups, 1):
@@ -1896,26 +1760,6 @@ def kitty_spawn(cli, cwd, title, inner):
     return "kitty pid %s" % proc.pid, None
 
 
-def ghostty_preflight(cli):
-    """Verify ghostty can spawn a new window without crashing."""
-    try:
-        # Quick check: ghostty +list-windows returns quickly without UI
-        r = subprocess.run([cli, "+list-windows"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return True, None
-        # Try version check as alternative
-        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return True, None
-        return False, "ghostty not responding"
-    except FileNotFoundError:
-        return False, "ghostty binary not found"
-    except subprocess.TimeoutExpired:
-        return False, "ghostty pre-flight timed out"
-    except Exception as e:
-        return False, str(e)
-
-
 def ghostty_spawn(cli, cwd, title, inner):
     # Use Popen (non-blocking) for both +new-window and the plain fallback.
     # subprocess.run would block the spawn loop until the inner command exits,
@@ -2433,20 +2277,14 @@ def select_group_records(groups, args):
         records = groups[0]["records"]
     elif sys.stdin.isatty() and sys.stdout.isatty():
         args._history_prompted = True
-        multi_groups = [g for g in groups if g.get("_multi_session")]
-        pref_groups = multi_groups if multi_groups else groups
         group_opts = [
             "%s  %d session(s)  %s" % (
                 g.get("status") or "unknown",
                 len(g["records"]),
                 g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown",
             )
-            for g in pref_groups
+            for g in groups
         ]
-        # If we filtered to multi-session only, note the suppression
-        if multi_groups and len(multi_groups) < len(groups):
-            suppressed = len(groups) - len(multi_groups)
-            group_opts.append("[2m--- %d single-session group(s) hidden (use --all to show) ---[0m" % suppressed)
         try:
             gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
         except (KeyboardInterrupt, EOFError):
@@ -2509,7 +2347,6 @@ def select_group_records(groups, args):
 # multi_select function — inject into crash-guard via replace
 
 def multi_select(items, title, cfg=None):
-    import signal as _signal
     """Interactive multi-select with arrow keys, space toggle, numbers, archive toggle, filter."""
     if not items:
         return []
@@ -2535,40 +2372,11 @@ def multi_select(items, title, cfg=None):
 
     sel = set()
     idx = 0
+    old = termios.tcgetattr(sys.stdin)
     show_archived = False
     show_omitted = False
     filter_text = ""
     orig_items = list(items)
-    
-    # Save terminal settings for safe restoration
-    _saved_tio = None
-    try:
-        _saved_tio = termios.tcgetattr(sys.stdin)
-    except Exception:
-        pass  # Not a TTY, non-interactive fallback
-    
-    # Register signal handlers to restore terminal on crash
-    _old_sig_handlers = {}
-    def _restore_tty():
-        if _saved_tio is not None:
-            try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _saved_tio)
-                sys.stdout.write("\033[?25h")
-                sys.stdout.flush()
-            except Exception:
-                pass
-    def _signal_handler(signum, frame):
-        _restore_tty()
-        sys.exit(128 + signum)
-    for sig in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
-        if hasattr(signal, sig):
-            try:
-                _old = signal.signal(getattr(signal, sig), _signal_handler)
-                _old_sig_handlers[sig] = _old
-            except Exception:
-                pass
-    
-    old = _saved_tio
 
     def _filtered():
         out = list(orig_items)
@@ -2595,9 +2403,6 @@ def multi_select(items, title, cfg=None):
                 parts.append("[ARCHIVE]")
             if show_omitted:
                 parts.append("[OMITTED]")
-            show_all_mode = os.environ.get("CG_SHOW_ALL", "") == "1"
-            if show_all_mode:
-                parts.append("[ALL]")
             if filter_text:
                 parts.append("filter: %s" % filter_text)
             parts.append("%d/%d shown" % (len(display), len(orig_items)))
@@ -2664,16 +2469,6 @@ def multi_select(items, title, cfg=None):
                 show_archived = not show_archived
                 idx = 0
                 continue
-            if ch.upper() == "A" and ch != "a":  # Capital A toggles all
-                current = os.environ.get("CG_SHOW_ALL", "")
-                if current == "1":
-                    os.environ["CG_SHOW_ALL"] = "0"
-                else:
-                    os.environ["CG_SHOW_ALL"] = "1"
-                # Re-run restore_groups with new filter
-                # (groups will be re-read on next restore invocation)
-                idx = 0
-                continue
             if ch.lower() == "o":
                 show_omitted = not show_omitted
                 idx = 0
@@ -2719,14 +2514,7 @@ def multi_select(items, title, cfg=None):
         sys.stdout.flush()
         raise
     finally:
-        _restore_tty()
-        # Restore signal handlers
-        for sig_name, handler in _old_sig_handlers.items():
-            if hasattr(signal, sig_name):
-                try:
-                    signal.signal(getattr(signal, sig_name), handler)
-                except Exception:
-                    pass
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
 
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
@@ -2802,11 +2590,10 @@ def cmd_restore(args):
             print("  (%d ephemeral archive session(s) filtered out)\n" % skipped)
         targets = filtered
     else:
-        # Default to ALL boots with recoverable sessions (no boot filter).
-        # Crashed sessions are from PREVIOUS boots (before WSL restart).
-        # The ephemeral filtering + grouping will organize them.
-        # If --boot is specified, filter to that boot only.
-        effective_boot = args.boot if args.boot else None
+        # Default to current boot only (crashed from previous boot or stale this boot).
+        # When --boot is not specified, use the current boot. This prevents accidentally
+        # restoring sessions from many boots ago.
+        effective_boot = args.boot if args.boot else cur
         groups = restore_groups(
             include_closed=args.include_closed,
             boot_id=effective_boot,
@@ -2839,9 +2626,6 @@ def cmd_restore(args):
         for spec in args.apply_args:
             _apply_args_from_cli(plan, cfg, spec)
 
-    # --all / --show-all: show single-session groups too
-    if args.all:
-        os.environ["CG_SHOW_ALL"] = "1"
     # Inherit --yes into the history prompt when it was used for the login check.
     args._history_prompted = getattr(args, "_history_prompted", False)
 
@@ -2904,16 +2688,6 @@ def cmd_restore(args):
         return 0
 
     backend, cli, note = resolve_terminal_backend(cfg, args.terminal or (cfg.get("terminal") or {}).get("backend", "auto"))
-    
-    # Pre-flight: verify ghostty can create windows before trying to spawn
-    if backend == "ghostty" and cli:
-        ok, err = ghostty_preflight(cli)
-        if not ok:
-            print(colorize("fail", "\nghostty pre-flight check failed: %s" % err))
-            print("  Try running with --no-spawn or use a different terminal backend.")
-            print("  Aborting to prevent session crash.\n")
-            return 2
-    
     if not cli:
         sys.stderr.write(
             "crash-guard: %s.\n"
@@ -3728,8 +3502,6 @@ def main():
                    help="list recovery groups without restoring")
     s.add_argument("--include-closed", dest="include_closed", action="store_true", default=False,
                    help="also include cleanly closed sessions in recovery groups")
-    s.add_argument("--all", "--show-all", action="store_true", default=False,
-                   help="show all sessions including single-session entries (default: groups only)")
     s.add_argument("--terminal", default=None,
                    choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
                    help="terminal backend for spawning restored sessions")
