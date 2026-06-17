@@ -725,11 +725,10 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
                     break
         
         if not matched:
-            if status == "closed":
-                gkey = ("closed", inv_id)
-            else:
-                bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
-                gkey = (rec.get("boot_id"), status, bucket)
+            # Group ALL non-running sessions by time proximity, not inv_id
+            # Closed sessions still get bucketed by boot+time so they merge
+            bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
+            gkey = (rec.get("boot_id"), status, bucket)
             found = {
                 "key": gkey,
                 "time": when or dt.datetime.fromtimestamp(0, dt.timezone.utc),
@@ -741,6 +740,8 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
 
     for g in groups:
         g["records"].sort(key=lambda r: r.get("cwd", ""))
+        g["_session_count"] = len(g["records"])
+        g["_multi_session"] = len(g["records"]) >= 3  # 3+ sessions = real crash group
     groups.sort(key=lambda g: g["time"], reverse=True)
     return groups
 
@@ -889,7 +890,23 @@ def _resolve_display_key(r, cfg):
 def print_restore_groups(groups):
     cfg = load_config()
     title()
-    print(color("bold", "recovery groups (%d):\n" % len(groups)))
+    show_all = os.environ.get("CG_SHOW_ALL", "") == "1"
+    multi_groups = [g for g in groups if g.get("_multi_session")]
+    single_groups = [g for g in groups if not g.get("_multi_session")]
+    
+    if show_all:
+        display_groups = groups
+        subtitle = "%d groups (all)" % len(groups)
+    elif multi_groups:
+        display_groups = multi_groups
+        subtitle = "%d crash groups — %d single suppressed (press 'A' or --all to show)" % (
+            len(multi_groups), len(single_groups))
+    else:
+        display_groups = groups
+        subtitle = "%d groups" % len(groups)
+    
+    print(color("bold", "recovery %s:\n" % subtitle))
+    groups = display_groups  # Use the filtered list for display
     # Cache git context per cwd to avoid repeated subprocess calls
     git_cache = {}
     for i, g in enumerate(groups, 1):
@@ -2291,14 +2308,20 @@ def select_group_records(groups, args):
         records = groups[0]["records"]
     elif sys.stdin.isatty() and sys.stdout.isatty():
         args._history_prompted = True
+        multi_groups = [g for g in groups if g.get("_multi_session")]
+        pref_groups = multi_groups if multi_groups else groups
         group_opts = [
             "%s  %d session(s)  %s" % (
                 g.get("status") or "unknown",
                 len(g["records"]),
                 g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown",
             )
-            for g in groups
+            for g in pref_groups
         ]
+        # If we filtered to multi-session only, note the suppression
+        if multi_groups and len(multi_groups) < len(groups):
+            suppressed = len(groups) - len(multi_groups)
+            group_opts.append("[2m--- %d single-session group(s) hidden (use --all to show) ---[0m" % suppressed)
         try:
             gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
         except (KeyboardInterrupt, EOFError):
@@ -2447,6 +2470,9 @@ def multi_select(items, title, cfg=None):
                 parts.append("[ARCHIVE]")
             if show_omitted:
                 parts.append("[OMITTED]")
+            show_all_mode = os.environ.get("CG_SHOW_ALL", "") == "1"
+            if show_all_mode:
+                parts.append("[ALL]")
             if filter_text:
                 parts.append("filter: %s" % filter_text)
             parts.append("%d/%d shown" % (len(display), len(orig_items)))
@@ -2511,6 +2537,16 @@ def multi_select(items, title, cfg=None):
 
             if ch.lower() == "a":
                 show_archived = not show_archived
+                idx = 0
+                continue
+            if ch.upper() == "A" and ch != "a":  # Capital A toggles all
+                current = os.environ.get("CG_SHOW_ALL", "")
+                if current == "1":
+                    os.environ["CG_SHOW_ALL"] = "0"
+                else:
+                    os.environ["CG_SHOW_ALL"] = "1"
+                # Re-run restore_groups with new filter
+                # (groups will be re-read on next restore invocation)
                 idx = 0
                 continue
             if ch.lower() == "o":
@@ -2677,6 +2713,9 @@ def cmd_restore(args):
         for spec in args.apply_args:
             _apply_args_from_cli(plan, cfg, spec)
 
+    # --all / --show-all: show single-session groups too
+    if args.all:
+        os.environ["CG_SHOW_ALL"] = "1"
     # Inherit --yes into the history prompt when it was used for the login check.
     args._history_prompted = getattr(args, "_history_prompted", False)
 
@@ -3563,6 +3602,8 @@ def main():
                    help="list recovery groups without restoring")
     s.add_argument("--include-closed", dest="include_closed", action="store_true", default=False,
                    help="also include cleanly closed sessions in recovery groups")
+    s.add_argument("--all", "--show-all", action="store_true", default=False,
+                   help="show all sessions including single-session entries (default: groups only)")
     s.add_argument("--terminal", default=None,
                    choices=("auto", "tmux", "wezterm", "kitty", "ghostty", "windows-terminal", "wt"),
                    help="terminal backend for spawning restored sessions")
