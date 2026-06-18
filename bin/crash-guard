@@ -2862,6 +2862,17 @@ def cmd_restore(args):
     if args.dry_run:
         print("dry-run: nothing spawned.")
         return 0
+    
+    if args.safe:
+        print(colorize("bold", "\nSAFE MODE: printing commands only, no spawn.\n"))
+        print("  Run with the commands below in separate terminals:\n")
+        for item in plan:
+            if item["argv"] and item.get("cwd"):
+                print("    cd %s && %s" % (item["cwd"], " ".join(item["argv"])))
+            elif item["argv"]:
+                print("    %s" % " ".join(item["argv"]))
+        print("\n  Or run without --safe to auto-spawn.\n")
+        return 0
 
     if not args.no_spawn:
         shell = os.environ.get("SHELL", "/bin/zsh")
@@ -3764,6 +3775,8 @@ def main():
                    help="show full shell commands in plan (default: collapsed)")
     s.add_argument("--batch", action="store_true",
                    help="non-interactive mode: auto-confirm + group 1")
+    s.add_argument("--safe", action="store_true",
+                   help="safe mode: no raw terminal, no spawn, print plan and exit")
     s.add_argument("--repair", action="store_true",
                    help="repair truncated Claude/Codex session artifacts before resuming (backs up originals)")
     # --include-stale was intentionally removed: stale sessions from the
