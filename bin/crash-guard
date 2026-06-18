@@ -2875,8 +2875,23 @@ def cmd_restore(args):
         return 0
 
     if not args.no_spawn:
+        # Warn on native Linux (non-WSL2) about potential spawn instability
+        if not os.environ.get("WSL_DISTRO_NAME"):
+            print(colorize("warn", "\n⚠️  Native Linux detected. Session restore spawn may be unstable."))
+            print("  Use --safe to print commands without spawning.")
+            print("  Use --go to confirm spawn and suppress this warning.\n")
+            if not getattr(args, "_go_set", False) and not args.yes:
+                try:
+                    ans = input("  Continue with spawn? [y/N] ").strip().lower()
+                except (KeyboardInterrupt, EOFError):
+                    print("\naborted.")
+                    return 0
+                if ans not in ("y", "yes"):
+                    print("aborted. Use --safe or --go.")
+                    return 0
+        
         shell = os.environ.get("SHELL", "/bin/zsh")
-        test_rc = subprocess.run([shell, "-lic", "command -v cg_run >/dev/null 2>&1"], capture_output=True).returncode
+        test_rc = subprocess.run([shell, "-lic", "command -v cg_run >/dev/null 2>&1"], capture_output=True).text
         if test_rc != 0:
             print(colorize("fail", "\nERROR: cg_run not found in shell environment."))
             print("The crash-guard shell integration must be sourced in your ~/.zshrc or ~/.bashrc:")
@@ -3775,6 +3790,8 @@ def main():
                    help="show full shell commands in plan (default: collapsed)")
     s.add_argument("--batch", action="store_true",
                    help="non-interactive mode: auto-confirm + group 1")
+    s.add_argument("--go", action="store_true", dest="_go_set", default=False,
+                   help="confirm spawn on Linux (suppress warning)")
     s.add_argument("--safe", action="store_true",
                    help="safe mode: no raw terminal, no spawn, print plan and exit")
     s.add_argument("--repair", action="store_true",
