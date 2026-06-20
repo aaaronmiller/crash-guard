@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+- Fixed `build_plan` grouping: each session now gets its own plan item instead of collapsing multiple sessions in the same directory into one plan item. This ensures all sessions in a crash group are restored when selecting "all sessions".
+- Added 30-second timeout to `wez_spawn` subprocess call — prevents indefinite hang when WezTerm is overwhelmed by too many simultaneous spawns.
+- Increased default `spawn_delay` from 0.5s to 2.0s, max allowed from 30s to 60s — prevents terminal freeze when restoring many sessions.
+- Fixed group sorting: same-boot stale sessions (now called "disconnected") appear first in restore menu, ahead of old-boot crashed sessions — users see their current work first.
+- Lowered multi-session group threshold from 3 to 2 — more crash groups shown by default, fewer hidden.
+- Removed single-session group suppression — all recoverable sessions now visible in restore menu without needing `--all`.
+- Renamed "stale" to "disconnected" in user-facing output (`status`, `restore`, `prune` commands) — "stale" was misleading; these are same-boot sessions worth recovering.
+- Added `rtx` to `known_wrappers` set — handles typo'd `rtx` sentinel key (was being used for hermes).
+
 ### Added
 - Added `append_history(flush=True)` with `os.fsync()` for restore-related events so the log survives OOM kill.
 - Added `_system_snapshot()` helper: logs `mem_total_kb`, `mem_avail_kb`, `live_sentinels`, `user_procs` in `restore_start`/`restore_done` events for crash diagnosis.
