@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
     "tmux": {"cli": ""},
     "windows_terminal": {"cli": "", "wsl": ""},
     "env_patterns": DEFAULT_ENV_PATTERNS,
-    "restore": {"pre": DEFAULT_RESTORE_PRE, "spawn_delay": 0.5},
+    "restore": {"pre": DEFAULT_RESTORE_PRE, "spawn_delay": 2.0},
     "programs": {
         "claude": {
             "continue": ["rtk", "claude", "--continue", "--dangerously-skip-permissions"],
@@ -233,16 +233,16 @@ def load_config():
     for key, prog in DEFAULT_CONFIG["programs"].items():
         cfg["programs"].setdefault(key, prog)
     # Validate spawn_delay early so callers don't need to re-check
-    raw_delay = (cfg.get("restore") or {}).get("spawn_delay", 0.5)
+    raw_delay = (cfg.get("restore") or {}).get("spawn_delay", 2.0)
     try:
         v = float(raw_delay)
         if v < 0:
-            v = 0.5
-        elif v > 30:
-            v = 30.0
+            v = 2.0
+        elif v > 60:
+            v = 60.0
         cfg.setdefault("restore", {})["spawn_delay"] = v
     except (ValueError, TypeError):
-        cfg.setdefault("restore", {})["spawn_delay"] = 0.5
+        cfg.setdefault("restore", {})["spawn_delay"] = 2.0
     return cfg
 
 
@@ -792,7 +792,7 @@ def session_sort_time(sess):
     return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
 
-def restore_groups(include_closed=True, boot_id=None, include_archived=False):
+def restore_groups(include_closed=True, boot_filter=None, include_archived=False):
     sessions = []
     for inv_id, sess in history_sessions().items():
         status = sess.get("status")
@@ -810,7 +810,7 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
         if sess.get("_ephemeral"):
             continue
         rec = dict(sess.get("record") or {})
-        if boot_id and rec.get("boot_id") != boot_id:
+        if boot_filter and rec.get("boot_id") != boot_filter:
             continue
         rec.setdefault("inv_id", inv_id)
         if sess.get("live_path"):
@@ -875,8 +875,21 @@ def restore_groups(include_closed=True, boot_id=None, include_archived=False):
         g["records"] = unique
         g["records"].sort(key=lambda r: r.get("cwd", ""))
         g["_session_count"] = len(g["records"])
-        g["_multi_session"] = len(g["records"]) >= 3  # 3+ sessions = real crash group
-    groups.sort(key=lambda g: g["time"], reverse=True)
+        g["_multi_session"] = len(g["records"]) >= 2  # 2+ sessions = crash group
+    # Sort: same-boot stale groups first, then same-boot other, then old-boot crashed
+    def group_priority(g):
+        status = g.get("status", "")
+        boot_tuple = g.get("key")
+        if isinstance(boot_tuple, tuple):
+            bid = boot_tuple[0] if boot_tuple else ""
+        else:
+            bid = g.get("key", "")
+        t = g.get("time") or dt.datetime.fromtimestamp(0, dt.timezone.utc)
+        if bid and bid == boot_id():
+            return (0, 0 if status == "stale" else 1, -t.timestamp())
+        else:
+            return (2, 0, -t.timestamp())
+    groups.sort(key=group_priority)
     return groups
 
 
@@ -998,7 +1011,7 @@ def _resolve_display_key(r, cfg):
     key, note = resolve_record_program(r, cfg)
     raw_key = r.get("key", "?")
     argv = r.get("argv") or []
-    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
     
     # Collect wrapper names from argv and find the actual tool
     wrappers = []
@@ -1024,35 +1037,33 @@ def _resolve_display_key(r, cfg):
 def print_restore_groups(groups):
     cfg = load_config()
     title()
-    show_all = os.environ.get("CG_SHOW_ALL", "") == "1"
-    multi_groups = [g for g in groups if g.get("_multi_session")]
-    single_groups = [g for g in groups if not g.get("_multi_session")]
-    
-    if show_all:
-        display_groups = groups
-        subtitle = "%d groups (all)" % len(groups)
-    elif multi_groups:
-        display_groups = multi_groups
-        subtitle = "%d crash groups — %d single suppressed (press 'A' or --all to show)" % (
-            len(multi_groups), len(single_groups))
+    # Show all groups — no more hidden single-session groups
+    display_groups = groups
+    multi_count = sum(1 for g in groups if g.get("_multi_session"))
+    single_count = sum(1 for g in groups if not g.get("_multi_session"))
+    if single_count:
+        subtitle = "%d groups — %d multi, %d single" % (len(groups), multi_count, single_count)
     else:
-        display_groups = groups
         subtitle = "%d groups" % len(groups)
     
+    # Rename internal "stale" status to user-facing "disconnected"
+    status_labels = {"stale": "disconnected"}
+    
     print(color("bold", "recovery %s:\n" % subtitle))
-    groups = display_groups  # Use the filtered list for display
     # Cache git context per cwd to avoid repeated subprocess calls
     git_cache = {}
     for i, g in enumerate(groups, 1):
         when = g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown time"
         status = g.get("status") or "unknown"
-        status_colors = {"stale": "warn", "crashed": "fail", "archived": "highlight", "closed": "muted"}
-        sc = status_colors.get(status, "info")
-        print("  %s %s %s  (%d session(s))" % (
+        display_status = status_labels.get(status, status)
+        status_colors = {"stale": "warn", "disconnected": "warn", "crashed": "fail", "archived": "highlight", "closed": "muted"}
+        sc = status_colors.get(display_status, "info")
+        print("  %s %s %s  (%d session(s)%s)" % (
             colorize("ok", "%2d." % i),
-            colorize(sc, "%-9s" % status),
+            colorize(sc, "%-12s" % display_status),
             colorize("info", when),
-            len(g["records"])))
+            len(g["records"]),
+            colorize("muted", ", single") if not g.get("_multi_session") else ""))
         for j, r in enumerate(g["records"], 1):
             display = _resolve_display_key(r, cfg)
             wrap = ""
@@ -1213,7 +1224,7 @@ def argv_program_key(argv, programs):
     find the actual tool (claude, pi, kilo, etc.).
     """
     names = [Path(a).name for a in (argv or []) if a]
-    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
     for name in names[:5]:  # Check up to 5 positions to skip wrappers
         if name in known_wrappers:
             continue
@@ -1289,7 +1300,7 @@ def resolve_record_program(r, cfg):
     key = r.get("key")
     prog = programs.get(key)
     raw_argv = r.get("argv") or []
-    known_wrappers = {"rtk", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
 
     # If the original key has use_sentinel_argv, prefer the recorded argv
     if prog and prog.get("use_sentinel_argv"):
@@ -1332,91 +1343,87 @@ def sentinel_restore_argv(r, key, prog=None):
 
 
 def build_plan(crashed, cfg, repair=False):
-    """Group crashed sentinels by (key, cwd) and resolve resume commands."""
-    groups = {}
+    """Build restore plan for crashed sentinels.
+    
+    Each session gets its own plan item to avoid collapsing multiple sessions
+    in the same directory into one plan item.
+    """
+    plan = []
     for r in crashed:
         key, infer_note = resolve_record_program(r, cfg)
         r["_plan_note"] = infer_note
-        groups.setdefault((key, r.get("cwd")), []).append(r)
-
-    plan = []
-    for (key, cwd), recs in groups.items():
+        cwd = r.get("cwd")
         prog = cfg["programs"].get(key)
-        n = len(recs)
+        
         if not prog:
-            for r in recs:
-                note = "no config entry for '%s'" % key
-                if r.get("_plan_note"):
-                    note = "%s; %s" % (r["_plan_note"], note)
-                replay_argv = list(r.get("argv") or [])
-                if replay_argv:
-                    plan.append({
-                        "key": key, "cwd": cwd, "rec": r, "tier": "replay",
-                        "argv": replay_argv, "note": note,
-                        "env": r.get("env", {}),
-                    })
-                else:
-                    plan.append({
-                        "key": key, "cwd": cwd, "rec": r, "tier": "skip",
-                        "argv": None, "note": note,
-                        "env": r.get("env", {}),
-                    })
-            continue
-
-        if prog.get("use_sentinel_argv"):
-            for r in recs:
-                note = r.get("_plan_note") or "using recorded argv"
+            note = "no config entry for '%s'" % key
+            if r.get("_plan_note"):
+                note = "%s; %s" % (r["_plan_note"], note)
+            replay_argv = list(r.get("argv") or [])
+            if replay_argv:
                 plan.append({
-                    "key": key, "cwd": cwd, "rec": r, "tier": "recorded",
-                    "argv": sentinel_restore_argv(r, key, prog), "note": note,
+                    "key": key, "cwd": cwd, "rec": r, "tier": "replay",
+                    "argv": replay_argv, "note": note,
+                    "env": r.get("env", {}),
+                })
+            else:
+                plan.append({
+                    "key": key, "cwd": cwd, "rec": r, "tier": "skip",
+                    "argv": None, "note": note,
                     "env": r.get("env", {}),
                 })
             continue
 
-        sessions = []
-        if n > 1 and prog.get("resume_by_id") and prog.get("store"):
-            sessions = store_sessions(prog, cwd, n)
+        if prog.get("use_sentinel_argv"):
+            note = r.get("_plan_note") or "using recorded argv"
+            plan.append({
+                "key": key, "cwd": cwd, "rec": r, "tier": "recorded",
+                "argv": sentinel_restore_argv(r, key, prog), "note": note,
+                "env": r.get("env", {}),
+            })
+            continue
 
-        for i, r in enumerate(recs):
-            env = r.get("env", {})
-            recorded_argv = r.get("argv") or []
-            if i < len(sessions):
-                sid, spath = sessions[i]
-                status = verify_artifact(spath, repair=repair)
-                if status in ("ok", "repaired"):
-                    base_argv = [a.replace("{id}", sid).replace("{cwd}", cwd)
-                                 for a in prog["resume_by_id"]]
-                    extra = argv_extra_args(recorded_argv, base_argv, key)
-                    plan.append({
-                        "key": key, "cwd": cwd, "rec": r, "tier": "id",
-                        "argv": base_argv + extra, "session": sid, "verify": status,
-                        "note": "" if status == "ok" else "artifact repaired",
-                        "env": env,
-                    })
-                    continue
-                # fall through to continue with a degradation note
-                note = "session %s %s; using continue" % (sid[:8], status)
-                if r.get("_plan_note"):
-                    note = "%s; %s" % (r["_plan_note"], note)
-                base_argv = prog["continue"]
+        # Try to find a matching session in the store
+        sessions = store_sessions(prog, cwd, 1) if prog.get("resume_by_id") and prog.get("store") else []
+        env = r.get("env", {})
+        recorded_argv = r.get("argv") or []
+        
+        if sessions:
+            sid, spath = sessions[0]
+            status = verify_artifact(spath, repair=repair)
+            if status in ("ok", "repaired"):
+                base_argv = [a.replace("{id}", sid).replace("{cwd}", cwd)
+                             for a in prog["resume_by_id"]]
                 extra = argv_extra_args(recorded_argv, base_argv, key)
                 plan.append({
-                    "key": key, "cwd": cwd, "rec": r, "tier": "continue",
-                    "argv": base_argv + extra, "verify": status,
-                    "note": note,
+                    "key": key, "cwd": cwd, "rec": r, "tier": "id",
+                    "argv": base_argv + extra, "session": sid, "verify": status,
+                    "note": "" if status == "ok" else "artifact repaired",
                     "env": env,
                 })
-            else:
-                note = r.get("_plan_note") or ""
-                if n > 1 and i > 0:
-                    extra = "multiple in same dir, no distinct id; may collapse"
-                    note = "%s; %s" % (note, extra) if note else extra
-                base_argv = prog["continue"]
-                uxtra = argv_extra_args(recorded_argv, base_argv, key)
-                plan.append({
-                    "key": key, "cwd": cwd, "rec": r, "tier": "continue",
-                    "argv": base_argv + uxtra, "note": note, "env": env,
-                })
+                continue
+            # fall through to continue with a degradation note
+            note = "session %s %s; using continue" % (sid[:8], status)
+            if r.get("_plan_note"):
+                note = "%s; %s" % (r["_plan_note"], note)
+            base_argv = prog["continue"]
+            extra = argv_extra_args(recorded_argv, base_argv, key)
+            plan.append({
+                "key": key, "cwd": cwd, "rec": r, "tier": "continue",
+                "argv": base_argv + extra, "verify": status,
+                "note": note,
+                "env": env,
+            })
+        else:
+            # No store or no matching session - use continue tier
+            note = r.get("_plan_note") or ""
+            base_argv = prog["continue"]
+            extra = argv_extra_args(recorded_argv, base_argv, key)
+            plan.append({
+                "key": key, "cwd": cwd, "rec": r, "tier": "continue",
+                "argv": base_argv + extra, "note": note, "env": env,
+            })
+    
     return plan
 
 
@@ -2094,7 +2101,10 @@ def wez_spawn(cli, domain, inner, window_id=None):
     else:
         argv += ["--window-id", str(window_id)]
     argv += ["--"] + inner
-    res = subprocess.run(argv, capture_output=True, text=True)
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None, "wezterm cli spawn timed out after 30s"
     if res.returncode != 0:
         return None, res.stderr.strip()
     return res.stdout.strip(), None
@@ -2156,7 +2166,7 @@ def cmd_status(args):
         for r in running:
             print(fmt_row(r, "run", cfg))
     if stale:
-        print(colorize("warn", "\nstale this boot (%d) -- launcher died, tool gone:" % len(stale)))
+        print(colorize("warn", "\ndisconnected this boot (%d) -- same boot, shell process gone:" % len(stale)))
         for r in stale:
             print(fmt_row(r, "stl", cfg))
     if crashed:
@@ -2164,7 +2174,7 @@ def cmd_status(args):
         for r in crashed:
             print(fmt_row(r, "crx", cfg))
     if stale:
-        print("  \033[2m(Hint: run 'crash-guard prune' to remove stale sentinels)\033[0m")
+        print("  \033[2m(Hint: run 'crash-guard prune' to remove disconnected sentinels)\033[0m")
     if not (running or stale or crashed):
         print("  nothing tracked.")
     # Check data directory disk space if available
@@ -2269,11 +2279,11 @@ def cmd_prune(args):
     for r in stale:
         try:
             Path(r["_path"]).unlink()
-            print("pruned stale: %s %s" % (r.get("key"), r.get("cwd")))
+            print("pruned disconnected: %s %s" % (r.get("key"), r.get("cwd")))
         except Exception as e:
             sys.stderr.write("prune: %s\n" % e)
     if not stale:
-        print("no stale sentinels.")
+        print("no disconnected sentinels.")
     return 0
 
 
@@ -2301,7 +2311,7 @@ def cmd_history(args):
         all_cwds = sorted(set(
             r.get("cwd")
             for p in periods
-            for g in restore_groups(include_closed=True, boot_id=p["boot_id"], include_archived=True)
+            for g in restore_groups(include_closed=True, boot_filter=p["boot_id"], include_archived=True)
             for r in g["records"] if r.get("cwd")
         ))
         if all_cwds:
@@ -2330,7 +2340,7 @@ def cmd_history(args):
         return 1
     print("")
     period = periods[idx]
-    groups = restore_groups(include_closed=True, boot_id=period["boot_id"], include_archived=True)
+    groups = restore_groups(include_closed=True, boot_filter=period["boot_id"], include_archived=True)
     print_restore_groups(groups)
     print("Restore from this period with: crash-guard restore --boot %s --group N" % period["boot_id"])
     return 0
@@ -2442,20 +2452,16 @@ def select_group_records(groups, args):
         records = groups[0]["records"]
     elif sys.stdin.isatty() and sys.stdout.isatty():
         args._history_prompted = True
-        multi_groups = [g for g in groups if g.get("_multi_session")]
-        pref_groups = multi_groups if multi_groups else groups
+        # Show all groups — no more hidden single-session groups
+        status_display = {"stale": "disconnected"}
         group_opts = [
             "%s  %d session(s)  %s" % (
-                g.get("status") or "unknown",
+                status_display.get(g.get("status") or "unknown", g.get("status") or "unknown"),
                 len(g["records"]),
                 g["time"].strftime("%Y-%m-%d %H:%M:%S %z") if g.get("time") else "unknown",
             )
-            for g in pref_groups
+            for g in groups
         ]
-        # If we filtered to multi-session only, note the suppression
-        if multi_groups and len(multi_groups) < len(groups):
-            suppressed = len(groups) - len(multi_groups)
-            group_opts.append("[2m--- %d single-session group(s) hidden (use --all to show) ---[0m" % suppressed)
         try:
             gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
         except (KeyboardInterrupt, EOFError):
@@ -2818,7 +2824,7 @@ def cmd_restore(args):
         effective_boot = args.boot if args.boot else None
         groups = restore_groups(
             include_closed=args.include_closed,
-            boot_id=effective_boot,
+            boot_filter=effective_boot,
             include_archived=args.from_archive,
         )
         if args.list_groups:
