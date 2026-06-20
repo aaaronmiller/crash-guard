@@ -8,6 +8,12 @@ tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
 
 # crash-guard
 
+[![GitHub stars](https://img.shields.io/github/stars/aaaronmiller/crash-guard?style=flat-square)](https://github.com/aaaronmiller/crash-guard)
+[![License](https://img.shields.io/github/license/aaaronmiller/crash-guard?style=flat-square)](MIT)
+[![Python](https://img.shields.io/badge/python-3.6%2B-blue?style=flat-square&logo=python)](https://python.org)
+
+> Restores CLI coding tool and agentic sessions following a system crash.
+
 ```
   _____ _____ _____ _____     _____ _____ _____ _____ 
  |  _  |  _  |  _  |  _  |   |  _  |  _  |  _  |  _  |
