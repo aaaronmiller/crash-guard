@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ---
-# date: 2026-06-13 00:00:00 PT
-# ver: 2.1.0
+# date: 2026-06-23 00:00:00 PT
+# ver: 2.2.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, python]
@@ -34,6 +34,7 @@ import datetime as dt
 import fnmatch
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -88,6 +89,55 @@ def color(code, text):
 def colorize(status, text):
     """Convenience: apply a semantic color in one call."""
     return color(status, text)
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s):
+    """Length of *s* ignoring SGR color escapes (their on-screen width is 0)."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _fit_ansi(s, budget):
+    """Truncate *s* to *budget* visible columns, preserving color codes.
+
+    Keeps the redraw math honest: every menu row must occupy exactly one
+    terminal line or the cursor-up count smears the display.
+    """
+    s = s.replace("\n", " ").replace("\r", "")
+    if _visible_len(s) <= budget:
+        return s
+    out, vis = [], 0
+    for tok in re.split(r"(\x1b\[[0-9;]*m)", s):
+        if tok.startswith("\x1b"):
+            out.append(tok)
+            continue
+        for ch in tok:
+            if vis >= budget - 1:
+                out.append("…")
+                return "".join(out) + "\033[0m"
+            out.append(ch)
+            vis += 1
+    return "".join(out)
+
+
+# Stable per-project color so each task/folder is visually distinct in the
+# session list. Keyed on the final path component (the project name).
+_FOLDER_PALETTE = (
+    "38;5;110", "38;5;150", "38;5;180", "38;5;175", "38;5;144",
+    "38;5;108", "38;5;141", "38;5;216", "38;5;152", "38;5;186",
+)
+
+
+def _folder_color(cwd, text=None):
+    """Colorize *text* (default: the project basename) by a hash of the folder."""
+    base = Path(cwd).name or cwd or "?"
+    label = base if text is None else text
+    if not USE_COLOR or not cwd:
+        return label
+    code = _FOLDER_PALETTE[sum(map(ord, base)) % len(_FOLDER_PALETTE)]
+    return "\033[%sm%s\033[0m" % (code, label)
 
 
 def title():
@@ -458,7 +508,7 @@ def cmd_stop(args):
                 lt = parse_time(launched)
                 if lt:
                     dur = max(0, (dt.datetime.now(lt.tzinfo) - lt).total_seconds())
-            extra = {"reason": "closed"}
+            extra = {"reason": getattr(args, "reason", None) or "closed"}
             if dur is not None:
                 extra["duration_secs"] = round(dur, 1)
             append_history("stop", rec, **extra)
@@ -609,7 +659,15 @@ def history_sessions():
         cur["reason"] = reason
         cur["live_path"] = rec.get("_path")
         if status in ("stale", "crashed"):
-            cur.setdefault("ended_at", now_iso())
+            # End time = last real activity (NOT now). Stamping 'now' produced
+            # the bogus multi-day durations and collapsed every crashed session
+            # into one fake time bucket.
+            la = _session_last_activity(cur, cfg)
+            if la:
+                cur["_last_activity"] = la.isoformat()
+                cur.setdefault("ended_at", la.isoformat())
+            else:
+                cur.setdefault("ended_at", now_iso())
 
     # Compute session duration for all sessions with known start/end.
     # Sessions that ran < 5 seconds are "ephemeral" (single-command that
@@ -618,18 +676,17 @@ def history_sessions():
         started = cur.get("started_at") or (cur.get("record") or {}).get("launched_at")
         ended = cur.get("ended_at")
         if started and ended:
-            # Try to get duration from the stop/archive event first
+            # Duration is only trustworthy when it comes from a REAL close
+            # event (clean exit / tab-close / archive). A crashed or
+            # disconnected session has no end signal — its true end is unknown,
+            # so we leave duration blank rather than inventing launched->now
+            # (which produced the bogus 100h+ labels) or launched->launched
+            # (which produced 0s and wrongly hid the session as ephemeral).
             dur = None
             for ev in cur.get("events", []):
                 if ev.get("event") in ("stop", "archive") and ev.get("duration_secs") is not None:
                     dur = ev["duration_secs"]
                     break
-            if dur is None:
-                # Compute from timestamps
-                st = parse_time(started)
-                en = parse_time(ended)
-                if st and en:
-                    dur = max(0, (en - st).total_seconds())
             # Get ephemeral thresholds from config
             ephemeral_cfg = cfg.get("ephemeral", {})
             max_dur = ephemeral_cfg.get("max_duration_secs", 5)
@@ -788,11 +845,45 @@ def _find_session_payload(rec, tool_key=None):
     if key == "ante":
         return None
     return None
+def _session_last_activity(sess, cfg):
+    """Best estimate of when a session was last active (datetime or None).
+
+    Newest of: the session payload file's mtime, any recorded event time,
+    and the launch time. For a crashed (no-clean-close) session this is our
+    proxy for 'was it still alive when WSL2 died'. A session whose project
+    went quiet long before the crash was effectively finished, not killed.
+    """
+    rec = sess.get("record") or {}
+    times = []
+    for ev in sess.get("events", []) or []:
+        t = parse_time(ev.get("at"))
+        if t:
+            times.append(t)
+    lt = parse_time(rec.get("launched_at"))
+    if lt:
+        times.append(lt)
+    try:
+        tool_key, _ = resolve_record_program(rec, cfg)
+        p = _find_session_payload(rec, tool_key)
+        if p and p.exists():
+            times.append(dt.datetime.fromtimestamp(p.stat().st_mtime, dt.timezone.utc))
+    except Exception:
+        pass
+    return max(times) if times else None
+
+
 def session_sort_time(sess):
     return parse_time(sess.get("ended_at")) or parse_time(sess.get("started_at")) or dt.datetime.fromtimestamp(0, dt.timezone.utc)
 
 
-def restore_groups(include_closed=True, boot_filter=None, include_archived=False):
+def restore_groups(include_closed=True, boot_filter=None, include_archived=False,
+                   include_abandoned=False):
+    cfg = load_config()
+    EPOCH = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+    # How long a session's project may be quiet before the crash and still
+    # count as "live at crash". Sessions idle longer were effectively finished
+    # (the user just never closed the tab) — hidden unless include_abandoned.
+    grace = cfg.get("ephemeral", {}).get("crash_grace_secs", 14400)  # 4h
     sessions = []
     for inv_id, sess in history_sessions().items():
         status = sess.get("status")
@@ -821,61 +912,94 @@ def restore_groups(include_closed=True, boot_filter=None, include_archived=False
         rec["_history_reason"] = sess.get("reason") or status or "unknown"
         rec["_history_time"] = sess.get("ended_at") or sess.get("started_at") or None
         rec["_duration_secs"] = sess.get("_duration_secs")
+        rec["_last_activity_dt"] = parse_time(sess.get("_last_activity")) or session_sort_time(sess)
         sessions.append((inv_id, sess, rec))
 
     groups = []
-    # Pre-sort sessions by time for proximity-based crash grouping
-    sessions.sort(key=lambda x: session_sort_time(x[1]) or dt.datetime.fromtimestamp(0, dt.timezone.utc))
-    
+    # Crashed sessions: ONE group per boot. A boot transition IS a WSL2 crash
+    # (the VM died, taking every live session with it). Grouping by boot gives
+    # one recovery group per crash, going back through history.
+    crashed_by_boot = {}
+    others = []
     for inv_id, sess, rec in sessions:
+        if rec.get("_history_status") == "crashed":
+            crashed_by_boot.setdefault(rec.get("boot_id") or "unknown-boot", []).append(rec)
+        else:
+            others.append((inv_id, sess, rec))
+
+    for boot, recs in crashed_by_boot.items():
+        crash_time = max((r.get("_last_activity_dt") or EPOCH) for r in recs)
+        groups.append({
+            "key": (boot, "crashed", "boot"),
+            "time": crash_time,
+            "status": "crashed",
+            "reason": "crashed",
+            "records": recs,
+            "_crash_time": crash_time,
+        })
+
+    # Non-crashed (stale/closed/archived): keep time-proximity bucketing.
+    others.sort(key=lambda x: session_sort_time(x[1]) or EPOCH)
+    for inv_id, sess, rec in others:
         status = rec.get("_history_status")
         when = session_sort_time(sess)
-        
-        # For non-closed sessions, try to find a nearby crash group
-        # within the same boot (5 minute window)
         matched = False
         if status != "closed" and when:
             for g in reversed(groups):
-                g_time = g.get("time")
-                g_status = g.get("status")
-                g_boot = g.get("key", ("",))[0] if isinstance(g.get("key"), tuple) else ""
-                if (g_status == status 
-                    and g_time 
-                    and abs((when - g_time).total_seconds()) < 300  # 5 min window
-                    and g_boot == rec.get("boot_id")):
+                if g.get("status") != status:
+                    continue
+                gk = g.get("key")
+                gboot = gk[0] if isinstance(gk, tuple) else ""
+                if (g.get("time")
+                        and abs((when - g["time"]).total_seconds()) < 300
+                        and gboot == rec.get("boot_id")):
                     g["records"].append(rec)
-                    if when > g_time:
+                    if when > g["time"]:
                         g["time"] = when
                     matched = True
                     break
-        
         if not matched:
-            # Group ALL non-running sessions by time proximity, not inv_id
-            # Closed sessions still get bucketed by boot+time so they merge
             bucket = when.strftime("%Y%m%d%H%M") if when else "unknown"
-            gkey = (rec.get("boot_id"), status, bucket)
-            found = {
-                "key": gkey,
-                "time": when or dt.datetime.fromtimestamp(0, dt.timezone.utc),
+            groups.append({
+                "key": (rec.get("boot_id"), status, bucket),
+                "time": when or EPOCH,
                 "status": status,
                 "reason": rec.get("_history_reason"),
                 "records": [rec],
-            }
-            groups.append(found)
+            })
 
+    kept = []
     for g in groups:
-        # Deduplicate: remove duplicate inv_id entries within each group
-        seen = set()
-        unique = []
+        ct = g.get("_crash_time")
+        # Mark sessions whose project went quiet well before the crash.
         for r in g["records"]:
-            inv = r.get("inv_id") or r.get("_path", "")
-            if inv not in seen:
-                seen.add(inv)
-                unique.append(r)
-        g["records"] = unique
-        g["records"].sort(key=lambda r: r.get("cwd", ""))
-        g["_session_count"] = len(g["records"])
-        g["_multi_session"] = len(g["records"]) >= 2  # 2+ sessions = crash group
+            la = r.get("_last_activity_dt")
+            if ct and la and (ct - la).total_seconds() > grace:
+                r["_abandoned"] = True
+                r["_abandoned_idle_secs"] = (ct - la).total_seconds()
+        # Collapse same tool+cwd relaunches to the most-recently-active one.
+        best, order = {}, []
+        for r in g["records"]:
+            tkey, _ = resolve_record_program(r, cfg)
+            dk = (tkey, r.get("cwd", ""))
+            if dk not in best:
+                best[dk] = r
+                order.append(dk)
+            elif (r.get("_last_activity_dt") or EPOCH) > (best[dk].get("_last_activity_dt") or EPOCH):
+                best[dk] = r
+        deduped = [best[k] for k in order]
+        hidden = [r for r in deduped if r.get("_abandoned")]
+        shown = deduped if include_abandoned else [r for r in deduped if not r.get("_abandoned")]
+        g["_abandoned_hidden"] = 0 if include_abandoned else len(hidden)
+        if not shown:
+            # Whole group is abandoned/finished work — drop unless asked for it.
+            continue
+        shown.sort(key=lambda r: r.get("cwd", ""))
+        g["records"] = shown
+        g["_session_count"] = len(shown)
+        g["_multi_session"] = len(shown) >= 2  # 2+ sessions = crash group
+        kept.append(g)
+    groups = kept
     # Sort: same-boot stale groups first, then same-boot other, then old-boot crashed
     def group_priority(g):
         status = g.get("status", "")
@@ -959,14 +1083,23 @@ def arrow_select(options, title, default=0):
         return default if raw == "" else max(0, min(len(options) - 1, int(raw) - 1))
 
     idx = default
+    # Truncate every line to the terminal width so each option occupies
+    # EXACTLY one row. Otherwise long lines (full paths) soft-wrap, the
+    # cursor-up count below under-counts, and the redraw smears/duplicates.
+    cols = shutil.get_terminal_size((80, 24)).columns
+    def _fit(s, budget):
+        s = s.replace("\n", " ").replace("\r", "")
+        return s if len(s) <= budget else s[:max(1, budget - 1)] + "…"
+    t_line = _fit(title, cols - 1)
     old = termios.tcgetattr(sys.stdin)
     try:
         tty.setraw(sys.stdin.fileno())
         while True:
-            sys.stdout.write("\033[?25l\033[2K\r%s\n" % title)
+            sys.stdout.write("\033[?25l\033[2K\r%s\n" % t_line)
             for i, opt in enumerate(options):
                 marker = ">" if i == idx else " "
-                sys.stdout.write("\033[2K\r %s %2d. %s\n" % (marker, i + 1, opt))
+                row = " %s %2d. %s" % (marker, i + 1, opt)
+                sys.stdout.write("\033[2K\r%s\n" % _fit(row, cols - 1))
             sys.stdout.write("\033[%dA" % (len(options) + 1))
             sys.stdout.flush()
             ch = sys.stdin.read(1)
@@ -985,15 +1118,24 @@ def arrow_select(options, title, default=0):
                     continue
             if ch == "\x1b":
                 seq = sys.stdin.read(2)
-                if seq == "[A":
+                # Handle BOTH normal (ESC [ A/B) and application-cursor-keys
+                # mode (ESC O A/B). WezTerm and others send the latter, which
+                # the old code dropped — making arrows do nothing or corrupt.
+                if seq in ("[A", "OA"):
                     idx = (idx - 1) % len(options)
-                elif seq == "[B":
+                elif seq in ("[B", "OB"):
                     idx = (idx + 1) % len(options)
-            sys.stdout.write("\033[%dA" % 0)
+            # (no cursor move here: the move-up above already parked the
+            #  cursor at the title line, so the next loop redraws in place)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
+
+
+# Intermediary launchers that wrap the real agent. They are shown as
+# bracketed flags ([rtk]) but never as the primary tool nor as a resume arg.
+_KNOWN_WRAPPERS = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
 
 
 def _resolve_display_key(r, cfg):
@@ -1011,8 +1153,8 @@ def _resolve_display_key(r, cfg):
     key, note = resolve_record_program(r, cfg)
     raw_key = r.get("key", "?")
     argv = r.get("argv") or []
-    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
-    
+    known_wrappers = _KNOWN_WRAPPERS
+
     # Collect wrapper names from argv and find the actual tool
     wrappers = []
     tool_from_argv = None
@@ -1058,18 +1200,29 @@ def print_restore_groups(groups):
         display_status = status_labels.get(status, status)
         status_colors = {"stale": "warn", "disconnected": "warn", "crashed": "fail", "archived": "highlight", "closed": "muted"}
         sc = status_colors.get(display_status, "info")
-        print("  %s %s %s  (%d session(s)%s)" % (
+        hidden = g.get("_abandoned_hidden") or 0
+        hidden_note = colorize("muted", "  +%d idle hidden" % hidden) if hidden else ""
+        print("  %s %s %s  (%d session(s)%s)%s" % (
             colorize("ok", "%2d." % i),
             colorize(sc, "%-12s" % display_status),
             colorize("info", when),
             len(g["records"]),
-            colorize("muted", ", single") if not g.get("_multi_session") else ""))
+            colorize("muted", ", single") if not g.get("_multi_session") else "",
+            hidden_note))
         for j, r in enumerate(g["records"], 1):
             display = _resolve_display_key(r, cfg)
+            # Arrow suffix = the resume-relevant args, never the wrapper/tool.
+            # (rtk/rtx/xx/etc. are intermediaries and must never appear here.)
             wrap = ""
-            argv = r.get("argv") or []
-            if argv:
-                wrap = "→ " + next((Path(a).name for a in argv if Path(a).name != display.split(" → ")[0] and Path(a).name != display.split(" → ")[-1]), "")
+            tool_key, _wn = resolve_record_program(r, cfg)
+            names = [Path(a).name for a in (r.get("argv") or [])]
+            meaningful = [n for n in names
+                          if n not in _KNOWN_WRAPPERS and n != tool_key and n != "--"]
+            if meaningful:
+                joined = " ".join(meaningful)
+                if len(joined) > 40:
+                    joined = joined[:37] + "..."
+                wrap = "→ " + joined
             # Duration label
             dur_label = ""
             dur = r.get("_duration_secs")
@@ -1100,7 +1253,7 @@ def print_restore_groups(groups):
             print("      %s  %-15s %s%s%s%s%s" % (
                 colorize("muted", "%d.%d" % (i, j)),
                 colorize("bold", display),
-                cwd,
+                _folder_color(cwd, cwd),
                 colorize("muted", "  " + wrap) if wrap else "",
                 colorize("muted", dur_label) if dur_label else "",
                 name_label if name_label else "",
@@ -2464,8 +2617,9 @@ def select_group_records(groups, args):
         if gi is None:
             return []
         group_records = groups[gi]["records"]
+        _cfg = load_config()
         item_opts = ["all sessions in group %d" % (gi + 1)] + [
-            "%s  %s" % (r.get("key", "?"), r.get("cwd", "?")) for r in group_records
+            "%s  %s" % (_resolve_display_key(r, _cfg), r.get("cwd", "?")) for r in group_records
         ]
         try:
             ii = arrow_select(item_opts, "Select session (Enter = all):")
@@ -2518,7 +2672,7 @@ def select_group_records(groups, args):
 # multi_select function — inject into crash-guard via replace
 
 def multi_select(items, title, cfg=None):
-    import signal as _signal
+    import signal
     """Interactive multi-select with arrow keys, space toggle, numbers, archive toggle, filter."""
     if not items:
         return []
@@ -2592,11 +2746,13 @@ def multi_select(items, title, cfg=None):
                    or f in (it.get("cwd") or "").lower()]
         return out
 
+    cfg = cfg or load_config()
     try:
         tty.setraw(sys.stdin.fileno())
         while True:
             display = _filtered()
             n = max(len(display), 1)
+            cols = shutil.get_terminal_size((80, 24)).columns
 
             # Mode bar
             parts = ["MODE: restore"]
@@ -2610,29 +2766,32 @@ def multi_select(items, title, cfg=None):
             if filter_text:
                 parts.append("filter: %s" % filter_text)
             parts.append("%d/%d shown" % (len(display), len(orig_items)))
-            bar = " | ".join(parts) + "\n"
+            bar = _fit_ansi(" | ".join(parts), cols - 1) + "\n"
             sys.stdout.write("\033[?25l\033[2K\r" + bar)
 
-            # Items
+            # Items — resolved tool label (never the raw 'rtk' key), folder-
+            # colored project, every row truncated to one terminal line.
             for i, it in enumerate(display):
-                key = it.get("key", "?")
+                label = _resolve_display_key(it, cfg)
                 cwd = it.get("cwd", "") or ""
                 status = it.get("_history_status", "?")
                 sc = {"crashed": "\033[31m", "stale": "\033[33m",
                       "archived": "\033[2m", "closed": "\033[2m",
                       "running": "\033[32m"}.get(status, "\033[0m")
-                # Find actual index
                 actual = orig_items.index(it)
                 cb = "\033[7m[x]\033[0m" if actual in sel else "   "
                 cursor = "\033[7m >\033[0m" if i == idx else "   "
-                line = ("%s %s %2d. \033[1m%s\033[0m %s(%s)\033[0m \033[2m%s\033[0m\n"
-                        % (cursor, cb, i + 1, key, sc, status, cwd))
-                sys.stdout.write("\033[2K\r" + line)
+                line = ("%s %s %2d. \033[1m%s\033[0m %s(%s)\033[0m %s"
+                        % (cursor, cb, i + 1, label, sc, status,
+                           _folder_color(cwd, cwd)))
+                sys.stdout.write("\033[2K\r" + _fit_ansi(line, cols - 1) + "\n")
 
             # Footer
             sel_count = len(sel)
-            footer = ("\033[2mSelected: %d | arrows=move space=toggle enter=restore"
-                      " a=archive o=omitted f=filter ?=help\033[0m\n" % sel_count)
+            footer = _fit_ansi(
+                "\033[2mSelected: %d | arrows=move space=toggle enter=restore"
+                " a=archive o=omitted f=filter ?=help\033[0m" % sel_count,
+                cols - 1) + "\n"
             sys.stdout.write(footer)
             sys.stdout.write("\033[%dA" % (len(display) + 2))
             sys.stdout.flush()
@@ -2663,9 +2822,11 @@ def multi_select(items, title, cfg=None):
 
             if ch == "\x1b":
                 seq = sys.stdin.read(2)
-                if seq == "[A" and display:
+                # Accept normal (ESC [ A/B) and application-cursor (ESC O A/B)
+                # modes — WezTerm sends the latter, which the old code ignored.
+                if seq in ("[A", "OA") and display:
                     idx = (idx - 1) % len(display)
-                elif seq == "[B" and display:
+                elif seq in ("[B", "OB") and display:
                     idx = (idx + 1) % len(display)
                 continue
 
@@ -2820,6 +2981,7 @@ def cmd_restore(args):
             include_closed=args.include_closed,
             boot_filter=effective_boot,
             include_archived=args.from_archive,
+            include_abandoned=args.all,
         )
         if args.list_groups:
             print_restore_groups(groups)
@@ -2901,9 +3063,12 @@ def cmd_restore(args):
             key = item.get("key", "?")
             cwd = rec.get("cwd", "") or ""
             status = rec.get("_history_status", "recoverable")
-            select_items.append({"key": key, "cwd": cwd, "_history_status": status})
+            # Carry argv so the picker can resolve the real tool label
+            # (claude/pi/...) and bracket wrappers instead of showing 'rtk'.
+            select_items.append({"key": key, "argv": rec.get("argv"),
+                                 "cwd": cwd, "_history_status": status})
         try:
-            sel_idx = multi_select(select_items, "Select sessions to restore")
+            sel_idx = multi_select(select_items, "Select sessions to restore", cfg=cfg)
         except (KeyboardInterrupt, EOFError):
             print("\naborted.")
             return 0
@@ -3351,7 +3516,7 @@ def cmd_metrics(args):
         # ---- build info ----
         lines.append("# HELP crash_guard_build_info Build metadata for crash-guard")
         lines.append("# TYPE crash_guard_build_info gauge")
-        lines.append('crash_guard_build_info{version="2.1.0",python="%s"} 1 %d' % (
+        lines.append('crash_guard_build_info{version="2.2.0",python="%s"} 1 %d' % (
             _prom_esc(sys.version.split()[0]), ts))
 
         # ---- live sentinel gauges ----
@@ -3671,7 +3836,7 @@ def cmd_analytics(args):
 def main():
     # Handle --version at the top level before argparse touches subparsers
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
-        print("crash-guard version 2.1.0")
+        print("crash-guard version 2.2.0")
         print("Python %s" % sys.version.split()[0])
         sys.exit(0)
 
@@ -3692,6 +3857,9 @@ def main():
 
     s = sub.add_parser("stop")
     s.add_argument("--inv-id", required=True)
+    s.add_argument("--reason", default="closed",
+                   help="why the session ended (closed, signal-hup, signal-term, ...). "
+                        "Any reason other than a crash counts as a clean closure.")
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser("status")

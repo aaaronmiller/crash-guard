@@ -1,6 +1,6 @@
 # ---
 # date: 2026-06-13 00:00:00 PT
-# ver: 2.1.0
+# ver: 2.2.0
 # author: Ice-ninja
 # model: Claude Opus 4.8
 # tags: [wsl2, shell-integration, zsh, bash, session-recovery, terminal]
@@ -23,6 +23,26 @@
 #   args append to the end of an alias expansion, a bare alias works:
 #       alias cc='... cg_run claude -- rtk claude --flags'
 #       cc foo  ->  ... cg_run claude -- rtk claude --flags foo
+#
+#   Closure is recorded both on a clean return AND on a terminating signal
+#   (SIGHUP from closing the tab/window, SIGTERM from kill/`wsl --shutdown`).
+#   A genuine WSL2 crash delivers NO signal — the VM just vanishes — so it
+#   leaves no stop event and is the ONLY way a session is flagged "crashed".
+#   This is what makes crash detection reliable instead of conflating every
+#   tab-close with a crash.
+
+# _cg_stop INV REASON  — record a closure exactly once. Uses dynamically
+# scoped locals from the enclosing cg_run frame (_cg_stopped guard).
+_cg_stop() {
+  [ "${_cg_stopped:-0}" = "1" ] && return 0
+  _cg_stopped=1
+  if [ "${CG_QUIET:-0}" = "1" ]; then
+    command crash-guard stop --inv-id "$1" --reason "$2" 2>/dev/null
+  else
+    command crash-guard stop --inv-id "$1" --reason "$2"
+  fi
+}
+
 cg_run() {
   local key="$1"; shift
   local name=""
@@ -55,13 +75,15 @@ cg_run() {
   else
     command crash-guard "${start_args[@]}" -- "$@"
   fi
+  # Guard so the closure is recorded once even if both a signal and the
+  # normal return path fire. Traps reference $inv via dynamic scope.
+  local _cg_stopped=0
+  trap '_cg_stop "$inv" signal-hup;  trap - HUP TERM; return 129' HUP
+  trap '_cg_stop "$inv" signal-term; trap - HUP TERM; return 143' TERM
   "$@"
   local rc=$?
-  if [ "${CG_QUIET:-0}" = "1" ]; then
-    command crash-guard stop --inv-id "$inv" 2>/dev/null
-  else
-    command crash-guard stop --inv-id "$inv"
-  fi
+  trap - HUP TERM
+  _cg_stop "$inv" closed
   if [ "$rc" -ne 0 ] && [ "${CG_QUIET:-0}" != "1" ]; then
     echo "[cg_run] sentinel removed (exit code $rc)" >&2
   fi
