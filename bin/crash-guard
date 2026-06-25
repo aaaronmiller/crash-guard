@@ -2790,7 +2790,7 @@ def multi_select(items, title, cfg=None):
             sel_count = len(sel)
             footer = _fit_ansi(
                 "\033[2mSelected: %d | arrows=move space=toggle enter=restore"
-                " a=archive o=omitted f=filter ?=help\033[0m" % sel_count,
+                " n=abort a=archive o=omitted f=filter ?=help\033[0m" % sel_count,
                 cols - 1) + "\n"
             sys.stdout.write(footer)
             sys.stdout.write("\033[%dA" % (len(display) + 2))
@@ -2871,6 +2871,7 @@ def multi_select(items, title, cfg=None):
                 sys.stdout.write("    space   \u2014 toggle selection\n")
                 sys.stdout.write("    #       \u2014 jump to item N\n")
                 sys.stdout.write("    enter   \u2014 restore selected (or all)\n")
+                sys.stdout.write("    n       \u2014 abort (select nothing)\n")
                 sys.stdout.write("    a       \u2014 toggle archive mode\n")
                 sys.stdout.write("    f       \u2014 filter\n")
                 sys.stdout.write("    o       \u2014 toggle omitted/ephemeral sessions\n")
@@ -2883,7 +2884,10 @@ def multi_select(items, title, cfg=None):
                 continue
 
             if ch.lower() == "n":
-                pass
+                # Abort: select nothing and leave the picker cleanly.
+                sys.stdout.write("\033[%dB\033[?25h" % (len(display) + 2))
+                sys.stdout.flush()
+                return []
     except (KeyboardInterrupt, EOFError):
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
