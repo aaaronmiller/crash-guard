@@ -433,6 +433,50 @@ def append_history(event, rec=None, flush=False, **extra):
         sys.stderr.write("crash-guard history: %s\n" % e)
 
 
+def append_history_payload(payload, flush=False):
+    """Append a pre-built history payload."""
+    try:
+        ensure_dirs()
+        with HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            if flush:
+                _history_flush(f)
+    except Exception as e:
+        sys.stderr.write("crash-guard history: %s\n" % e)
+
+
+def _clean_history_record(rec):
+    return {k: v for k, v in (rec or {}).items() if not k.startswith("_")}
+
+
+def restore_group_payload(restore_id, selected, source):
+    """Build a durable snapshot of the selected restore group.
+
+    Saved groups preserve the human-visible grouping before live sentinels are
+    archived, so the same set can be found and retried later from archives.
+    """
+    records = []
+    for item in selected:
+        rec = item.get("rec") if isinstance(item, dict) else None
+        if rec is None:
+            rec = item if isinstance(item, dict) else {}
+        clean = _clean_history_record(rec)
+        if clean.get("inv_id"):
+            records.append(clean)
+    return {
+        "event": "restore_group",
+        "at": now_iso(),
+        "restore_id": restore_id,
+        "source": source,
+        "record_count": len(records),
+        "records": records,
+    }
+
+
+def append_restore_group(restore_id, selected, source):
+    append_history_payload(restore_group_payload(restore_id, selected, source), flush=True)
+
+
 def parse_time(value):
     if not value:
         return None
@@ -590,6 +634,84 @@ def read_history_events():
             except Exception:
                 sys.stderr.write("crash-guard: skipping bad history line %d\n" % lineno)
     return out
+
+
+def archive_restore_groups():
+    """Return archive restore groups, preferring saved human-visible groups."""
+    EPOCH = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+    archived = [r for r in read_archived_sentinels() if not r.get("_ephemeral")]
+    by_inv = {}
+    for rec in archived:
+        inv_id = rec.get("inv_id")
+        if inv_id and inv_id not in by_inv:
+            by_inv[inv_id] = rec
+
+    groups = []
+    used = set()
+    seen_restore_ids = set()
+    for ev in read_history_events():
+        event = ev.get("event")
+        if event not in ("restore_group", "restore_start"):
+            continue
+        restore_id = ev.get("restore_id") or ""
+        if restore_id and restore_id in seen_restore_ids:
+            continue
+        saved_records = ev.get("records") if event == "restore_group" else ev.get("plan")
+        if not saved_records:
+            continue
+        records = []
+        for saved in saved_records or []:
+            inv_id = saved.get("inv_id")
+            if not inv_id:
+                continue
+            archived_rec = by_inv.get(inv_id)
+            if not archived_rec:
+                continue
+            merged = dict(saved)
+            merged.update(archived_rec)
+            merged["_history_status"] = "archived"
+            merged["_history_reason"] = "saved restore group"
+            records.append(merged)
+            used.add(inv_id)
+        if not records:
+            continue
+        if restore_id:
+            seen_restore_ids.add(restore_id)
+        when = parse_time(ev.get("at")) or max(
+            (parse_time(r.get("_archive_at")) or EPOCH for r in records),
+            default=EPOCH,
+        )
+        reason = "saved restore group" if event == "restore_group" else "historical restore group"
+        groups.append({
+            "key": ("archive", restore_id),
+            "time": when,
+            "status": "archived",
+            "reason": reason,
+            "records": records,
+            "_saved_group_id": restore_id,
+            "_session_count": len(records),
+            "_multi_session": len(records) >= 2,
+        })
+
+    legacy = [r for r in archived if r.get("inv_id") not in used]
+    if legacy:
+        for r in legacy:
+            r["_history_status"] = "archived"
+            r["_history_reason"] = "legacy archive"
+        when = max((parse_time(r.get("_archive_at")) or EPOCH for r in legacy), default=EPOCH)
+        groups.append({
+            "key": ("archive", "legacy"),
+            "time": when,
+            "status": "archived",
+            "reason": "legacy archive",
+            "records": legacy,
+            "_saved_group_id": "legacy",
+            "_session_count": len(legacy),
+            "_multi_session": len(legacy) >= 2,
+        })
+
+    groups.sort(key=lambda g: g.get("time") or EPOCH, reverse=True)
+    return groups
 
 
 def classify(records, cur_boot):
@@ -1135,7 +1257,8 @@ def arrow_select(options, title, default=0):
 
 # Intermediary launchers that wrap the real agent. They are shown as
 # bracketed flags ([rtk]) but never as the primary tool nor as a resume arg.
-_KNOWN_WRAPPERS = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
+# `hermes` is a real restorable tool, not just a wrapper.
+_KNOWN_WRAPPERS = {"rtk", "rtx", "xx", "headroom", "proxy", "ccproxy", "gateway"}
 
 
 def _resolve_display_key(r, cfg):
@@ -1171,6 +1294,8 @@ def _resolve_display_key(r, cfg):
     
     # Build display: tool-name [wrapper-flags]
     display = tool_from_argv or (key if key not in known_wrappers else None) or raw_key
+    if display == "hermes":
+        wrappers = []
     if wrappers:
         display += " [%s]" % " ".join(wrappers)
     return display
@@ -1377,9 +1502,8 @@ def argv_program_key(argv, programs):
     find the actual tool (claude, pi, kilo, etc.).
     """
     names = [Path(a).name for a in (argv or []) if a]
-    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
     for name in names[:5]:  # Check up to 5 positions to skip wrappers
-        if name in known_wrappers:
+        if name in _KNOWN_WRAPPERS:
             continue
         prog = programs.get(name)
         if prog and not prog.get("use_sentinel_argv"):
@@ -1431,14 +1555,31 @@ def argv_extra_args(recorded_argv, program_argv, tool_name):
 
     prog_tail = program_argv[prog_idx + 1:]
 
-    # Remove each default arg from the recorded tail (first occurrence only).
-    # What remains are the truly extra flags the user added at launch.
+    def _arg_equivalent(left, right):
+        """Treat accidental single-dash long flags as their canonical long flag.
+
+        A prior sentinel may contain ``-dangerously-skip-permissions`` while the
+        configured restore command contains ``--dangerously-skip-permissions``.
+        They represent the same flag for de-duping, but short flags like ``-c``
+        must stay distinct.
+        """
+        def norm(arg):
+            if arg.startswith("--"):
+                return arg
+            if arg.startswith("-") and len(arg) > 2:
+                return "-" + arg
+            return arg
+        return norm(left) == norm(right)
+
+    # Remove each default arg from the recorded tail (first equivalent
+    # occurrence only). What remains are the truly extra flags the user added
+    # at launch.
     extra = list(rec_tail)
     for a in prog_tail:
-        try:
-            extra.remove(a)
-        except ValueError:
-            pass
+        for i, candidate in enumerate(extra):
+            if _arg_equivalent(candidate, a):
+                del extra[i]
+                break
     return extra
 
 
@@ -1453,8 +1594,6 @@ def resolve_record_program(r, cfg):
     key = r.get("key")
     prog = programs.get(key)
     raw_argv = r.get("argv") or []
-    known_wrappers = {"rtk", "rtx", "xx", "hermes", "headroom", "proxy", "ccproxy", "gateway"}
-
     # If the original key has use_sentinel_argv, prefer the recorded argv
     if prog and prog.get("use_sentinel_argv"):
         return key, "using recorded argv (use_sentinel_argv)"
@@ -1465,17 +1604,17 @@ def resolve_record_program(r, cfg):
     # when the original key is a known wrapper (rtk, etc.)
     if inferred:
         if key != inferred:
-            if key in known_wrappers or not prog or prog.get("use_sentinel_argv"):
+            if key in _KNOWN_WRAPPERS or not prog or prog.get("use_sentinel_argv"):
                 return inferred, "recorded as '%s'; inferred from argv" % key
         else:
             return inferred, ""
     
     # If key itself is a wrapper with an empty command, try to find
     # something useful in argv anyway
-    if key in known_wrappers and not (prog and (prog.get("command") or prog.get("continue"))):
+    if key in _KNOWN_WRAPPERS and not (prog and (prog.get("command") or prog.get("continue"))):
         for a in raw_argv:
             alt = Path(a).name
-            if alt not in known_wrappers and programs.get(alt):
+            if alt not in _KNOWN_WRAPPERS and programs.get(alt):
                 return alt, "recorded as '%s'; inferred tool '%s' from argv" % (key, alt)
     
     return key, ""
@@ -2558,7 +2697,7 @@ def cmd_excise(args):
     return 0
 
 
-def archive_sentinel(r):
+def archive_sentinel(r, restore_id=None):
     try:
         src = Path(r["_path"])
         if src.exists():
@@ -2572,6 +2711,8 @@ def archive_sentinel(r):
                 if lt:
                     dur = max(0, (dt.datetime.now(lt.tzinfo) - lt).total_seconds())
             extra = {"reason": r.get("_history_reason") or "restored", "archive_path": str(dst)}
+            if restore_id:
+                extra["restore_id"] = restore_id
             if dur is not None:
                 extra["duration_secs"] = round(dur, 1)
             shutil.move(str(src), str(dst))
@@ -2580,28 +2721,28 @@ def archive_sentinel(r):
         sys.stderr.write("archive: %s\n" % e)
 
 
-def select_group_records(groups, args):
-    if args.from_archive:
-        targets = read_archived_sentinels()
-        # Skip ephemeral archive sessions (< 5s — test launches, missing commands)
-        filtered = [r for r in targets if not r.get("_ephemeral")]
-        skipped = len(targets) - len(filtered)
-        if skipped:
-            print("  (%d ephemeral archive session(s) filtered out)\n" % skipped)
-        return filtered
+def select_group_records(groups, args, default_all=True, include_all_option=True):
     if not groups:
         return []
+    def _all_visible_records():
+        return [r for g in groups for r in g["records"]]
+    def _default_records():
+        return _all_visible_records() if default_all else groups[0]["records"]
+
     if args.group:
         if not (1 <= args.group <= len(groups)):
             raise ValueError("group %d out of range" % args.group)
         records = groups[args.group - 1]["records"]
     elif args.yes or args.dry_run:
-        records = groups[0]["records"]
+        records = _default_records()
     elif sys.stdin.isatty() and sys.stdout.isatty():
         args._history_prompted = True
         # Show all groups — no more hidden single-session groups
         status_display = {"stale": "disconnected"}
-        group_opts = [
+        group_opts = []
+        if include_all_option:
+            group_opts.append("all visible sessions  %d session(s)" % len(_all_visible_records()))
+        group_opts += [
             "%s  %d session(s)  %s" % (
                 status_display.get(g.get("status") or "unknown", g.get("status") or "unknown"),
                 len(g["records"]),
@@ -2610,15 +2751,20 @@ def select_group_records(groups, args):
             for g in groups
         ]
         try:
-            gi = arrow_select(group_opts, "Select recovery group (Enter = newest):")
+            prompt = "Select recovery group (Enter = all):" if include_all_option else "Select recovery group (Enter = newest):"
+            gi = arrow_select(group_opts, prompt)
         except (KeyboardInterrupt, EOFError):
             print("\naborted.")
             return []
         if gi is None:
             return []
-        group_records = groups[gi]["records"]
+        if include_all_option and gi == 0:
+            records = _all_visible_records()
+            return records
+        group_idx = gi - 1 if include_all_option else gi
+        group_records = groups[group_idx]["records"]
         _cfg = load_config()
-        item_opts = ["all sessions in group %d" % (gi + 1)] + [
+        item_opts = ["all sessions in group %d" % (group_idx + 1)] + [
             "%s  %s" % (_resolve_display_key(r, _cfg), r.get("cwd", "?")) for r in group_records
         ]
         try:
@@ -2632,16 +2778,16 @@ def select_group_records(groups, args):
     else:
         args._history_prompted = True
         try:
-            raw = input("Restore group/item [1]? (1, 2.1, 2.1,3.2, all, none): ").strip().lower()
+            raw = input("Restore group/item [all]? (all, 1, 2.1, 2.1,3.2, none): ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             print("\naborted.")
             return []
-        if raw in ("", "1"):
-            records = groups[0]["records"]
+        if raw == "":
+            records = _default_records()
+        elif raw in ("all", "a"):
+            records = _all_visible_records()
         elif raw in ("none", "n", "no"):
             return []
-        elif raw in ("all", "a"):
-            records = [r for g in groups for r in g["records"]]
         else:
             picked = []
             for part in raw.replace(" ", "").split(","):
@@ -2968,13 +3114,18 @@ def cmd_restore(args):
         except Exception:
             restore_id = "fallback-%.0f-%d" % (time.time(), os.getpid())
     if args.from_archive:
-        targets = read_archived_sentinels()
-        # Skip ephemeral archive sessions (< 5s)
-        filtered = [r for r in targets if not r.get("_ephemeral")]
-        skipped = len(targets) - len(filtered)
-        if skipped:
-            print("  (%d ephemeral archive session(s) filtered out)\n" % skipped)
-        targets = filtered
+        groups = archive_restore_groups()
+        if args.list_groups:
+            print_restore_groups(groups)
+            return 0
+        print_restore_groups(groups)
+        try:
+            targets = select_group_records(
+                groups, args, default_all=False, include_all_option=False
+            )
+        except ValueError as e:
+            sys.stderr.write("crash-guard: %s\n" % e)
+            return 2
     else:
         # Default to ALL boots with recoverable sessions (no boot filter).
         # Crashed sessions are from PREVIOUS boots (before WSL restart).
@@ -3155,6 +3306,11 @@ def cmd_restore(args):
 
     # Log restore_start with system snapshot and plan details before spawning
     # — if the system crashes mid-restore we need evidence of what was attempted.
+    append_restore_group(
+        restore_id,
+        selected,
+        "archive" if args.from_archive else "restore",
+    )
     plan_summary = []
     for s in selected:
         rec = s.get("rec") or {}
@@ -3225,7 +3381,7 @@ def cmd_restore(args):
         print("  ok   %s @ %s  (%s)" % (item["key"], item["cwd"], spawned))
         append_history("restore_ok", item["rec"], backend=backend, restore_id=restore_id, flush=True)
         if item["rec"].get("_path") and "/live/" in item["rec"].get("_path"):
-            archive_sentinel(item["rec"])
+            archive_sentinel(item["rec"], restore_id=restore_id)
         ok += 1
         ok_list.append("%s @ %s" % (item["key"], item["cwd"]))
         if i < len(selected) - 1 and spawn_delay > 0:

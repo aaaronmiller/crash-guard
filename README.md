@@ -154,7 +154,7 @@ Future updates: `crash-guard self-update`.
 Common commands:
 
 ```bash
-crash-guard       # restore picker; Enter restores newest group
+crash-guard       # restore picker; Enter restores all visible sessions
 cgr               # same as crash-guard restore
 cgs               # current live/stale/crashed sentinel status
 cgh               # OS boot-period history browser
@@ -162,9 +162,10 @@ cgr-archive       # retry records already moved to archive
 ```
 
 The restore picker shows recovery groups, then lets you use arrow keys or
-numbers to select a group. It then lets you select all sessions in that group or
-one individual session. Pressing Enter on the defaults restores the newest
-recoverable group.
+numbers to restore all visible sessions, select a group, or select one
+individual session inside a group. Pressing Enter on the default restores all
+visible recoverable sessions. Use `--group N` when you intentionally want only
+one group.
 
 Restore groups show:
 - **Session duration** (e.g. `(8h35m)`, `(51s)`) — sessions that ran < 5 seconds
@@ -179,9 +180,13 @@ Useful non-interactive forms:
 
 ```bash
 crash-guard --dry-run
+crash-guard restore --yes
 crash-guard restore --group 2
 crash-guard restore --group 2 --item 3
 crash-guard restore --boot <boot-id> --group 1
+crash-guard restore --from-archive --list-groups
+crash-guard restore --from-archive --group 1
+crash-guard restore --from-archive --group 1 --item 2
 crash-guard restore --from-archive --terminal ghostty
 crash-guard restore --no-spawn
 crash-guard restore --include-closed   # also show cleanly closed sessions
@@ -198,7 +203,10 @@ Crash-guard keeps append-only history at:
 ```
 
 It also folds in live sentinels and archived sentinels, so a failed restore does
-not erase the only recovery record.
+not erase the only recovery record. When you restore a visible group,
+crash-guard saves that group membership before archiving old sentinels; later,
+`crash-guard restore --from-archive` lets you select the saved group again or
+choose individual sessions inside it.
 
 `crash-guard history` first lists OS boot periods with record counts. In an
 interactive terminal, choose a period with arrow keys or a number; crash-guard
@@ -321,6 +329,7 @@ Key config options:
 The append-only `history.jsonl` now records detailed restore lifecycle:
 ```
 restore_start: plan summary, backend, system memory/process snapshot
+restore_group: saved selected group membership for archive retry
 restore_attempt: per-item, logged BEFORE spawn (survives OOM kill)
 restore_ok / restore_fail: per-item result
 restore_done: final counts, system snapshot (compare before/after)
