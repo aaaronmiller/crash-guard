@@ -18,3 +18,5 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+.ralph-runner/
+maximum-iterations-*/

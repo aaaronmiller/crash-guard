@@ -167,7 +167,7 @@ ROUTING_ENV_PATTERNS = [
 # Auth-named patterns: captured ONLY when the value is a non-secret placeholder
 # (the dummy `pass`/`dummy`/short token your proxy aliases set inline).
 # HEADROOM_* was moved here because HEADROOM_API_KEY could contain real keys.
-AUTH_ENV_PATTERNS = ["*_API_KEY", "*_AUTH_TOKEN", "*_TOKEN", "*_KEY", "HEADROOM_*"]
+AUTH_ENV_PATTERNS = ["*_API_KEY", "*_AUTH_TOKEN", "*_TOKEN", "*_KEY", "*_PASSWORD", "*_SECRET", "*_CREDENTIAL", "*_AUTH", "HEADROOM_*"]
 NONSECRET_VALUES = {"", "pass", "dummy", "none", "no", "x", "test", "local", "0", "1"}
 # Back-compat alias; load_config still reads "env_patterns" if a user set one.
 DEFAULT_ENV_PATTERNS = ROUTING_ENV_PATTERNS
@@ -315,7 +315,7 @@ def _value_is_nonsecret(v):
     if v.startswith(("http://", "https://")):
         return True
     # Anything longer than a short placeholder is treated as a secret.
-    return len(v) <= 8
+    return len(v) <= 12
 
 
 def _system_snapshot():
@@ -392,9 +392,10 @@ def env_snapshot(patterns):
     return out
 
 
-def atomic_write(path, text):
+def atomic_write(path, text, mode=0o600):
     tmp = path.with_suffix(path.suffix + ".tmp-%d" % os.getpid())
     tmp.write_text(text)
+    os.chmod(str(tmp), mode)
     os.replace(str(tmp), str(path))
 
 
@@ -1500,7 +1501,9 @@ def verify_artifact(path, repair=False):
         ts = time.strftime("%Y%m%d-%H%M%S")
         backup = ARCH_DIR / ("%s.%s.bak" % (p.name, ts))
         try:
-            backup.write_bytes(p.read_bytes())
+            data = p.read_bytes()
+            backup.write_bytes(data)
+            os.chmod(str(backup), p.stat().st_mode & 0o777)
             p.write_bytes(b"\n".join(lines) + b"\n")
             return "repaired"
         except Exception as e:
@@ -2712,6 +2715,7 @@ def cmd_excise(args):
     with tmp.open("w", encoding="utf-8") as f:
         for line in keep_lines:
             f.write(line + "\n")
+    os.chmod(str(tmp), 0o600)
     os.replace(str(tmp), str(HISTORY_FILE))
     for p in archive_drop:
         try:
@@ -2759,7 +2763,9 @@ def select_group_records(groups, args, default_all=True, include_all_option=True
             raise ValueError("group %d out of range" % args.group)
         records = groups[args.group - 1]["records"]
     elif args.yes or args.dry_run:
-        records = _default_records()
+        # --yes or --dry-run should default to the most recent group only,
+        # not all visible records across groups.
+        records = groups[0]["records"]
     elif sys.stdin.isatty() and sys.stdout.isatty():
         args._history_prompted = True
         # Show all groups — no more hidden single-session groups
@@ -3156,7 +3162,17 @@ def cmd_restore(args):
         # Crashed sessions are from PREVIOUS boots (before WSL restart).
         # The ephemeral filtering + grouping will organize them.
         # If --boot is specified, filter to that boot only.
+        # Support short prefix matching (first 8 hex chars shown in --list).
         effective_boot = args.boot if args.boot else None
+        if effective_boot and len(effective_boot) < 36:
+            periods = boot_periods()
+            matches = [p["boot_id"] for p in periods if p["boot_id"].startswith(effective_boot)]
+            if len(matches) == 1:
+                effective_boot = matches[0]
+            elif len(matches) > 1:
+                sys.stderr.write("crash-guard: boot prefix '%s' matches multiple periods: %s\n" %
+                                 (effective_boot, ", ".join(short(b, 8) for b in matches)))
+                return 2
         groups = restore_groups(
             include_closed=args.include_closed,
             boot_filter=effective_boot,
