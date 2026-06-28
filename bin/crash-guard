@@ -193,7 +193,7 @@ DEFAULT_CONFIG = {
     "tmux": {"cli": ""},
     "windows_terminal": {"cli": "", "wsl": ""},
     "env_patterns": DEFAULT_ENV_PATTERNS,
-    "restore": {"pre": DEFAULT_RESTORE_PRE, "spawn_delay": 2.0},
+    "restore": {"pre": DEFAULT_RESTORE_PRE, "spawn_delay": 2.0, "stale_after_secs": 86400},
     "programs": {
         "claude": {
             "continue": ["rtk", "claude", "--continue", "--dangerously-skip-permissions"],
@@ -999,9 +999,18 @@ def session_sort_time(sess):
 
 
 def restore_groups(include_closed=True, boot_filter=None, include_archived=False,
-                   include_abandoned=False):
+                   include_abandoned=False, include_expired=False):
     cfg = load_config()
     EPOCH = dt.datetime.fromtimestamp(0, dt.timezone.utc)
+    # Prior-boot crash groups older than this are auto-expired (a boot_id change
+    # on native Linux is usually a normal reboot, not a crash — without this we
+    # resurrect week-old ghosts). Same-boot groups are never expired. 0 disables.
+    try:
+        stale_after = float((cfg.get("restore") or {}).get("stale_after_secs", 86400))
+    except (TypeError, ValueError):
+        stale_after = 86400.0
+    cur_boot = boot_id()
+    now_dt = dt.datetime.now(dt.timezone.utc)
     # How long a session's project may be quiet before the crash and still
     # count as "live at crash". Sessions idle longer were effectively finished
     # (the user just never closed the tab) — hidden unless include_abandoned.
@@ -1093,6 +1102,17 @@ def restore_groups(include_closed=True, boot_filter=None, include_archived=False
     kept = []
     for g in groups:
         ct = g.get("_crash_time")
+        # Age-gate prior-boot crash groups: a different boot_id that's also old
+        # is almost always a normal reboot, not a crash we should restore from.
+        gk = g.get("key")
+        gboot = gk[0] if isinstance(gk, tuple) and gk else g.get("key")
+        if stale_after > 0 and gboot and gboot != cur_boot:
+            gt = g.get("time") or ct
+            if gt and (now_dt - gt).total_seconds() > stale_after:
+                g["_expired"] = True
+                g["_expired_age_secs"] = (now_dt - gt).total_seconds()
+                if not include_expired:
+                    continue
         # Mark sessions whose project went quiet well before the crash.
         for r in g["records"]:
             la = r.get("_last_activity_dt")
@@ -2199,17 +2219,19 @@ def kitty_spawn(cli, cwd, title, inner):
 
 
 def ghostty_preflight(cli):
-    """Verify ghostty can spawn a new window without crashing."""
+    """Verify the ghostty binary responds before we try to spawn windows.
+
+    This is a liveness check on the binary, not a window-spawn test: there is
+    no headless Ghostty CLI action that opens-and-closes a window, so we cannot
+    truly rehearse a spawn without flashing a real window on screen. `--version`
+    is the honest, side-effect-free check. (The old code probed the nonexistent
+    `+list-windows` action and silently fell back to this anyway.)
+    """
     try:
-        # Quick check: ghostty +list-windows returns quickly without UI
-        r = subprocess.run([cli, "+list-windows"], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return True, None
-        # Try version check as alternative
         r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
             return True, None
-        return False, "ghostty not responding"
+        return False, "ghostty not responding (--version exited %s)" % r.returncode
     except FileNotFoundError:
         return False, "ghostty binary not found"
     except subprocess.TimeoutExpired:
@@ -2219,33 +2241,36 @@ def ghostty_preflight(cli):
 
 
 def ghostty_spawn(cli, cwd, title, inner):
-    # Use Popen (non-blocking) for both +new-window and the plain fallback.
-    # subprocess.run would block the spawn loop until the inner command exits,
-    # which could be hours for an AI agent session.
+    # Plain `ghostty -e` is the only portable way to open a window. It works in
+    # BOTH of Ghostty's Linux modes:
+    #   * single-instance (a daemon is running): the daemon adopts a new window
+    #     and this CLI process exits 0 immediately.
+    #   * standalone (no daemon — common right after a crash/reboot, which is
+    #     exactly when restore runs): this process *becomes* the window and
+    #     stays alive for the life of the session.
+    # We deliberately do NOT use `ghostty +new-window`: it is not a CLI action
+    # in current Ghostty builds (only +version/+help/+list-* exist), and where
+    # it is handled it requires a single-instance daemon to already be running.
+    # Popen (non-blocking) so the spawn loop isn't held for the life of the
+    # session — an AI agent window can stay open for hours.
     argv = [
-        cli, "+new-window",
-        "--working-directory=%s" % cwd,
-        "--title=%s" % title,
-        "-e",
-    ] + inner
-    try:
-        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return "ghostty pid %s" % proc.pid, None
-    except Exception as e:
-        primary_err = str(e)
-
-    # Older or platform-specific Ghostty builds may not support +new-window.
-    # Plain ghostty -e still creates a surface and returns immediately via Popen.
-    fallback = [
         cli,
         "--working-directory=%s" % cwd,
         "--title=%s" % title,
         "-e",
     ] + inner
     try:
-        proc = subprocess.Popen(fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        return None, "%s; fallback failed: %s" % (primary_err, e)
+        return None, "ghostty spawn failed: %s" % e
+    # Give ghostty a beat to either hand off (single-instance, exits 0) or stay
+    # up (standalone, still running). A *non-zero* early exit means it actually
+    # failed to open a window — the case the old code silently logged as
+    # success. poll()==None (alive) or 0 (clean handoff) are both good.
+    time.sleep(0.4)
+    rc = proc.poll()
+    if rc is not None and rc != 0:
+        return None, "ghostty exited %s before a window opened" % rc
     return "ghostty pid %s" % proc.pid, None
 
 
@@ -2597,7 +2622,7 @@ def cmd_history(args):
         all_cwds = sorted(set(
             r.get("cwd")
             for p in periods
-            for g in restore_groups(include_closed=True, boot_filter=p["boot_id"], include_archived=True)
+            for g in restore_groups(include_closed=True, boot_filter=p["boot_id"], include_archived=True, include_expired=True)
             for r in g["records"] if r.get("cwd")
         ))
         if all_cwds:
@@ -2626,7 +2651,7 @@ def cmd_history(args):
         return 1
     print("")
     period = periods[idx]
-    groups = restore_groups(include_closed=True, boot_filter=period["boot_id"], include_archived=True)
+    groups = restore_groups(include_closed=True, boot_filter=period["boot_id"], include_archived=True, include_expired=True)
     print_restore_groups(groups)
     print("Restore from this period with: crash-guard restore --boot %s --group N" % period["boot_id"])
     return 0
@@ -3137,6 +3162,7 @@ def cmd_restore(args):
             boot_filter=effective_boot,
             include_archived=args.from_archive,
             include_abandoned=args.all,
+            include_expired=args.all,
         )
         if args.list_groups:
             print_restore_groups(groups)
@@ -3152,6 +3178,7 @@ def cmd_restore(args):
         print("crash-guard: %s." % msg)
         if not args.from_archive:
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
+            print("   \033[1m--all\033[0m to also reveal old prior-boot sessions auto-expired as stale,")
             print("   \033[1m--from-archive\033[0m for archived ones, or")
             print("   \033[1mcrash-guard history\033[0m to browse older boot periods)")
         if args.batch:
@@ -3373,6 +3400,20 @@ def cmd_restore(args):
             except KeyboardInterrupt:
                 print("\n  %s interrupted by user" % colorize("warn", "WARN"))
                 break
+        # Fallback: if ghostty fails (now reported correctly, not as a false
+        # success) and tmux is available, drop the session into a detached tmux
+        # so it survives instead of vanishing. This is the rescue path for the
+        # common "ghostty can't open windows right after a crash" case.
+        elif spawned is None and backend == "ghostty" and shutil.which("tmux"):
+            print("  %s ghostty failed, retrying with tmux (detached session)" % colorize("warn", "WARN"))
+            tmux_cli = shutil.which("tmux")
+            tmux_ctx = spawn_terminal_prepare(cfg, "tmux", tmux_cli)
+            if not tmux_ctx.get("error"):
+                try:
+                    spawned, err = spawn_terminal(cfg, "tmux", tmux_cli, tmux_ctx, item, inner)
+                except KeyboardInterrupt:
+                    print("\n  %s interrupted by user" % colorize("warn", "WARN"))
+                    break
         if spawned is None:
             sys.stderr.write("  FAIL %s @ %s: %s\n" % (item["key"], item["cwd"], err))
             append_history("restore_fail", item["rec"], backend=backend, error=err, restore_id=restore_id, flush=True)
@@ -4000,7 +4041,7 @@ def main():
         print("Python %s" % sys.version.split()[0])
         sys.exit(0)
 
-    p = argparse.ArgumentParser(prog="crash-guard", description="WSL2 agentic session recovery")
+    p = argparse.ArgumentParser(prog="crash-guard", description="Agentic session recovery for Linux (native + WSL2)")
     if len(sys.argv) == 1 or (len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help")):
         sys.argv.insert(1, "restore")
     sub = p.add_subparsers(dest="cmd", required=True)

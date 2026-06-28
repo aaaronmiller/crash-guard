@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Fixed
+- **Ghostty spawn no longer reports false success on native Linux.** `ghostty_spawn` used the nonexistent `+new-window` CLI action and returned "ok" the instant `Popen` started, so a window that opened and immediately died was logged as `restore_ok`. Now spawns with plain `ghostty -e` (works in both single-instance and standalone modes) and verifies the child didn't exit non-zero before reporting success.
+- **Ghostty pre-flight was theater.** It probed `ghostty +list-windows` (not a real action), silently fell back to `--version`, and always "passed". Replaced with an honest `--version` liveness check.
+- **Ghostty → tmux rescue fallback.** When a ghostty spawn genuinely fails (now detectable), the session drops into a detached tmux session instead of vanishing — the rescue path for "ghostty can't open windows right after a crash". Mirrors the existing tmux → ghostty fallback.
+- **Stale prior-boot sessions are auto-expired.** On native Linux a `boot_id` change is usually a normal reboot, not a crash, so crash-guard was resurrecting week-old ghosts. Prior-boot crash groups older than `restore.stale_after_secs` (default 24h) are now hidden by default; `--all` reveals them and history browsing is unaffected.
+- Reframed `--help` description and docs as "Linux (native + WSL2)" instead of WSL2-only.
 - Fixed `build_plan` grouping: each session now gets its own plan item instead of collapsing multiple sessions in the same directory into one plan item. This ensures all sessions in a crash group are restored when selecting "all sessions".
 - Added 30-second timeout to `wez_spawn` subprocess call — prevents indefinite hang when WezTerm is overwhelmed by too many simultaneous spawns.
 - Increased default `spawn_delay` from 0.5s to 2.0s, max allowed from 30s to 60s — prevents terminal freeze when restoring many sessions.
