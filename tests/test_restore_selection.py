@@ -1,7 +1,9 @@
 import argparse
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -33,7 +35,7 @@ class RestoreSelectionTests(unittest.TestCase):
         values.update(overrides)
         return argparse.Namespace(**values)
 
-    def test_yes_without_explicit_group_selects_all_visible_groups(self):
+    def test_yes_without_explicit_group_selects_newest_visible_group(self):
         groups = [
             {"records": [{"inv_id": "one"}]},
             {"records": [{"inv_id": "two"}, {"inv_id": "three"}]},
@@ -41,7 +43,7 @@ class RestoreSelectionTests(unittest.TestCase):
 
         records = self.cg.select_group_records(groups, self.args())
 
-        self.assertEqual(["one", "two", "three"], [r["inv_id"] for r in records])
+        self.assertEqual(["one"], [r["inv_id"] for r in records])
 
     def test_explicit_group_keeps_group_scoped_restore(self):
         groups = [
@@ -167,6 +169,36 @@ class RestoreSelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(["new-one", "new-two"], [r["inv_id"] for r in records])
+
+    def test_ledger_reader_accepts_schema_record(self):
+        original = self.cg.WORK_LEDGER_DIR
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                self.cg.WORK_LEDGER_DIR = Path(directory)
+                (Path(directory) / "work.json").write_text(json.dumps({
+                    "schema": "living-documents-work-ledger/v1",
+                    "work_id": "example-work",
+                    "project": "living-documents",
+                    "sessions": ["codex:019fa642-7dda-7d32-8783-32e344bfb5a1"],
+                    "evidence": ["/tmp/evidence"],
+                }))
+                records = self.cg.read_work_ledger()
+                self.assertEqual(["example-work"], [r["work_id"] for r in records])
+                self.assertTrue(records[0]["_ledger_path"].endswith("work.json"))
+        finally:
+            self.cg.WORK_LEDGER_DIR = original
+
+    def test_native_ledger_resume_uses_static_codex_adapter(self):
+        original_which = self.cg.shutil.which
+        try:
+            self.cg.shutil.which = lambda command: "/usr/bin/codex" if command == "codex" else None
+            action = self.cg.native_resume_for_ledger({
+                "sessions": ["codex:019fa642-7dda-7d32-8783-32e344bfb5a1"]
+            })
+            self.assertEqual("native-resume-attempt", action["kind"])
+            self.assertEqual(["codex", "resume", "019fa642-7dda-7d32-8783-32e344bfb5a1"], action["argv"])
+        finally:
+            self.cg.shutil.which = original_which
 
 
 if __name__ == "__main__":

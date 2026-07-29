@@ -53,6 +53,8 @@ DATA_DIR = XDG_DATA / "crash-guard"
 LIVE_DIR = DATA_DIR / "live"
 ARCH_DIR = DATA_DIR / "archive"
 HISTORY_FILE = DATA_DIR / "history.jsonl"
+LIVING_DOCUMENTS_STATE = Path.home() / ".local" / "state" / "living-documents"
+WORK_LEDGER_DIR = LIVING_DOCUMENTS_STATE / "ledger"
 EXCISE_PHRASE = "Jettison the ghosts"
 
 USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -444,6 +446,69 @@ def append_history_payload(payload, flush=False):
                 _history_flush(f)
     except Exception as e:
         sys.stderr.write("crash-guard history: %s\n" % e)
+
+
+def read_work_ledger():
+    """Read the bounded Living Documents ledger without making it authority.
+
+    Records are untrusted state supplied by a separate system. This executor
+    validates only the fields needed to display or select a recovery action;
+    it never executes record-provided commands.
+    """
+    records = []
+    if not WORK_LEDGER_DIR.is_dir():
+        return records
+    for path in sorted(WORK_LEDGER_DIR.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("schema") != "living-documents-work-ledger/v1":
+            continue
+        if not isinstance(record.get("work_id"), str) or not isinstance(record.get("project"), str):
+            continue
+        if not isinstance(record.get("sessions"), list) or not isinstance(record.get("evidence"), list):
+            continue
+        record["_ledger_path"] = str(path)
+        records.append(record)
+    return records
+
+
+def native_resume_for_ledger(record):
+    """Return a static verified adapter command, never a record-provided argv."""
+    for reference in record.get("sessions") or []:
+        if not isinstance(reference, str) or ":" not in reference:
+            continue
+        harness, session_id = reference.split(":", 1)
+        if harness != "codex" or not re.fullmatch(r"[0-9a-f-]{8,80}", session_id):
+            continue
+        if not shutil.which("codex"):
+            continue
+        return {
+            "kind": "native-resume-attempt",
+            "harness": "codex",
+            "session": session_id,
+            "argv": ["codex", "resume", session_id],
+        }
+    return None
+
+
+def ledger_handoff_for(record):
+    """Return the explicit portable pack when the record has one."""
+    source = record.get("source_handoff")
+    if not isinstance(source, str) or not source:
+        source = str(LIVING_DOCUMENTS_STATE / "handoffs" / record["project"] /
+                     (record["work_id"] + ".json"))
+    path = Path(source)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("work_id") != record.get("work_id"):
+        return None
+    return {"kind": "portable-handoff", "path": str(path), "payload": payload}
 
 
 def _clean_history_record(rec):
@@ -2586,6 +2651,64 @@ def cmd_list(args):
     return 0
 
 
+def cmd_ledger(args):
+    """Expose Living Documents work items as executor candidates."""
+    records = read_work_ledger()
+    if args.work_id:
+        records = [r for r in records if r.get("work_id") == args.work_id]
+        if not records:
+            sys.stderr.write("crash-guard: no Living Documents work item '%s'\n" % args.work_id)
+            return 2
+    if not args.action:
+        view = [{k: v for k, v in r.items() if not k.startswith("_")} for r in records]
+        if args.json:
+            print(json.dumps({"records": view}, indent=2))
+        else:
+            for record in view:
+                print("%s  %-12s  %s" % (record["work_id"], record.get("status", "unknown"),
+                                          record.get("next_action", "")))
+            if not view:
+                print("crash-guard: no Living Documents ledger records.")
+        return 0
+
+    if len(records) != 1:
+        sys.stderr.write("crash-guard: --action requires exactly one --work-id\n")
+        return 2
+    record = records[0]
+    if args.action == "handoff":
+        action = ledger_handoff_for(record)
+        if not action:
+            sys.stderr.write("crash-guard: no verified portable handoff for '%s'\n" % record["work_id"])
+            return 2
+        print(json.dumps(action, indent=2))
+        return 0
+
+    action = native_resume_for_ledger(record)
+    if not action:
+        sys.stderr.write("crash-guard: no verified native-resume adapter for '%s'; use --action handoff\n" % record["work_id"])
+        return 2
+    output = dict(action)
+    output["work_id"] = record["work_id"]
+    output["status"] = "attempt-not-launched"
+    if not args.spawn:
+        output["note"] = "dry run only; --spawn records an attempt but cannot prove loaded context"
+        print(json.dumps(output, indent=2))
+        return 0
+    try:
+        process = subprocess.Popen(action["argv"])
+    except OSError as error:
+        sys.stderr.write("crash-guard: native resume launch failed: %s\n" % error)
+        return 2
+    append_history("ledger_native_resume_attempt", None, flush=True,
+                   work_id=record["work_id"], project=record["project"],
+                   harness=action["harness"], session=action["session"], pid=process.pid)
+    output["status"] = "attempt-launched"
+    output["pid"] = process.pid
+    output["note"] = "process launch is not verified session recovery"
+    print(json.dumps(output, indent=2))
+    return 0
+
+
 def cmd_prune(args):
     cur = boot_id()
     recs = read_sentinels()
@@ -4090,6 +4213,16 @@ def main():
 
     s = sub.add_parser("list")
     s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("ledger",
+                       help="inspect Living Documents work items and recovery actions")
+    s.add_argument("--work-id", default="", help="select one stable ledger work ID")
+    s.add_argument("--action", choices=("handoff", "native"),
+                   help="show a portable handoff or native-resume attempt")
+    s.add_argument("--spawn", action="store_true",
+                   help="launch the static native adapter and record an attempt; never implies success")
+    s.add_argument("--json", action="store_true", help="emit JSON when listing records")
+    s.set_defaults(func=cmd_ledger)
 
     s = sub.add_parser("prune")
     s.set_defaults(func=cmd_prune)
