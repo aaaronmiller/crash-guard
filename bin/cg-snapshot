@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""cg-snapshot: periodic liveness snapshot of running agent sessions.
+
+================================================================================
+THIS IS SCAFFOLDING. IT IS MEANT TO BE DELETED.
+================================================================================
+
+It is not the solution to crash recovery. It is a measuring instrument built to
+produce ground truth for the thing that IS the solution: a forensic detector
+that reconstructs the crash set from evidence the harnesses already leave
+behind, with no daemon and no wrapper.
+
+A design that needs a babysitter process has the same shape of fragility as the
+design it replaces, which needed a typed prefix on every launch. That one
+failed because coverage never arrived: 10 of 83 shell aliases used it, and the
+ledger accumulated 13,598 phantom crash records. This one would fail the same
+way the first time the daemon dies unnoticed.
+
+So it is accepted ONLY as a grader. Every snapshot it writes is a labelled test
+case. When the forensic detector reaches the agreed accuracy against these
+snapshots, over the agreed number of real boots, this file is deleted and its
+removal recorded in the project's decisions page.
+
+Exit condition and the agreed threshold live in:
+    ~/LIVING_DOCUMENTS/projects/crash-guard/what-to-do.md
+    ~/LIVING_DOCUMENTS/projects/crash-guard/decisions.md
+================================================================================
+
+What it records
+---------------
+Every N seconds, one line per live agent process: pid, the working directory
+read from /proc/PID/cwd, argv, controlling tty, process start time, and the
+harness session id where the harness exposes one.
+
+Working directory is the point. It is the single most valuable field for
+restoring a session and the hardest to reconstruct afterwards, and /proc makes
+it authoritative rather than inferred.
+
+What it deliberately does not do
+--------------------------------
+It never reads or writes ~/.local/share/crash-guard/. The existing ledger stays
+untouched so the two can be compared, and so a bug here cannot damage the only
+surviving record of older boots.
+
+Bounded from the first commit
+-----------------------------
+Snapshots rotate and old ones are deleted. The 13,598-sentinel failure was an
+unbounded store that nobody noticed growing. An unbounded store is exactly what
+this is, so the rotation is not a later refinement.
+
+Usage
+-----
+    cg-snapshot --once             take one snapshot and print it
+    cg-snapshot --daemon           loop until killed
+    cg-snapshot --crash-set        show the last snapshot before the current boot
+    cg-snapshot --status           store size, snapshot count, age
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cg-snapshot"
+SNAP_DIR = STATE / "snapshots"
+
+INTERVAL_SECS = 20
+# Rotation. A snapshot is roughly 1 KB, so 20s for 14 days is about 60 MB.
+# Both bounds are enforced, whichever bites first.
+MAX_SNAPSHOTS = 60480
+MAX_AGE_DAYS = 14
+
+# Process names that indicate an agent session worth restoring. Matched against
+# the executable name and the first argv element.
+HARNESS_PATTERNS = [
+    ("claude",     re.compile(r"(^|/)claude($|\s)")),
+    ("codex",      re.compile(r"(^|/)codex($|\s)")),
+    ("omp",        re.compile(r"(^|/)omp($|\s)|/\.bun/bin/omp")),
+    ("muse",       re.compile(r"(^|/)muse(-bin[\w.\-]*)?($|\s)")),
+    ("hermes",     re.compile(r"(^|/)hermes($|\s)")),
+    ("agy",        re.compile(r"(^|/)agy($|\s)|antigravity")),
+    ("opencode",   re.compile(r"(^|/)opencode($|\s)")),
+    ("pi",         re.compile(r"(^|/)pi($|\s)")),
+    ("kilo",       re.compile(r"(^|/)kilo(code)?($|\s)")),
+    ("omx",        re.compile(r"(^|/)omx($|\s)")),
+    ("omc",        re.compile(r"(^|/)omc($|\s)")),
+]
+
+# Sub-invocations that are not user sessions. A headless -p run is a delegated
+# task, not a tab someone wants back.
+NOT_A_SESSION = re.compile(r"(^|\s)(-p|--print|exec|--version|--help)(\s|$)")
+
+# Helper subprocesses a harness spawns for itself. They match the harness name
+# because they ARE the harness binary, but nobody wants them restored as tabs.
+HELPER = re.compile(
+    r"session-message\s+serve"          # muse IPC socket server
+    r"|__tbh_internal"                   # muse internal process-owner host
+    r"|site-packages/"                   # a library path, not an invocation
+    r"|agent-sdk-venv"                   # claude agent SDK helper
+    r"|/daemons?/|--daemon\b"           # generic daemon forms
+)
+
+
+def boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def _tty_of(pid: int) -> str:
+    """Controlling terminal, resolved through /proc/PID/fd/0."""
+    try:
+        target = os.readlink(f"/proc/{pid}/fd/0")
+        return target if "/pts/" in target or "/tty" in target else ""
+    except OSError:
+        return ""
+
+
+def _boot_time() -> float:
+    for line in _read(Path("/proc/stat")).splitlines():
+        if line.startswith("btime "):
+            return float(line.split()[1])
+    return 0.0
+
+
+def _start_time(pid: int) -> float | None:
+    """Absolute epoch seconds when the process started."""
+    stat = _read(Path(f"/proc/{pid}/stat"))
+    if not stat:
+        return None
+    try:
+        # field 22 is starttime in clock ticks, after the comm field which may
+        # itself contain spaces and parentheses.
+        after = stat[stat.rindex(")") + 2:].split()
+        ticks = float(after[19])
+        return _boot_time() + ticks / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError):
+        return None
+
+
+def _session_id(harness: str, cwd: str, pid: int) -> str | None:
+    """Best-effort harness session id, from each harness's own startup marker.
+
+    Deliberately conservative. A wrong session id restores the wrong
+    conversation, which is worse than restoring none, so anything uncertain
+    returns None and the restore degrades to directory plus resume.
+    """
+    home = Path.home()
+    try:
+        if harness == "omp":
+            for client in (home / ".omp/run/daemons").glob("*/clients/*.json"):
+                try:
+                    rec = json.loads(client.read_text())
+                except Exception:
+                    continue
+                if rec.get("pid") == pid:
+                    return rec.get("id")
+        elif harness == "muse":
+            for lock in (home / ".local/share/muse/sessions").rglob(".session.lock"):
+                if f"pid={pid}" in _read(lock):
+                    return lock.parent.name
+    except OSError:
+        pass
+    return None
+
+
+def scan() -> list[dict]:
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        cmdline = _read(entry / "cmdline").replace("\x00", " ").strip()
+        if not cmdline:
+            continue
+        harness = None
+        for name, pat in HARNESS_PATTERNS:
+            if pat.search(cmdline):
+                harness = name
+                break
+        if not harness or NOT_A_SESSION.search(cmdline) or HELPER.search(cmdline):
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue  # process died mid-scan, or not ours
+
+        # A controlling tty is the discriminator between a session someone
+        # typed into a terminal and a background process that merely happens to
+        # be the same binary. Verified 2026-08-20: it removed all three false
+        # positives (two muse helpers, one claude SDK helper) and kept every
+        # real session.
+        #
+        # This also settles the ambiguity from the 2026-08-18 crash, where four
+        # omp processes were found and the operator recalled only two open
+        # tabs. Log evidence alone could not tell a foreground TUI from a
+        # background instance. A tty can.
+        tty = _tty_of(pid)
+        if not tty:
+            continue
+        out.append({
+            "pid": pid,
+            "harness": harness,
+            "cwd": cwd,
+            "argv": cmdline[:600],
+            "tty": tty,
+            "started_at": _start_time(pid),
+            "session_id": _session_id(harness, cwd, pid),
+        })
+    return sorted(out, key=lambda r: r["pid"])
+
+
+def take_snapshot() -> dict:
+    return {
+        "at": dt.datetime.now().astimezone().isoformat(),
+        "epoch": time.time(),
+        "boot_id": boot_id(),
+        "sessions": scan(),
+    }
+
+
+def write_snapshot(snap: dict) -> Path:
+    SNAP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    os.chmod(SNAP_DIR, 0o700)
+    path = SNAP_DIR / f"{int(snap['epoch'])}.json"
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(snap, fh, separators=(",", ":"))
+    return path
+
+
+def rotate() -> int:
+    """Enforce both bounds. Returns how many were removed."""
+    if not SNAP_DIR.exists():
+        return 0
+    files = sorted(SNAP_DIR.glob("*.json"))
+    cutoff = time.time() - MAX_AGE_DAYS * 86400
+    doomed = [f for f in files if f.stat().st_mtime < cutoff]
+    surviving = [f for f in files if f not in set(doomed)]
+    if len(surviving) > MAX_SNAPSHOTS:
+        doomed += surviving[: len(surviving) - MAX_SNAPSHOTS]
+    for f in doomed:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return len(doomed)
+
+
+def crash_set() -> dict | None:
+    """The last snapshot taken before the current boot.
+
+    That is the answer to "what was open when it died", which is the whole
+    reason this exists.
+    """
+    if not SNAP_DIR.exists():
+        return None
+    cur = boot_id()
+    prior = [f for f in sorted(SNAP_DIR.glob("*.json"))]
+    for f in reversed(prior):
+        try:
+            snap = json.loads(f.read_text())
+        except Exception:
+            continue
+        if snap.get("boot_id") and snap["boot_id"] != cur:
+            return snap
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--once", action="store_true")
+    g.add_argument("--daemon", action="store_true")
+    g.add_argument("--crash-set", action="store_true")
+    g.add_argument("--status", action="store_true")
+    ap.add_argument("--interval", type=int, default=INTERVAL_SECS)
+    args = ap.parse_args()
+
+    if args.status:
+        files = sorted(SNAP_DIR.glob("*.json")) if SNAP_DIR.exists() else []
+        size = sum(f.stat().st_size for f in files)
+        print(f"store      : {SNAP_DIR}")
+        print(f"snapshots  : {len(files)}  (cap {MAX_SNAPSHOTS}, {MAX_AGE_DAYS}d)")
+        print(f"size       : {size/1e6:.2f} MB")
+        if files:
+            oldest = dt.datetime.fromtimestamp(files[0].stat().st_mtime)
+            newest = dt.datetime.fromtimestamp(files[-1].stat().st_mtime)
+            print(f"span       : {oldest:%Y-%m-%d %H:%M} to {newest:%Y-%m-%d %H:%M}")
+        print(f"boot_id    : {boot_id()}")
+        return 0
+
+    if args.crash_set:
+        snap = crash_set()
+        if not snap:
+            print("no snapshot from a previous boot; nothing to reconstruct")
+            return 1
+        print(f"last snapshot before this boot: {snap['at']}")
+        print(f"boot_id then: {snap['boot_id']}")
+        print(f"sessions: {len(snap['sessions'])}\n")
+        for s in snap["sessions"]:
+            sid = s.get("session_id") or "-"
+            print(f"  {s['harness']:<10} pid {s['pid']:<8} {s['cwd']}")
+            print(f"  {'':<10} session {sid}  tty {s.get('tty') or '-'}")
+        return 0
+
+    if args.once:
+        snap = take_snapshot()
+        write_snapshot(snap)
+        removed = rotate()
+        print(json.dumps(snap, indent=2))
+        if removed:
+            print(f"\nrotated out {removed} old snapshot(s)", file=sys.stderr)
+        return 0
+
+    # daemon
+    while True:
+        try:
+            write_snapshot(take_snapshot())
+            rotate()
+        except Exception as e:  # never let one bad scan kill the grader
+            print(f"cg-snapshot: {e}", file=sys.stderr)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

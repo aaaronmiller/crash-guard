@@ -257,6 +257,40 @@ def now_iso():
 def ensure_dirs():
     for d in (CFG_DIR, DATA_DIR, LIVE_DIR, ARCH_DIR):
         d.mkdir(parents=True, exist_ok=True)
+        # Owner-only. These directories hold sentinels and the history log,
+        # which record every working directory and every argv. They were being
+        # created 0755 by the default umask, so any local user could list and
+        # read them, while atomic_write() was carefully writing the sentinels
+        # themselves 0600. Only the file mode was tightened; the directory and
+        # the history log were missed.
+        try:
+            os.chmod(str(d), 0o700)
+        except OSError:
+            pass
+
+
+def _secure_history_file():
+    """Keep history.jsonl owner-only.
+
+    `append_history_payload` opens the file with a plain "a", so on first
+    creation it takes the process umask, which yields 0644 on this machine. The
+    file holds cwd and argv for every launch, so it must not be world-readable.
+    Cheap to enforce on every append: one stat, and a chmod only when wrong.
+
+    Creates the file 0600 when it is missing, because chmod-after-open would
+    still leave a window where the file exists world-readable, and because the
+    caller opens with a plain "a" that cannot carry a mode.
+    """
+    try:
+        if HISTORY_FILE.exists():
+            if HISTORY_FILE.stat().st_mode & 0o077:
+                os.chmod(str(HISTORY_FILE), 0o600)
+        else:
+            # O_CREAT with an explicit mode, so the file is never briefly loose.
+            fd = os.open(str(HISTORY_FILE), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _deep_merge(base, override):
@@ -418,6 +452,7 @@ def append_history(event, rec=None, flush=False, **extra):
     """
     try:
         ensure_dirs()
+        _secure_history_file()
         payload = {
             "event": event,
             "at": now_iso(),
@@ -440,6 +475,7 @@ def append_history_payload(payload, flush=False):
     """Append a pre-built history payload."""
     try:
         ensure_dirs()
+        _secure_history_file()
         with HISTORY_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, separators=(",", ":")) + "\n")
             if flush:
@@ -889,17 +925,25 @@ def history_sessions():
                 if dur < max_dur:
                     cur["_ephemeral"] = True
                     cur["_ephemeral_reason"] = f"duration {dur:.0f}s < {max_dur}s"
+            # The record of the session being evaluated. This MUST come from
+            # `cur`. It previously read the bare name `rec`, which was the
+            # leaked loop variable from `for rec in live:` above, so every
+            # session's payload was looked up against the last live sentinel
+            # instead of its own, and with no live sentinels at all the name
+            # was unbound and raised NameError.
+            cur_rec = cur.get("record") or {}
+
             # Also mark sessions with tiny payload files as ephemeral
             # This catches sessions that started and exited with no activity
             if not cur.get("_ephemeral"):
-                payload = _find_session_payload(rec, tool_key)
+                payload = _find_session_payload(cur_rec, tool_key)
                 if payload and payload.exists() and payload.stat().st_size < max_payload:
                     cur["_ephemeral"] = True
                     cur["_ephemeral_reason"] = f"payload {payload.stat().st_size}B < {max_payload}B"
             # Low-activity detection: count messages/turns in session file
             # Sessions with very few interactions are likely test/accidental launches
             if not cur.get("_ephemeral"):
-                payload = _find_session_payload(rec, tool_key)
+                payload = _find_session_payload(cur_rec, tool_key)
                 if payload and payload.exists():
                     activity = _count_session_activity(payload, tool_key)
                     if activity is not None and activity < min_turns:
