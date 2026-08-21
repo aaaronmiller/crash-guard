@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""cg-correlate: reconcile shell launch history against harness session logs.
+
+The question this answers
+-------------------------
+"Which CLI sessions did I actually start, and which of them were still alive
+when the machine died?"
+
+Three independent sources, each incomplete on its own:
+
+1. **Shell history.** `~/.zsh_history` with `EXTENDED_HISTORY` and
+   `SHARE_HISTORY` records every command with a timestamp, immediately. It
+   proves a launch was TYPED. It does not prove the process survived, and
+   `HIST_IGNORE_ALL_DUPS` silently drops a repeated launch, so re-running the
+   same command twice leaves one entry.
+
+2. **Harness session files.** Each harness writes its own conversation log.
+   These prove a session EXISTED and carry its id, but their modification time
+   tracks typing, not liveness: a session open and idle for a day looks stale.
+   That is how a live codex session was missed on 2026-08-18.
+
+3. **Liveness snapshots** from `cg-snapshot`, when the daemon was running.
+   These prove a process was ALIVE at a known instant, with its working
+   directory from /proc. Authoritative, but only for the period covered.
+
+Correlating them gives more than any one: history supplies intent and
+timestamps, session files supply identity, snapshots supply liveness. Where
+they disagree, the disagreement is itself the finding.
+
+Usage
+-----
+    cg-correlate                 the last completed boot
+    cg-correlate --since DATE    from an explicit date, e.g. 2026-08-18
+    cg-correlate --json
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+HOME = Path.home()
+HIST = HOME / ".zsh_history"
+SNAP_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "cg-snapshot" / "snapshots"
+
+# Commands that start an interactive agent session. Deliberately narrow: a
+# `--version` or a headless `-p` run is not a session someone wants restored.
+LAUNCH = re.compile(
+    r"^\s*(?:\S+=\S+\s+)*"                       # leading VAR=value assignments
+    r"(?:[a-z_]+\s+&&\s+)*"                      # leading `something &&`
+    r"(?P<tool>claude|codex|omp|muse|hermes|agy|opencode|pi|kilo|kilocode|omx|omc)\b"
+    r"(?P<args>.*)$"
+)
+NOT_A_SESSION = re.compile(r"(^|\s)(-p|--print|--version|--help|update|models?|stats)(\s|$)")
+
+# Where each harness keeps its conversation logs.
+SESSION_ROOTS = {
+    "claude":   [HOME / ".claude/projects"],
+    "codex":    [HOME / ".codex/sessions"],
+    "omp":      [HOME / ".omp/agent/sessions"],
+    "muse":     [HOME / ".local/share/muse/sessions"],
+    "opencode": [HOME / ".local/share/opencode/storage"],
+    "pi":       [HOME / ".pi/agent/sessions"],
+    "agy":      [HOME / ".gemini/antigravity-cli/conversations"],
+    "hermes":   [HOME / ".hermes"],
+}
+
+
+def read_history(since: float) -> list[tuple[float, str]]:
+    if not HIST.exists():
+        return []
+    raw = HIST.read_bytes().decode("utf-8", "replace")
+    out = []
+    for m in re.finditer(r"^: (\d+):\d+;(.*)$", raw, re.M):
+        ts = int(m.group(1))
+        if ts >= since:
+            out.append((ts, m.group(2)))
+    return out
+
+
+def launches(hist) -> list[dict]:
+    out = []
+    for ts, cmd in hist:
+        m = LAUNCH.match(cmd)
+        if not m:
+            continue
+        args = m.group("args") or ""
+        if NOT_A_SESSION.search(args):
+            continue
+        out.append({"at": ts, "tool": m.group("tool"), "cmd": cmd.strip()[:160]})
+    return out
+
+
+def sessions_touched(tool: str, lo: float, hi: float) -> list[dict]:
+    """Harness session files modified inside the window."""
+    found = []
+    for root in SESSION_ROOTS.get(tool, []):
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix not in (".jsonl", ".json", ".db"):
+                continue
+            try:
+                mt = p.stat().st_mtime
+            except OSError:
+                continue
+            if lo <= mt <= hi:
+                found.append({"path": str(p), "mtime": mt, "size": p.stat().st_size})
+    found.sort(key=lambda r: -r["mtime"])
+    return found[:6]
+
+
+def load_snapshots() -> list[dict]:
+    out = []
+    if not SNAP_DIR.exists():
+        return out
+    for f in sorted(SNAP_DIR.glob("*.json")):
+        try:
+            out.append(json.loads(f.read_text()))
+        except Exception:
+            continue
+    return out
+
+
+def boot_windows(snaps) -> list[tuple[str, float, float]]:
+    """(boot_id, first_seen, last_seen) per boot, from snapshot coverage."""
+    seen: dict[str, list[float]] = {}
+    for s in snaps:
+        b = s.get("boot_id") or "?"
+        seen.setdefault(b, []).append(s.get("epoch", 0))
+    return [(b, min(v), max(v)) for b, v in seen.items()]
+
+
+def fmt(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--since", help="YYYY-MM-DD; default is the last completed boot")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    snaps = load_snapshots()
+    windows = boot_windows(snaps)
+    cur_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    prior = [w for w in windows if w[0] != cur_boot]
+
+    if a.since:
+        lo = dt.datetime.strptime(a.since, "%Y-%m-%d").timestamp()
+        # Stop at the crash, not at now. Otherwise the window sweeps up the
+        # recovery commands typed AFTER the reboot and reports them as things
+        # that were running before it, which inverts the whole answer.
+        hi = max((s.get("epoch", 0) for s in snaps
+                  if s.get("boot_id") != cur_boot), default=None)
+        if hi:
+            label = f"since {a.since}, bounded at the crash ({fmt(hi)})"
+        else:
+            hi = dt.datetime.now().timestamp()
+            label = f"since {a.since} (no crash bound available)"
+    elif prior:
+        b, lo, hi = max(prior, key=lambda w: w[2])
+        label = f"boot {b[:8]} ({fmt(lo)} to {fmt(hi)})"
+    else:
+        lo = dt.datetime.now().timestamp() - 7 * 86400
+        hi = dt.datetime.now().timestamp()
+        label = "last 7 days (no prior boot snapshots)"
+
+    hist = read_history(lo)
+    lau = [l for l in launches(hist) if l["at"] <= hi]
+
+    # The authoritative liveness answer, when a snapshot covers the window.
+    crash_set = None
+    pre = [s for s in snaps if s.get("boot_id") != cur_boot]
+    if pre:
+        crash_set = max(pre, key=lambda s: s.get("epoch", 0))
+
+    if a.json:
+        print(json.dumps({"window": label, "launches": lau,
+                          "crash_set": crash_set}, indent=2, default=str))
+        return 0
+
+    print(f"WINDOW: {label}")
+    print(f"history entries in window: {len(hist)}   launches detected: {len(lau)}\n")
+
+    print("=" * 74)
+    print("1. SESSIONS YOU TYPED  (shell history)")
+    print("=" * 74)
+    if not lau:
+        print("  none detected")
+    by_tool: dict[str, list] = {}
+    for l in lau:
+        by_tool.setdefault(l["tool"], []).append(l)
+    for tool in sorted(by_tool):
+        print(f"\n  {tool}  ({len(by_tool[tool])} launch(es))")
+        for l in by_tool[tool]:
+            print(f"    {fmt(l['at'])}  {l['cmd']}")
+
+    print("\n" + "=" * 74)
+    print("2. SESSION FILES TOUCHED IN THE SAME WINDOW  (harness logs)")
+    print("=" * 74)
+    for tool in sorted(by_tool):
+        found = sessions_touched(tool, lo, hi)
+        print(f"\n  {tool}: {len(found)} file(s)")
+        for f in found:
+            print(f"    {fmt(f['mtime'])}  {f['size']:>10,}  "
+                  f"{f['path'].replace(str(HOME), '~')}")
+
+    print("\n" + "=" * 74)
+    print("3. ALIVE AT THE CRASH  (liveness snapshot, authoritative)")
+    print("=" * 74)
+    if not crash_set:
+        print("  No snapshot from a previous boot. Liveness is unknown for that")
+        print("  window, and sections 1 and 2 are the only evidence.")
+    else:
+        gap = None
+        cur_first = min((s["epoch"] for s in snaps if s.get("boot_id") == cur_boot),
+                        default=None)
+        if cur_first:
+            gap = cur_first - crash_set["epoch"]
+        print(f"  last snapshot: {crash_set['at']}")
+        if gap:
+            print(f"  blind gap to next boot: {gap:.0f}s")
+        print(f"  sessions alive: {len(crash_set['sessions'])}\n")
+        for s in crash_set["sessions"]:
+            sid = s.get("session_id") or "-"
+            print(f"    {s['harness']:<9} {s.get('tty','-'):<12} {s['cwd']}")
+            print(f"    {'':<9} {'':<12} session {sid}")
+
+    print("\n" + "=" * 74)
+    print("4. RECONCILIATION")
+    print("=" * 74)
+    if crash_set:
+        alive = {}
+        for s in crash_set["sessions"]:
+            alive.setdefault(s["harness"], 0)
+            alive[s["harness"]] += 1
+        typed = {t: len(v) for t, v in by_tool.items()}
+        for tool in sorted(set(alive) | set(typed)):
+            t, al = typed.get(tool, 0), alive.get(tool, 0)
+            note = ""
+            if al > t:
+                note = "  <- more alive than typed: HIST_IGNORE_ALL_DUPS dropped repeats"
+            elif t > al:
+                note = "  <- typed but not alive: exited, or died before the last snapshot"
+            print(f"  {tool:<10} typed={t:<3} alive={al:<3}{note}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
