@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Reconstruct the set of agent sessions that were live when the machine died.
+
+This is the permanent detector. It uses only artifacts the harnesses write for
+their own reasons -- session logs, per-session startup markers, SQLite WAL
+residue -- so it keeps working on a machine where crash-guard was never
+installed, and on a crash that happened before anybody thought to instrument it.
+
+`cg-snapshot` is the scaffold that grades this. It records live processes every
+15-30s and is deleted once this detector is trusted. Until then every snapshot
+is a labelled test case and every disagreement here is a defect report.
+
+## Why the obvious approaches fail
+
+**Startup markers alone are useless.** Every harness writes one containing a pid
+-- muse `.session.lock` with `pid=`, omp `clients/<pid>-<uuid>.json`, agy
+`presence/<id>.lock`, claude `security_warnings_state_<id>.lock` -- and **none of
+them removes its marker on a clean exit**. Claude had 198 markers against 20
+session files. Treating a present marker as a live session is what produced
+13,598 phantom sessions in the first implementation.
+
+**mtime alone is worse.** Scanning for recently-modified session files missed a
+codex session entirely on the 2026-08-18 crash, and invented omp sessions that
+were never open. A session idle for twenty minutes before the crash looks dead;
+a file touched by a background process looks alive.
+
+## What actually works
+
+A session that was live at the crash leaves *converging* evidence: its log was
+written near the crash, AND its process artifacts belong to the dying boot, AND
+where a database is involved, a WAL survives because nothing checkpointed it.
+
+So the detector scores each candidate on independent signals and requires more
+than one. A single signal is a hypothesis; two agreeing signals from different
+mechanisms is evidence.
+
+Usage:
+    cg-forensic                          reconstruct the most recent crash
+    cg-forensic --at <epoch|iso>         reconstruct around a given moment
+    cg-forensic --json                   machine-readable
+    cg-forensic --grade                  score against cg-snapshot ground truth
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state"))
+SNAP_DIR = STATE / "cg-snapshot" / "snapshots"
+
+# How close to the crash a write must be to count as "active at the crash".
+# 15 minutes: long enough that a session idle while the operator reads still
+# counts, short enough that a session closed an hour earlier does not.
+ACTIVE_WINDOW = 15 * 60
+
+# Where each harness keeps per-session state. Each entry is
+# (harness, glob of session logs, regex extracting a session key from the path).
+SESSION_LOGS = [
+    ("claude", ".claude/projects/*/*.jsonl", r"([0-9a-f-]{36})\.jsonl$"),
+    ("omp", ".omp/agent/sessions/*/*.jsonl", r"/([^/]+)/[^/]+\.jsonl$"),
+    ("muse", ".local/share/muse/sessions/*/*/*/*/session.jsonl", r"/([0-9a-f-]{36})/session\.jsonl$"),
+    ("muse", ".local/share/muse/sessions/*/*/*/*/subagent/*/session.jsonl", r"sessions/[0-9/]+/([0-9a-f-]{36})/"),
+    ("codex", ".codex/sessions/**/*.jsonl", r"([0-9a-f-]{36})"),
+    ("opencode", ".local/share/opencode/storage/**/*.json", r"([a-zA-Z0-9_-]+)\.json$"),
+]
+
+# Databases whose WAL surviving means the writer died without checkpointing.
+WAL_CANDIDATES = [
+    ("claude", ".claude/__store.db"),
+    ("omp", ".omp/agent/agent.db"),
+    ("opencode", ".local/share/opencode/opencode.db"),
+    ("cass", ".local/share/cass/cass.db"),
+]
+
+
+@dataclass
+class Candidate:
+    harness: str
+    key: str
+    path: str
+    cwd: str | None = None
+    last_write: float = 0.0
+    signals: list[str] = field(default_factory=list)
+
+    @property
+    def score(self) -> int:
+        return len(self.signals)
+
+
+def boot_time() -> float:
+    """Epoch of the current boot, from /proc/stat btime."""
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except OSError:
+        pass
+    return 0.0
+
+
+def crash_moment(explicit: str | None) -> float:
+    """When the machine died.
+
+    Without an explicit time, the crash is the boundary before the current
+    boot: the last moment anything was written by the previous boot. Using the
+    current boot's btime directly is wrong, because the machine may have been
+    off for hours between the crash and the restart.
+    """
+    if explicit:
+        try:
+            return float(explicit)
+        except ValueError:
+            import datetime as dt
+            return dt.datetime.fromisoformat(explicit).timestamp()
+
+    bt = boot_time()
+    latest = 0.0
+    for harness, pattern, _ in SESSION_LOGS:
+        for p in HOME.glob(pattern):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m < bt:  # written by the previous boot
+                latest = max(latest, m)
+    return latest or bt
+
+
+def cwd_from_claude(path: Path) -> str | None:
+    """Claude records the cwd in its first line."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(5):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict) and obj.get("cwd"):
+                    return obj["cwd"]
+    except OSError:
+        return None
+    return None
+
+
+def cwd_from_omp_marker(key: str) -> str | None:
+    """omp writes clients/<pid>-<uuid>.json carrying projectDir."""
+    for marker in (HOME / ".omp/agent/clients").glob("*.json"):
+        if key.split("-", 1)[-1] in marker.name or key in marker.name:
+            try:
+                return json.loads(marker.read_text()).get("projectDir")
+            except (OSError, json.JSONDecodeError):
+                continue
+    return None
+
+
+def cwd_from_path(path: str) -> str | None:
+    """Recover the working directory from the slugified directory name.
+
+    Both claude and omp encode the cwd in a path component with `/` replaced by
+    `-`: `.claude/projects/-home-cheta-code-crash-guard/` and
+    `.omp/agent/sessions/-code-quartermaster/`. omp's form is relative to $HOME
+    and drops the leading `home-cheta`.
+
+    The slug is lossy -- a directory whose real name contains a hyphen is
+    indistinguishable from a path separator -- so each candidate reconstruction
+    is checked against the filesystem and only a directory that exists is
+    returned. Guessing here would produce a restore into the wrong tree.
+    """
+    m = re.search(r"/(?:projects|sessions)/(-[^/]+)/", path)
+    if not m:
+        return None
+    slug = m.group(1)
+    parts = slug.strip("-").split("-")
+
+    # Try every split point, longest match first: the correct answer is the
+    # deepest existing directory.
+    for cut in range(len(parts), 0, -1):
+        # $HOME first: omp slugs are HOME-relative, and trying `/` first
+        # resolved `-tmp` to /tmp instead of ~/tmp -- both exist, and the wrong
+        # one would restore a session into the wrong tree.
+        for base in (HOME, Path("/")):
+            candidate = base / Path(*parts[:cut])
+            if candidate.is_dir():
+                rest = parts[cut:]
+                if not rest:
+                    return str(candidate)
+                # Remaining components may be a hyphenated single directory.
+                joined = candidate / "-".join(rest)
+                if joined.is_dir():
+                    return str(joined)
+    return None
+
+
+# Timestamp fields, across harnesses. muse uses `recorded_at`, not `timestamp`;
+# omitting it lost two of five sessions on the first grading run.
+TS_RE = re.compile(
+    rb'"(?:timestamp|recorded_at|created_at|startedAt|at|time)"\s*:\s*'
+    rb'"(20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.\-+Z]{8,26})"'
+)
+MAX_SCAN_BYTES = 60_000_000
+
+
+def record_in_window(path: Path, lo: float, hi: float) -> float | None:
+    """Did this session write a record between lo and hi?
+
+    Scans file CONTENT, not mtime. This is the difference between working and
+    not: crash-guard exists to resume sessions, and a resumed session's log is
+    rewritten, so its mtime reflects the resume rather than the crash. On the
+    2026-08-20 crash exactly one of five session files still had a crash-window
+    mtime; the other four had been rewritten. Their pre-crash records were still
+    inside them.
+    """
+    try:
+        if path.stat().st_size > MAX_SCAN_BYTES:
+            return None
+        with path.open("rb") as fh:
+            for raw in fh:
+                for m in TS_RE.finditer(raw):
+                    try:
+                        t = dt.datetime.fromisoformat(
+                            m.group(1).decode().replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        continue
+                    if lo <= t <= hi:
+                        return t
+    except OSError:
+        return None
+    return None
+
+
+def collect(at: float) -> list[Candidate]:
+    """Every session with evidence of being alive around the crash."""
+    out: dict[tuple[str, str], Candidate] = {}
+    lo, hi = at - ACTIVE_WINDOW, at + 60
+
+    for harness, pattern, key_rx in SESSION_LOGS:
+        rx = re.compile(key_rx)
+        for p in HOME.glob(pattern):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            # A file last touched before the crash cannot contain crash-window
+            # records. This prefilter is the only use of mtime, and it only ever
+            # excludes, never includes.
+            if mtime < lo:
+                continue
+
+            signals: list[str] = []
+            written = record_in_window(p, lo, hi)
+            if written is not None:
+                signals.append("record-in-window")
+                if at - written <= 120:
+                    signals.append("record-at-crash")
+            if lo <= mtime <= hi:
+                signals.append("mtime-in-window")
+            if not signals:
+                continue
+
+            m = rx.search(str(p))
+            key = m.group(1) if m else p.stem
+            cand = out.get((harness, key))
+            if cand is None:
+                cand = Candidate(harness=harness, key=key, path=str(p))
+                out[(harness, key)] = cand
+            cand.last_write = max(cand.last_write, written or mtime)
+            for s in signals:
+                if s not in cand.signals:
+                    cand.signals.append(s)
+
+    # Signal 3: a startup marker exists for this session. On its own this proves
+    # nothing (markers survive clean exits), but combined with a recent write it
+    # distinguishes a real session from a stray file.
+    marker_keys: set[str] = set()
+    for pattern in (".omp/agent/clients/*.json", ".claude/security/*.lock",
+                    ".local/share/muse/**/.session.lock", ".agy/presence/*.lock"):
+        for p in HOME.glob(pattern):
+            marker_keys.add(p.stem)
+            marker_keys.update(re.findall(r"[0-9a-f-]{36}", str(p)))
+    for cand in out.values():
+        if cand.key in marker_keys or any(cand.key in k for k in marker_keys):
+            cand.signals.append("startup-marker-present")
+
+    # Signal 4: WAL residue means the writer died without checkpointing.
+    for harness, rel in WAL_CANDIDATES:
+        wal = HOME / (rel + "-wal")
+        if not wal.exists():
+            continue
+        try:
+            if wal.stat().st_size == 0 or not (lo <= wal.stat().st_mtime <= hi):
+                continue
+        except OSError:
+            continue
+        for cand in out.values():
+            if cand.harness == harness:
+                cand.signals.append("wal-residue")
+
+    # Recover the working directory, which is what makes a restore possible.
+    for cand in out.values():
+        if cand.harness == "claude":
+            cand.cwd = cwd_from_claude(Path(cand.path))
+        elif cand.harness == "omp":
+            cand.cwd = cwd_from_omp_marker(cand.key)
+        if not cand.cwd:
+            cand.cwd = cwd_from_path(cand.path)
+
+    return sorted(out.values(), key=lambda c: (-c.score, -c.last_write))
+
+
+def detect(at: float, min_signals: int = 2) -> list[Candidate]:
+    """Sessions with converging evidence. One signal is a hypothesis."""
+    return [c for c in collect(at) if c.score >= min_signals]
+
+
+def grade(at: float, min_signals: int) -> dict:
+    """Score the detector against cg-snapshot ground truth.
+
+    Truth is the last snapshot at or before the crash moment. Matching is on
+    (harness, cwd), because pids are not recoverable forensically and are not
+    what a restore needs -- the cwd is.
+    """
+    snaps = []
+    for f in sorted(SNAP_DIR.glob("*.json")):
+        try:
+            snaps.append(json.loads(f.read_text()))
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not snaps:
+        return {"error": "no snapshots; cannot grade"}
+
+    before = [s for s in snaps if s.get("epoch", 0) <= at + 60]
+    truth_snap = before[-1] if before else snaps[-1]
+    truth = {(s["harness"], s.get("cwd")) for s in truth_snap.get("sessions", [])}
+
+    found = {(c.harness, c.cwd) for c in detect(at, min_signals)}
+    hit = truth & found
+    missed = truth - found
+    extra = found - truth
+    return {
+        "truth_at": truth_snap.get("at"),
+        "truth_count": len(truth),
+        "detected_count": len(found),
+        "correct": sorted(f"{h}:{c}" for h, c in hit),
+        "missed": sorted(f"{h}:{c}" for h, c in missed),
+        "false_positive": sorted(f"{h}:{c}" for h, c in extra),
+        "recall": round(len(hit) / len(truth), 3) if truth else None,
+        "precision": round(len(hit) / len(found), 3) if found else None,
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--at")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--grade", action="store_true")
+    ap.add_argument("--min-signals", type=int, default=2)
+    args = ap.parse_args()
+
+    at = crash_moment(args.at)
+
+    if args.grade:
+        result = grade(at, args.min_signals)
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("recall") else 1
+
+    found = detect(at, args.min_signals)
+    if args.json:
+        print(json.dumps({"crash_at": at, "sessions": [asdict(c) for c in found]}, indent=2))
+        return 0
+
+    print(f"crash reconstructed at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(at))}")
+    print(f"{len(found)} session(s) with {args.min_signals}+ converging signals\n")
+    for c in found:
+        age = at - c.last_write
+        print(f"  {c.harness:<9} {c.cwd or '(cwd unknown)'}")
+        print(f"    signals: {', '.join(c.signals)}")
+        print(f"    last write {age:.0f}s before the crash")
+    if not found:
+        print("  nothing. Either the crash moment is wrong, or no session was live.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
