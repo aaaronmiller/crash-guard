@@ -20,3 +20,4 @@ Thumbs.db
 *.log
 .ralph-runner/
 maximum-iterations-*/
+staged-for-deletion/
