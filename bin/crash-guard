@@ -629,6 +629,12 @@ def cmd_start(args):
         }
         if args.name:
             rec["name"] = args.name
+        # Refuse to record a probe. `pi --version` cannot be interrupted and
+        # has no session to reattach to, so a sentinel for it is pure noise --
+        # and noise that never expired: 11,984 such records, 88% of the store,
+        # survived from a single loop until `prune` learned to remove them.
+        if is_trivial_invocation(rec):
+            return 0
         sentinel_path = LIVE_DIR / (args.inv_id + ".json")
         if sentinel_path.exists():
             sys.stderr.write("crash-guard start: warning — sentinel %s already exists (overwriting)\n" % args.inv_id)
@@ -2753,18 +2759,88 @@ def cmd_ledger(args):
     return 0
 
 
+def is_trivial_invocation(rec):
+    """True when a sentinel records a probe rather than an interactive session.
+
+    `pi --version` exits in milliseconds and has nothing to restore, but it
+    still wrote a sentinel. One shell loop on 2026-07-18 left 11,984 of them,
+    88% of the whole store, which pushed every real session off the end of
+    `status`. A sentinel exists to reattach to a session that was interrupted;
+    an invocation that cannot be interrupted should never have created one.
+    """
+    argv = [a for a in (rec.get("argv") or []) if a != "command"]
+    if len(argv) < 2:
+        return False
+    return argv[-1] in TRIVIAL_FLAGS
+
+
+TRIVIAL_FLAGS = {"--version", "-V", "--help", "-h", "version", "--verify"}
+
+
 def cmd_prune(args):
+    """Remove sentinels that can no longer lead to a restore.
+
+    The default remains the conservative one: only `stale` sentinels, meaning
+    this boot's records whose shell is gone. Records from a previous boot are
+    `crashed`, and those are exactly what a restore consumes, so they are never
+    dropped unless asked for by an explicit flag.
+
+    That default was also the reason the store grew without bound: nothing in
+    the tool could ever remove a crashed record, so 13,598 of them accumulated
+    and `status` became unreadable. The flags below give retention a mechanism
+    without changing what a bare `prune` does.
+    """
     cur = boot_id()
     recs = read_sentinels()
-    _, stale, _ = classify(recs, cur)
+    _, stale, crashed = classify(recs, cur)
+
+    doomed = {}
     for r in stale:
+        doomed[r["_path"]] = "disconnected"
+
+    if getattr(args, "all_crashed", False):
+        for r in crashed:
+            doomed.setdefault(r["_path"], "previous boot")
+
+    if getattr(args, "trivial", False):
+        for r in recs:
+            if is_trivial_invocation(r):
+                doomed.setdefault(r["_path"], "probe invocation")
+
+    days = getattr(args, "older_than", None)
+    if days:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+        for r in crashed:
+            launched = parse_time(r.get("launched_at"))
+            if launched and launched < cutoff:
+                doomed.setdefault(r["_path"], "older than %dd" % days)
+
+    if not doomed:
+        print("nothing to prune (%d running/crashed sentinels retained)." % len(recs))
+        return 0
+
+    reasons = {}
+    for reason in doomed.values():
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+    if getattr(args, "dry_run", False):
+        print("would prune %d of %d sentinels:" % (len(doomed), len(recs)))
+        for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print("  %6d  %s" % (n, reason))
+        print("retained: %d" % (len(recs) - len(doomed)))
+        return 0
+
+    removed = 0
+    for path in doomed:
         try:
-            Path(r["_path"]).unlink()
-            print("pruned disconnected: %s %s" % (r.get("key"), r.get("cwd")))
+            Path(path).unlink()
+            removed += 1
         except Exception as e:
             sys.stderr.write("prune: %s\n" % e)
-    if not stale:
-        print("no disconnected sentinels.")
+    print("pruned %d of %d sentinels:" % (removed, len(recs)))
+    for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        print("  %6d  %s" % (n, reason))
+    print("retained: %d" % (len(recs) - removed))
     return 0
 
 
@@ -4268,7 +4344,15 @@ def main():
     s.add_argument("--json", action="store_true", help="emit JSON when listing records")
     s.set_defaults(func=cmd_ledger)
 
-    s = sub.add_parser("prune")
+    s = sub.add_parser("prune", help="remove sentinels that can no longer be restored")
+    s.add_argument("--older-than", type=int, metavar="DAYS",
+                   help="also remove crashed sentinels launched more than DAYS ago")
+    s.add_argument("--trivial", action="store_true",
+                   help="also remove sentinels for probe invocations (--version, --help)")
+    s.add_argument("--all-crashed", action="store_true",
+                   help="also remove every sentinel from a previous boot")
+    s.add_argument("--dry-run", action="store_true",
+                   help="report what would be removed without deleting anything")
     s.set_defaults(func=cmd_prune)
 
     s = sub.add_parser("history")
