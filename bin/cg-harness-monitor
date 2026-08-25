@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-08-25 00:00:00 PT
+# ---
+"""Sample memory use per agent harness over time.
+
+The question this answers is not "how much does one worker cost" -- a single
+measurement answers that, and badly, because the number moves with what else is
+resident. It is "what does this machine actually look like while I work", which
+needs a time series: how much is already resident before delegation starts, what
+each concurrent worker adds, and whether anything is failing to exit.
+
+Measuring that by hand produced three contradictory numbers in one session. RSS
+of direct children undercounts a runtime that spawns a child process. System
+free-memory delta is meaningless on a host that is never idle. Only PSS summed
+over the full descendant tree was repeatable, and PSS is also the honest metric
+when several processes share the same libraries.
+
+Attribution is by process tree, not by process name. A `claude` spawned by
+`ante` is charged to ante, because that is who is responsible for it -- the
+whole point of the exercise is to compare harnesses, and a harness that wraps
+another one is not cheap just because its own binary is small.
+
+Usage:
+    cg-harness-monitor sample                  one reading, human readable
+    cg-harness-monitor watch --interval 15     run until interrupted
+    cg-harness-monitor daemon --interval 30    detach and keep sampling
+    cg-harness-monitor report --hours 6        what happened, from the database
+    cg-harness-monitor report --by-session     per-session detail
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+
+try:
+    import psutil
+except ImportError:
+    sys.stderr.write("cg-harness-monitor needs psutil: pip install --user psutil\n")
+    sys.exit(2)
+
+DB_DEFAULT = os.path.expanduser("~/.local/share/crash-guard/harness-memory.db")
+
+# Matched against the process name and the first argv entry. Order matters:
+# the first match wins, so wrappers are listed before what they wrap.
+HARNESSES = [
+    ("jcode", ("jcode",)),
+    ("ante", ("ante",)),
+    ("omp", ("omp",)),
+    ("opencode", ("opencode",)),
+    ("codex", ("codex",)),
+    ("hermes", ("hermes",)),
+    ("pi", ("pi-agent", "pi")),
+    ("claude", ("claude",)),
+]
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sample (
+  id          INTEGER PRIMARY KEY,
+  at          TEXT NOT NULL,
+  mem_total   INTEGER NOT NULL,
+  mem_used    INTEGER NOT NULL,
+  mem_avail   INTEGER NOT NULL,
+  swap_used   INTEGER NOT NULL,
+  load1       REAL
+);
+CREATE TABLE IF NOT EXISTS harness_sample (
+  sample_id   INTEGER NOT NULL REFERENCES sample(id),
+  harness     TEXT NOT NULL,
+  sessions    INTEGER NOT NULL,   -- distinct roots, i.e. how many are running
+  procs       INTEGER NOT NULL,   -- processes including descendants
+  pss_mb      INTEGER NOT NULL,
+  rss_mb      INTEGER NOT NULL,
+  PRIMARY KEY (sample_id, harness)
+);
+CREATE TABLE IF NOT EXISTS session_sample (
+  sample_id   INTEGER NOT NULL REFERENCES sample(id),
+  harness     TEXT NOT NULL,
+  root_pid    INTEGER NOT NULL,
+  age_secs    INTEGER NOT NULL,
+  procs       INTEGER NOT NULL,
+  pss_mb      INTEGER NOT NULL,
+  rss_mb      INTEGER NOT NULL,
+  cmd         TEXT,
+  PRIMARY KEY (sample_id, root_pid)
+);
+CREATE INDEX IF NOT EXISTS idx_sample_at ON sample(at);
+"""
+
+
+def classify(proc_name, cmdline):
+    """Which harness is this, by name then by argv[0]."""
+    hay = (proc_name or "").lower()
+    first = (cmdline[0] if cmdline else "").lower()
+    base = os.path.basename(first)
+    for label, needles in HARNESSES:
+        for n in needles:
+            if hay == n or base == n or hay.startswith(n):
+                return label
+    return None
+
+
+def pss_of(pid):
+    """PSS in KB, falling back to RSS when smaps_rollup is unreadable.
+
+    PSS divides shared pages by the number of sharers, so summing it across a
+    tree does not double-count the runtime the parent and child share. RSS does,
+    which is why an unqualified RSS total for a wrapper is always too high.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as fh:
+            for line in fh:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]), False
+    except (OSError, ValueError):
+        pass
+    try:
+        return psutil.Process(pid).memory_info().rss // 1024, True
+    except Exception:
+        return 0, True
+
+
+def snapshot():
+    """One reading: every harness process tree, attributed to its root."""
+    procs = {}
+    for p in psutil.process_iter(["pid", "ppid", "name", "cmdline", "create_time"]):
+        try:
+            procs[p.info["pid"]] = p.info
+        except Exception:
+            continue
+
+    # A root is a harness process whose parent is not the same harness, so a
+    # tree is counted once however deep it goes.
+    roots = {}
+    for pid, info in procs.items():
+        label = classify(info.get("name"), info.get("cmdline") or [])
+        if not label:
+            continue
+        parent = procs.get(info.get("ppid") or 0)
+        if parent and classify(parent.get("name"), parent.get("cmdline") or []) == label:
+            continue
+        roots[pid] = label
+
+    children = {}
+    for pid, info in procs.items():
+        children.setdefault(info.get("ppid") or 0, []).append(pid)
+
+    sessions = []
+    now = time.time()
+    for pid, label in roots.items():
+        stack, seen = [pid], set()
+        pss = rss = 0
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            kb, _ = pss_of(cur)
+            pss += kb
+            try:
+                rss += psutil.Process(cur).memory_info().rss // 1024
+            except Exception:
+                pass
+            stack.extend(children.get(cur, []))
+        info = procs.get(pid, {})
+        cmd = " ".join(info.get("cmdline") or [])[:160]
+        sessions.append({
+            "harness": label, "root_pid": pid, "procs": len(seen),
+            "pss_mb": pss // 1024, "rss_mb": rss // 1024,
+            "age_secs": int(now - (info.get("create_time") or now)),
+            "cmd": cmd,
+        })
+    return sessions
+
+
+def store(db, sessions):
+    vm = psutil.virtual_memory()
+    sw = psutil.swap_memory()
+    try:
+        load1 = os.getloadavg()[0]
+    except OSError:
+        load1 = None
+    at = time.strftime("%Y-%m-%dT%H:%M:%S")
+    cur = db.execute(
+        "INSERT INTO sample(at,mem_total,mem_used,mem_avail,swap_used,load1) VALUES (?,?,?,?,?,?)",
+        (at, vm.total // 1048576, vm.used // 1048576, vm.available // 1048576,
+         sw.used // 1048576, load1))
+    sid = cur.lastrowid
+
+    agg = {}
+    for s in sessions:
+        a = agg.setdefault(s["harness"], {"sessions": 0, "procs": 0, "pss": 0, "rss": 0})
+        a["sessions"] += 1
+        a["procs"] += s["procs"]
+        a["pss"] += s["pss_mb"]
+        a["rss"] += s["rss_mb"]
+        db.execute(
+            "INSERT OR REPLACE INTO session_sample"
+            "(sample_id,harness,root_pid,age_secs,procs,pss_mb,rss_mb,cmd) VALUES (?,?,?,?,?,?,?,?)",
+            (sid, s["harness"], s["root_pid"], s["age_secs"], s["procs"],
+             s["pss_mb"], s["rss_mb"], s["cmd"]))
+    for h, a in agg.items():
+        db.execute(
+            "INSERT OR REPLACE INTO harness_sample"
+            "(sample_id,harness,sessions,procs,pss_mb,rss_mb) VALUES (?,?,?,?,?,?)",
+            (sid, h, a["sessions"], a["procs"], a["pss"], a["rss"]))
+    db.commit()
+    return sid, at, vm
+
+
+def render(sessions, vm, at):
+    out = [f"{at}   host {vm.used // 1048576} / {vm.total // 1048576} MB used, "
+           f"{vm.available // 1048576} MB available"]
+    if not sessions:
+        out.append("  no harness processes running")
+        return "\n".join(out)
+    agg = {}
+    for s in sessions:
+        a = agg.setdefault(s["harness"], [0, 0, 0])
+        a[0] += 1
+        a[1] += s["pss_mb"]
+        a[2] += s["procs"]
+    out.append(f"  {'harness':10s} {'sess':>5s} {'procs':>6s} {'PSS MB':>8s}  {'MB/session':>10s}")
+    for h, (n, pss, procs) in sorted(agg.items(), key=lambda kv: -kv[1][1]):
+        out.append(f"  {h:10s} {n:5d} {procs:6d} {pss:8d}  {pss // max(n, 1):10d}")
+    out.append(f"  {'TOTAL':10s} {sum(a[0] for a in agg.values()):5d} "
+               f"{sum(a[2] for a in agg.values()):6d} {sum(a[1] for a in agg.values()):8d}")
+    return "\n".join(out)
+
+
+def cmd_sample(args, db):
+    s = snapshot()
+    _, at, vm = store(db, s)
+    if args.json:
+        print(json.dumps({"at": at, "sessions": s}, indent=1))
+    else:
+        print(render(s, vm, at))
+
+
+def cmd_watch(args, db):
+    try:
+        while True:
+            s = snapshot()
+            _, at, vm = store(db, s)
+            print(render(s, vm, at), flush=True)
+            print("", flush=True)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("stopped")
+
+
+def cmd_daemon(args, db):
+    """Detach and keep sampling. One reading costs a few ms of CPU."""
+    if os.fork():
+        print(f"cg-harness-monitor: sampling every {args.interval}s into {args.db}")
+        return
+    os.setsid()
+    db = sqlite3.connect(args.db)
+    db.executescript(SCHEMA)
+    while True:
+        try:
+            store(db, snapshot())
+        except Exception:
+            pass
+        time.sleep(args.interval)
+
+
+def cmd_report(args, db):
+    since = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - args.hours * 3600))
+    n = db.execute("SELECT COUNT(*) FROM sample WHERE at >= ?", (since,)).fetchone()[0]
+    if not n:
+        print(f"no samples in the last {args.hours}h — run `cg-harness-monitor daemon` first")
+        return
+    print(f"{n} samples over {args.hours}h\n")
+    print(f"  {'harness':10s} {'peak':>7s} {'mean':>7s} {'max sess':>9s} {'peak/sess':>10s}")
+    q = """SELECT harness, MAX(pss_mb), AVG(pss_mb), MAX(sessions),
+                  MAX(pss_mb / MAX(sessions,1))
+           FROM harness_sample JOIN sample ON sample.id = harness_sample.sample_id
+           WHERE sample.at >= ? GROUP BY harness ORDER BY MAX(pss_mb) DESC"""
+    for h, peak, mean, sess, per in db.execute(q, (since,)):
+        print(f"  {h:10s} {peak:7d} {int(mean):7d} {sess:9d} {per:10d}")
+    row = db.execute(
+        "SELECT MIN(mem_avail), MAX(mem_used), MAX(swap_used) FROM sample WHERE at >= ?",
+        (since,)).fetchone()
+    print(f"\n  host: minimum available {row[0]} MB, peak used {row[1]} MB, peak swap {row[2]} MB")
+    if row[0] is not None and row[0] < 512:
+        print("  WARNING: available memory fell below 512 MB — concurrency was too high")
+
+    if args.by_session:
+        print("\n  longest-lived sessions seen:")
+        q2 = """SELECT harness, root_pid, MAX(age_secs)/60, MAX(pss_mb), cmd
+                FROM session_sample JOIN sample ON sample.id = session_sample.sample_id
+                WHERE sample.at >= ? GROUP BY root_pid
+                ORDER BY MAX(age_secs) DESC LIMIT 12"""
+        for h, pid, mins, pss, cmd in db.execute(q2, (since,)):
+            print(f"    {h:9s} pid {pid:<8d} {mins:5d}min {pss:5d}MB  {(cmd or '')[:52]}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Sample memory use per agent harness over time.")
+    ap.add_argument("--db", default=DB_DEFAULT)
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("sample", help="one reading")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_sample)
+
+    w = sub.add_parser("watch", help="sample until interrupted")
+    w.add_argument("--interval", type=int, default=15)
+    w.set_defaults(func=cmd_watch)
+
+    d = sub.add_parser("daemon", help="detach and keep sampling")
+    d.add_argument("--interval", type=int, default=30)
+    d.set_defaults(func=cmd_daemon)
+
+    r = sub.add_parser("report", help="summarise what was recorded")
+    r.add_argument("--hours", type=float, default=6)
+    r.add_argument("--by-session", action="store_true")
+    r.set_defaults(func=cmd_report)
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 0
+    os.makedirs(os.path.dirname(args.db), exist_ok=True)
+    db = sqlite3.connect(args.db)
+    db.executescript(SCHEMA)
+    args.func(args, db)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
