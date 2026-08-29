@@ -67,11 +67,16 @@ ACTIVE_WINDOW = 15 * 60
 # (harness, glob of session logs, regex extracting a session key from the path).
 SESSION_LOGS = [
     ("claude", ".claude/projects/*/*.jsonl", r"([0-9a-f-]{36})\.jsonl$"),
-    ("omp", ".omp/agent/sessions/*/*.jsonl", r"/([^/]+)/[^/]+\.jsonl$"),
+    # The omp key is the session uuid in the FILENAME, not the slug directory:
+    # markers match on the uuid (`clients/<pid>-<uuid>.json`), and the slug is
+    # not a session identifier. Grading found the slug key matching nothing.
+    ("omp", ".omp/agent/sessions/*/*.jsonl", r"_([0-9a-f-]{36})\.jsonl$"),
     ("muse", ".local/share/muse/sessions/*/*/*/*/session.jsonl", r"/([0-9a-f-]{36})/session\.jsonl$"),
     ("muse", ".local/share/muse/sessions/*/*/*/*/subagent/*/session.jsonl", r"sessions/[0-9/]+/([0-9a-f-]{36})/"),
     ("codex", ".codex/sessions/**/*.jsonl", r"([0-9a-f-]{36})"),
     ("opencode", ".local/share/opencode/storage/**/*.json", r"([a-zA-Z0-9_-]+)\.json$"),
+    # agy (antigravity) keeps one SQLite database per conversation.
+    ("agy", ".gemini/antigravity-cli/conversations/*.db", r"/([0-9a-f-]{36})\.db$"),
 ]
 
 # Databases whose WAL surviving means the writer died without checkpointing.
@@ -156,13 +161,41 @@ def cwd_from_claude(path: Path) -> str | None:
 
 
 def cwd_from_omp_marker(key: str) -> str | None:
-    """omp writes clients/<pid>-<uuid>.json carrying projectDir."""
-    for marker in (HOME / ".omp/agent/clients").glob("*.json"):
-        if key.split("-", 1)[-1] in marker.name or key in marker.name:
+    """omp writes daemons/<id>/clients/<pid>-<uuid>.json carrying projectDir.
+
+    The original path (`.omp/agent/clients`) does not exist on this machine;
+    client markers live under the daemon runtime directory.
+    """
+    for marker in HOME.glob(".omp/run/daemons/*/clients/*.json"):
+        if key in marker.name:
             try:
                 return json.loads(marker.read_text()).get("projectDir")
             except (OSError, json.JSONDecodeError):
                 continue
+    return None
+
+
+def cwd_from_muse(path: Path) -> str | None:
+    """muse records the cwd in its `runtime.session.route_facts` payload, and
+    the workspace root in the opening metadata. Both are on the first few
+    lines, so only the head of the file is read."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(10):
+                line = fh.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rec = (obj.get("payload") or {}).get("record") or {}
+                if rec.get("cwd"):
+                    return rec["cwd"]
+                if rec.get("workspace_root"):
+                    return rec["workspace_root"]
+    except OSError:
+        return None
     return None
 
 
@@ -204,12 +237,18 @@ def cwd_from_path(path: str) -> str | None:
     return None
 
 
-# Timestamp fields, across harnesses. muse uses `recorded_at`, not `timestamp`;
-# omitting it lost two of five sessions on the first grading run.
+# Timestamp fields, across harnesses. Two forms exist and BOTH must parse:
+# ISO strings (claude, omp, codex) and muse's UNQUOTED epoch microseconds --
+# `"recorded_at":1787258248303576`. The original regex only matched quoted ISO
+# strings, so muse session content could never produce a record-in-window
+# signal at all. Grading found this: the muse fix comment claimed coverage the
+# regex could not deliver.
 TS_RE = re.compile(
     rb'"(?:timestamp|recorded_at|created_at|startedAt|at|time)"\s*:\s*'
     rb'"(20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.\-+Z]{8,26})"'
 )
+# muse: unquoted epoch microseconds (16 digits as of 2026).
+TS_EPOCH_US_RE = re.compile(rb'"recorded_at"\s*:\s*(1[0-9]{15})\b')
 MAX_SCAN_BYTES = 60_000_000
 
 
@@ -235,6 +274,10 @@ def record_in_window(path: Path, lo: float, hi: float) -> float | None:
                         ).timestamp()
                     except ValueError:
                         continue
+                    if lo <= t <= hi:
+                        return t
+                for m in TS_EPOCH_US_RE.finditer(raw):
+                    t = int(m.group(1)) / 1e6
                     if lo <= t <= hi:
                         return t
     except OSError:
@@ -285,9 +328,17 @@ def collect(at: float) -> list[Candidate]:
     # Signal 3: a startup marker exists for this session. On its own this proves
     # nothing (markers survive clean exits), but combined with a recent write it
     # distinguishes a real session from a stray file.
+    #
+    # Patterns verified against the filesystem 2026-08-29. The originals
+    # (`.omp/agent/clients`, `.claude/security/*.lock`, `.agy/presence`) matched
+    # nothing anywhere on this machine, so the marker signal never fired for
+    # three of the covered harnesses -- a defect grading surfaced, because the
+    # signal list claimed coverage the paths could not deliver.
     marker_keys: set[str] = set()
-    for pattern in (".omp/agent/clients/*.json", ".claude/security/*.lock",
-                    ".local/share/muse/**/.session.lock", ".agy/presence/*.lock"):
+    for pattern in (".omp/run/daemons/*/clients/*.json",
+                    ".claude/security_warnings_state_*.json",
+                    ".local/share/muse/**/.session.lock",
+                    ".gemini/antigravity-cli/presence/*.lock"):
         for p in HOME.glob(pattern):
             marker_keys.add(p.stem)
             marker_keys.update(re.findall(r"[0-9a-f-]{36}", str(p)))
@@ -315,6 +366,8 @@ def collect(at: float) -> list[Candidate]:
             cand.cwd = cwd_from_claude(Path(cand.path))
         elif cand.harness == "omp":
             cand.cwd = cwd_from_omp_marker(cand.key)
+        elif cand.harness == "muse":
+            cand.cwd = cwd_from_muse(Path(cand.path))
         if not cand.cwd:
             cand.cwd = cwd_from_path(cand.path)
 
@@ -324,6 +377,38 @@ def collect(at: float) -> list[Candidate]:
 def detect(at: float, min_signals: int = 2) -> list[Candidate]:
     """Sessions with converging evidence. One signal is a hypothesis."""
     return [c for c in collect(at) if c.score >= min_signals]
+
+
+def current_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def snapshot_crash_moment() -> float | None:
+    """The crash moment, from the snapshot store itself.
+
+    The last snapshot of any boot that is not the current one. Deriving the
+    moment from session-log mtimes (crash_moment) is wrong once the machine
+    has booted more than once since the crash: the latest pre-btime log write
+    then belongs to a LATER boot, the reconstructed window points somewhere
+    far from the crash, and grading returns garbage.
+    Demonstrated 2026-08-29: grading without this returned recall 0.0 with one
+    invented session, against the same 808 snapshots that graded 0.4/1.0 when
+    the moment was correct.
+    """
+    cur = current_boot_id()
+    latest = 0.0
+    for f in SNAP_DIR.glob("*.json"):
+        try:
+            snap = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if snap.get("boot_id") and snap.get("boot_id") == cur:
+            continue
+        latest = max(latest, snap.get("epoch", 0) or 0)
+    return latest or None
 
 
 def grade(at: float, min_signals: int) -> dict:
@@ -371,6 +456,8 @@ def main() -> int:
     args = ap.parse_args()
 
     at = crash_moment(args.at)
+    if args.grade and not args.at:
+        at = snapshot_crash_moment() or at
 
     if args.grade:
         result = grade(at, args.min_signals)
@@ -385,10 +472,11 @@ def main() -> int:
     print(f"crash reconstructed at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(at))}")
     print(f"{len(found)} session(s) with {args.min_signals}+ converging signals\n")
     for c in found:
-        age = at - c.last_write
+        age = max(at - c.last_write, 0.0)
+        when = "at the crash moment" if age < 1 else f"{age:.0f}s before the crash"
         print(f"  {c.harness:<9} {c.cwd or '(cwd unknown)'}")
         print(f"    signals: {', '.join(c.signals)}")
-        print(f"    last write {age:.0f}s before the crash")
+        print(f"    last write {when}")
     if not found:
         print("  nothing. Either the crash moment is wrong, or no session was live.")
     return 0
