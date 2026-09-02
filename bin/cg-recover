@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-09-02 00:00:00 PT
+# ---
+"""Find the agent sessions that were open when the machine last died, and print
+the command to resume each one.
+
+## Why this exists alongside cg-forensic
+
+`cg-forensic` reconstructs a crash from *inferential* signals: startup markers,
+file mtimes, SQLite WAL residue, scored for convergence. That was the right
+design when nobody knew what the harnesses recorded, and it grades 0.6 recall /
+1.0 precision -- it is never wrong about a session it names, but it misses two
+in five.
+
+It misses them because it is inferring answers that two harnesses write down
+explicitly. The 2026-09-02 handoff established the tells:
+
+- **omp** closes a session with a final `{"type":"custom","customType":
+  "session_exit"}` record. Anything else as the last record means the session
+  was still open. Verified here: 40 graceful, 27 open across 68 files.
+- **hermes** keeps sessions in `~/.hermes/state.db`, not per-file. A clean close
+  sets `ended_at` and an `end_reason` (`cli_close`, `agent_close`,
+  `cron_complete`, `compression`, ...). `ended_at IS NULL` means it never closed.
+  Verified here: 611 sessions, 163 never-ended.
+
+For those two the answer is a fact, not a score. This tool reads the fact where
+one exists and falls back to the heuristic only where none does.
+
+## Where no marker exists
+
+**claude code** and **codex** write no terminal record of any kind -- a
+transcript simply stops, and a clean `/exit` is indistinguishable from a power
+cut by record type. For those, two signals must agree:
+
+1. the last write falls in the gap before the current boot, and
+2. the final turn is *unfinished* -- an assistant `tool_use` with no matching
+   `tool_result`, or a user turn with no reply.
+
+An idle session that was closed cleanly fails (2); a background process touching
+a file fails it too. Requiring both is what keeps precision high.
+
+**legacy pi** (`~/.pi`) predates the `session_exit` marker entirely -- zero of
+its files carry one -- so it is treated as untellable and scored heuristically.
+
+Usage:
+    cg-recover                     sessions open at the last boot
+    cg-recover --since <iso>       widen the window
+    cg-recover --resume            print resume commands only
+    cg-recover --json              machine-readable
+    cg-recover --all-open          every never-closed session, not just the crash
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+
+
+def boot_time():
+    """Epoch of the current boot. `uptime -s` is local time, no timezone."""
+    try:
+        out = subprocess.run(["uptime", "-s"], capture_output=True, text=True).stdout.strip()
+        return dt.datetime.strptime(out, "%Y-%m-%d %H:%M:%S").timestamp()
+    except Exception:
+        try:
+            with open("/proc/uptime") as fh:
+                return dt.datetime.now().timestamp() - float(fh.read().split()[0])
+        except Exception:
+            return 0.0
+
+
+def tail_json(path, probe=8):
+    """Last parseable JSON record, and the last few, without reading the file twice."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            lines = [l for l in fh if l.strip()]
+    except OSError:
+        return None, []
+    recs = []
+    for l in lines[-probe:]:
+        try:
+            recs.append(json.loads(l))
+        except ValueError:
+            pass
+    return (recs[-1] if recs else None), recs
+
+
+def first_last_user_text(path, limit=400):
+    """First and last human-authored message, for identifying the window."""
+    first = last = None
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if '"user"' not in line and "'user'" not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                msg = d.get("message") or d
+                if (msg.get("role") or d.get("type")) != "user":
+                    continue
+                c = msg.get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if not isinstance(c, str):
+                    continue
+                t = " ".join(c.split())
+                if len(t) < 8 or t.startswith("<"):
+                    continue
+                if first is None:
+                    first = t[:limit]
+                last = t[:limit]
+    except OSError:
+        pass
+    return first, last
+
+
+def unfinished_turn(recs):
+    """True when the transcript stops mid-work.
+
+    A tool_use with no following tool_result, or a user turn with no assistant
+    reply. This is the only structural difference between a transcript that
+    ended and one that was cut off, for harnesses with no terminal record.
+    """
+    if not recs:
+        return False
+    saw_tool_use = False
+    for r in recs:
+        msg = r.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "tool_use":
+                    saw_tool_use = True
+                elif c.get("type") == "tool_result":
+                    saw_tool_use = False
+    if saw_tool_use:
+        return True
+    last = recs[-1]
+    role = (last.get("message") or {}).get("role") or last.get("type")
+    return role == "user"
+
+
+# ── per-harness scanners ────────────────────────────────────────────────
+
+def scan_omp(cutoff, store, harness):
+    """Definitive: final record is `custom/session_exit`, or the session was open.
+
+    Only `<cwd-slug>/<ts>_<uuid>.jsonl` is a session. The store also holds
+    `<cwd-slug>/<ts>_<uuid>/<AgentName>.jsonl` — transcripts of subagents the
+    session spawned. Those never carry a `session_exit` of their own, so counting
+    them would report every worker a session ever launched as a window open at
+    the crash. They are attributed to the parent instead.
+    """
+    out = []
+    base = os.path.expanduser(store)
+    if not os.path.isdir(base):
+        return out
+    for root, _dirs, files in os.walk(base):
+        depth = os.path.relpath(root, base).count(os.sep)
+        if depth != 0:
+            continue  # deeper than <cwd-slug>/ is a subagent directory
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            last, _ = tail_json(p, probe=2)
+            if last is None:
+                continue
+            if last.get("customType") == "session_exit" or mtime < cutoff:
+                continue
+            first_u, last_u = first_last_user_text(p)
+            sid = fn.split("_", 1)[-1].replace(".jsonl", "")
+            subs = 0
+            sub_dir = os.path.join(root, fn[:-6])
+            if os.path.isdir(sub_dir):
+                subs = len([x for x in os.listdir(sub_dir) if x.endswith(".jsonl")])
+            out.append({
+                "harness": harness, "session": sid, "path": p,
+                "cwd": os.path.basename(root), "last_write": mtime,
+                "evidence": "no session_exit record (definitive)"
+                            + (f"; spawned {subs} subagent(s)" if subs else ""),
+                "confidence": "definitive",
+                "first_user": first_u, "last_user": last_u,
+                "resume": f"omp -r {sid.split('-')[0]}",
+            })
+    return out
+
+
+def scan_pi(cutoff):
+    """Legacy store: the marker does not exist here, so heuristic only."""
+    out = []
+    base = os.path.expanduser("~/.pi/agent/sessions")
+    if not os.path.isdir(base):
+        return out
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            _, recs = tail_json(p)
+            first_u, last_u = first_last_user_text(p)
+            out.append({
+                "harness": "pi (legacy)", "session": fn.replace(".jsonl", ""),
+                "path": p, "cwd": os.path.basename(root), "last_write": mtime,
+                "evidence": "store predates session_exit; mtime in pre-boot gap",
+                "confidence": "heuristic",
+                "first_user": first_u, "last_user": last_u,
+                "resume": f"pi -r {fn.split('_', 1)[-1].replace('.jsonl','').split('-')[0]}",
+            })
+    return out
+
+
+def scan_hermes(cutoff, all_open=False):
+    """Definitive: `ended_at IS NULL` means the session never closed."""
+    out = []
+    p = os.path.expanduser("~/.hermes/state.db")
+    if not os.path.exists(p):
+        return out
+    try:
+        db = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        rows = db.execute(
+            "SELECT id, model, started_at, message_count FROM sessions "
+            "WHERE ended_at IS NULL AND id NOT LIKE 'cron_%' ORDER BY started_at DESC"
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for sid, model, started, count in rows:
+        # started_at bounds it: a session cannot have been open at a boot it
+        # began after. Without an end time this is the only timestamp there is.
+        if not all_open and (started or 0) < cutoff - 30 * 86400:
+            continue
+        out.append({
+            "harness": "hermes", "session": sid, "path": p,
+            "cwd": "", "last_write": started or 0,
+            "evidence": "ended_at IS NULL, no end_reason (definitive)",
+            "confidence": "definitive",
+            "first_user": f"model={model} messages={count}", "last_user": None,
+            "resume": f"hermes --resume {sid}",
+        })
+    return out
+
+
+def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
+    """claude / codex: no terminal record, so require two agreeing signals."""
+    out = []
+    base = os.path.expanduser(store)
+    if not os.path.isdir(base):
+        return out
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            if not re.match(pattern, fn):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            if mtime < cutoff:
+                continue
+            _, recs = tail_json(p)
+            if not unfinished_turn(recs):
+                continue  # stopped cleanly between turns — not evidence of a crash
+            first_u, last_u = first_last_user_text(p)
+            sid = re.sub(r"\.jsonl$", "", fn)
+            out.append({
+                "harness": harness, "session": sid, "path": p,
+                "cwd": os.path.basename(root), "last_write": mtime,
+                "evidence": "unfinished turn + write in pre-boot gap (2 signals)",
+                "confidence": "heuristic",
+                "first_user": first_u, "last_user": last_u,
+                "resume": resume_fmt.format(id=sid, path=p),
+            })
+    return out
+
+
+def collect(cutoff, all_open=False):
+    found = []
+    found += scan_omp(cutoff, "~/.omp/agent/sessions", "omp")
+    found += scan_pi(cutoff)
+    found += scan_hermes(cutoff, all_open)
+    found += scan_transcript_only(
+        cutoff, "~/.claude/projects", "claude code", r"^[0-9a-f-]{36}\.jsonl$",
+        "claude --resume {id}")
+    found += scan_transcript_only(
+        cutoff, "~/.codex/sessions", "codex", r"^rollout-.*\.jsonl$",
+        "codex resume {id}")
+    found.sort(key=lambda r: -(r["last_write"] or 0))
+    return found
+
+
+def render(found, boot, cutoff, show_resume):
+    ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%Y-%m-%d %H:%M") if e else "?"
+    print(f"boot {ts(boot)} · looking for sessions last written before it\n")
+    if not found:
+        print("  no sessions appear to have been open at the last shutdown")
+        return
+    definitive = [r for r in found if r["confidence"] == "definitive"]
+    print(f"  {len(found)} session(s) open at shutdown "
+          f"({len(definitive)} definitive, {len(found)-len(definitive)} heuristic)\n")
+    for r in found:
+        mark = "!!" if r["confidence"] == "definitive" else " ?"
+        print(f"  {mark} {r['harness']:12s} {ts(r['last_write'])}  {r['session'][:38]}")
+        if r["cwd"]:
+            print(f"       cwd     {r['cwd']}")
+        print(f"       why     {r['evidence']}")
+        if r.get("first_user"):
+            print(f"       opened  {r['first_user'][:96]}")
+        if r.get("last_user"):
+            print(f"       last    {r['last_user'][:96]}")
+        if show_resume:
+            print(f"       resume  {r['resume']}")
+        print()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--since", help="ISO timestamp; default is the current boot")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--resume", action="store_true", help="print resume commands only")
+    ap.add_argument("--all-open", action="store_true",
+                    help="every never-closed session, not just the last crash")
+    args = ap.parse_args()
+
+    boot = boot_time()
+    if args.since:
+        try:
+            cutoff = dt.datetime.fromisoformat(args.since).timestamp()
+        except ValueError:
+            sys.stderr.write(f"cg-recover: cannot parse --since {args.since!r}\n")
+            return 2
+    else:
+        cutoff = 0 if args.all_open else boot - 7 * 86400
+
+    found = collect(cutoff if not args.all_open else 0, args.all_open)
+    if not args.all_open:
+        found = [r for r in found if (r["last_write"] or 0) < boot]
+
+    if args.json:
+        print(json.dumps(found, indent=1))
+    elif args.resume:
+        for r in found:
+            print(r["resume"])
+    else:
+        render(found, boot, cutoff, show_resume=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
