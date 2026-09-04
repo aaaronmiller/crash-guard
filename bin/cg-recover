@@ -337,7 +337,14 @@ def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
                 continue
             if mtime < cutoff:
                 continue
-            _, recs = tail_json(p)
+            last, recs = tail_json(p)
+            # `cg-session-end` (installed as a Claude SessionEnd hook) appends
+            # omp's marker on clean exit. Its presence is definitive; its
+            # absence is not, because every transcript written before the hook
+            # existed also lacks it. So the marker can only ever rule a session
+            # out, never in -- absence still has to earn its verdict below.
+            if last is not None and last.get("customType") == "session_exit":
+                continue
             if not unfinished_turn(recs):
                 continue  # stopped cleanly between turns — not evidence of a crash
             first_u, last_u = first_last_user_text(p)

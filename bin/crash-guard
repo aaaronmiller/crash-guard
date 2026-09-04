@@ -4293,6 +4293,86 @@ def cmd_analytics(args):
     return 0
 
 
+def _detector(name, *flags):
+    """Run one of the sibling detectors and return its parsed JSON.
+
+    They stay separate executables because they are separately testable and
+    each is useful alone, but `crash-guard` is the one command a user runs.
+    Shelling out rather than importing keeps that seam honest: the detectors
+    own their own CLIs and this only depends on their JSON, so neither can
+    break the other by refactoring internals.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    if not os.path.exists(path):
+        return None
+    try:
+        out = subprocess.run([sys.executable, path, "--json", *flags],
+                             capture_output=True, text=True, timeout=300)
+        return json.loads(out.stdout) if out.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def cmd_recover(args):
+    """Marker-based recovery, with an optional cross-check against cg-forensic.
+
+    Two detectors exist because they answer the question differently: cg-recover
+    reads the close markers omp and hermes actually write, cg-forensic infers a
+    crash from mtimes and startup residue. --compare runs both so a disagreement
+    is visible instead of a matter of which command you happened to type.
+    """
+    flags = []
+    if args.all_open:
+        flags.append("--all-open")
+    if args.restore:
+        flags.append("--restore")
+        if args.yes:
+            flags.append("--yes")
+
+    if args.restore or (not args.compare and not args.json):
+        # These are interactive/human-formatted; hand the terminal over.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cg-recover")
+        return subprocess.call([sys.executable, path, *flags])
+
+    marker = _detector("cg-recover", *flags) or []
+    if not args.compare:
+        print(json.dumps(marker, indent=1))
+        return 0
+
+    forensic = _detector("cg-forensic") or {}
+    fsessions = forensic.get("sessions") or []
+    # Compare on the transcript path -- the only identifier both detectors
+    # report. Session ids differ because one reads them from the store layout
+    # and the other from the file name.
+    mpaths = {r.get("path") for r in marker if r.get("path")}
+    fpaths = {r.get("path") for r in fsessions if r.get("path")}
+
+    print("crash-guard recover --compare\n")
+    print("  markers (cg-recover):  %d session(s)" % len(marker))
+    print("  forensic (cg-forensic): %d session(s)" % len(fsessions))
+    crash_at = forensic.get("crash_at")
+    if crash_at:
+        # cg-forensic reports this as an epoch float; show a readable time.
+        try:
+            crash_at = dt.datetime.fromtimestamp(
+                float(crash_at)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            pass
+        print("  forensic crash estimate: %s" % crash_at)
+    print()
+    for label, paths in (("both agree", mpaths & fpaths),
+                         ("markers only", mpaths - fpaths),
+                         ("forensic only", fpaths - mpaths)):
+        print("  %s: %d" % (label, len(paths)))
+        for p_ in sorted(paths):
+            print("      %s" % p_)
+    if fpaths - mpaths:
+        print("\n  forensic-only results are worth checking by hand: a session"
+              "\n  carrying a session_exit record closed cleanly no matter how"
+              "\n  close to the crash it was last written.")
+    return 0
+
+
 def main():
     # Handle --version at the top level before argparse touches subparsers
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
@@ -4457,6 +4537,19 @@ def main():
 
     s = sub.add_parser("genid", help="alias for uuid (deprecated)")
     s.set_defaults(func=cmd_uuid)
+
+    s = sub.add_parser("recover",
+                       help="find sessions open at the last crash (marker-based)")
+    s.add_argument("--restore", action="store_true",
+                   help="reopen them in tmux, each in its recorded directory")
+    s.add_argument("--yes", action="store_true",
+                   help="with --restore, reopen everything without asking")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--all-open", action="store_true",
+                   help="every never-closed session, not just the last crash")
+    s.add_argument("--compare", action="store_true",
+                   help="run both detectors and report where they disagree")
+    s.set_defaults(func=cmd_recover)
 
     args = p.parse_args()
     # strip a leading "--" left in REMAINDER for start

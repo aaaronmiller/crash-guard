@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-09-04 00:00:00 PT
+# ---
+"""Append a close marker to a Claude Code transcript on clean exit.
+
+Claude Code writes no terminal record. Its transcript simply stops, so a clean
+`/exit` and a power cut are indistinguishable by record type -- which is why
+`cg-recover` has to fall back to a two-signal heuristic for claude and codex
+while omp and hermes get a definitive answer.
+
+Claude Code does fire a `SessionEnd` hook event on clean shutdown, and a crash
+by definition fires nothing. Writing one record from that hook is therefore
+enough to give claude the same native tell omp already has: the record's
+presence means the session ended on purpose.
+
+Installed as a SessionEnd hook, it receives the event as JSON on stdin:
+
+    {"session_id": ..., "transcript_path": ..., "cwd": ..., "reason": ...}
+
+and appends to `transcript_path`:
+
+    {"type":"custom","customType":"session_exit","reason":...,"timestamp":...}
+
+`customType` deliberately matches omp's marker so one scanner handles both.
+
+This must never break a shutdown. Every failure path exits 0 -- a transcript
+that cannot be appended to costs a heuristic fallback for that one session,
+which is exactly where claude already was.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import sys
+
+
+def main():
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        return 0
+    if not raw.strip():
+        return 0
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return 0
+
+    path = event.get("transcript_path")
+    if not isinstance(path, str) or not path:
+        return 0
+    path = os.path.expanduser(path)
+    # Only append to a transcript that already exists. Creating one would
+    # invent a session file for a session that never wrote anything, and
+    # cg-recover would then have to reason about a file with a close marker
+    # and no content.
+    if not os.path.isfile(path):
+        return 0
+
+    record = {
+        "type": "custom",
+        "customType": "session_exit",
+        "source": "cg-session-end",
+        "reason": event.get("reason") or "unknown",
+        "sessionId": event.get("session_id"),
+        "cwd": event.get("cwd"),
+        "timestamp": dt.datetime.now().astimezone().isoformat(),
+    }
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        # A hook that raises on shutdown is worse than a missing marker.
+        sys.exit(0)

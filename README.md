@@ -34,16 +34,72 @@ It is not a PTY recorder. It stores enough metadata to relaunch the right
 continue/resume command in the right working directory, through the same
 captured non-secret proxy-routing environment.
 
+## Two ways to find a lost session
+
+Crash-guard answers "what was open when the machine died?" twice, because the
+harnesses fall into two groups.
+
+**Markers.** omp ends a clean session with a final
+`{"type":"custom","customType":"session_exit"}` record, and hermes sets
+`ended_at` + `end_reason` in `~/.hermes/state.db`. For those the answer is a
+fact: the marker is there or it isn't. Claude Code gains the same tell once
+`bin/cg-session-end` is installed as a `SessionEnd` hook (see below). Codex and
+legacy `~/.pi` write no terminal record at all, so they fall back to requiring
+two signals — a last write inside the pre-boot gap *and* an unfinished final
+turn (a `tool_use` with no `tool_result`, or a user turn with no reply).
+
+**Sentinels.** The original design writes a sentinel when a session starts,
+via `cg_run`. It captures richer relaunch metadata, but only for sessions
+started through the wrapper.
+
+They disagree sometimes, and that is worth seeing rather than guessing at:
+
+```bash
+crash-guard recover              # marker-based, the usual answer
+crash-guard recover --restore    # reopen chosen sessions in tmux, in their own dirs
+crash-guard recover --compare    # run both detectors, show where they differ
+```
+
+A session that carries a `session_exit` record closed cleanly no matter how
+close to the crash it was last written — which is exactly the case where
+mtime-proximity scoring gets it wrong.
+
 ## Repository Layout
 
 ```text
-bin/crash-guard       executable Python tool
-shell/crash-guard.sh  shell integration: cg_run, cgr, cgs, cgh
-scripts/install.sh    install files only; does not edit shell rc files
-README.md             setup and operating guide
-CHANGELOG.md          project changes
-LICENSE               MIT license
+bin/crash-guard        the command. Session ledger, restore, and `recover`
+bin/cg-recover         marker-based detection; `crash-guard recover` runs this
+bin/cg-forensic        inferential detection, for the harnesses with no marker
+bin/cg-session-end     SessionEnd hook that gives Claude Code a close marker
+bin/cg-snapshot        periodic liveness snapshots of running sessions
+bin/cg-correlate       reconciles shell history, session logs and snapshots
+bin/cg-harness-monitor samples memory use per harness over time
+shell/crash-guard.sh   shell integration: cg_run, cgr, cgs, cgh
+scripts/install.sh     install files only; does not edit shell rc files
+README.md              setup and operating guide
+CHANGELOG.md           project changes
+LICENSE                MIT license
 ```
+
+### Giving Claude Code a close marker
+
+Claude writes no terminal record, so a clean `/exit` and a power cut look
+identical. It does fire a `SessionEnd` hook on clean shutdown, and a crash
+fires nothing — so one record from that hook is enough. Add to
+`~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "SessionEnd": [
+    { "hooks": [ { "type": "command",
+                   "command": "/path/to/crash-guard/bin/cg-session-end" } ] }
+  ]
+}
+```
+
+The marker only ever rules a session *out*: transcripts written before the hook
+existed have no marker either, so its absence still has to earn its verdict
+through the two-signal heuristic.
 
 ## Agent Install Guide
 
