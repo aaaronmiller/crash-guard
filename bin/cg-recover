@@ -43,8 +43,18 @@ a file fails it too. Requiring both is what keeps precision high.
 **legacy pi** (`~/.pi`) predates the `session_exit` marker entirely -- zero of
 its files carry one -- so it is treated as untellable and scored heuristically.
 
+## Reopening them in the right place
+
+Every live harness records its own working directory -- omp as `cwd` on its
+`session` record, hermes in `sessions.cwd`, claude on ordinary records -- so
+restoring a session to the folder it was running in is a lookup, not a guess.
+`--restore` reads that field and opens each chosen session in its own tmux
+window, already `cd`'d there.
+
 Usage:
     cg-recover                     sessions open at the last boot
+    cg-recover --restore           pick from the list and reopen them in tmux
+    cg-recover --restore --yes     reopen all of them, no prompt
     cg-recover --since <iso>       widen the window
     cg-recover --resume            print resume commands only
     cg-recover --json              machine-readable
@@ -57,6 +67,8 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -91,6 +103,40 @@ def tail_json(path, probe=8):
         except ValueError:
             pass
     return (recs[-1] if recs else None), recs
+
+
+def head_json(path, n=6):
+    """First few parseable records. Harnesses put session metadata at the top."""
+    recs = []
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                if i >= n:
+                    break
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return recs
+
+
+def recorded_cwd(path, n=6):
+    """The directory the session was actually running in, per its own log.
+
+    Every live harness writes this down, so there is nothing to reconstruct:
+    omp emits `{"type":"session", ..., "cwd": ...}` as its second record, and
+    claude puts `cwd` on ordinary records. Deriving it from the store's
+    `<cwd-slug>` directory name instead would be guesswork -- the slug replaces
+    every `/` with `-`, so `-code-crash-guard` is equally `/code/crash/guard`
+    and `/code/crash-guard`, and only one of those exists.
+    """
+    for d in head_json(path, n):
+        cwd = d.get("cwd")
+        if isinstance(cwd, str) and cwd.startswith("/"):
+            return cwd
+    return None
 
 
 def first_last_user_text(path, limit=400):
@@ -192,7 +238,7 @@ def scan_omp(cutoff, store, harness):
                 subs = len([x for x in os.listdir(sub_dir) if x.endswith(".jsonl")])
             out.append({
                 "harness": harness, "session": sid, "path": p,
-                "cwd": os.path.basename(root), "last_write": mtime,
+                "cwd": recorded_cwd(p) or "", "last_write": mtime,
                 "evidence": "no session_exit record (definitive)"
                             + (f"; spawned {subs} subagent(s)" if subs else ""),
                 "confidence": "definitive",
@@ -238,22 +284,34 @@ def scan_hermes(cutoff, all_open=False):
     p = os.path.expanduser("~/.hermes/state.db")
     if not os.path.exists(p):
         return out
+    # `cwd` and `last_activity_at` are later additions to this table; a column
+    # this tool wants but an older db lacks should degrade the output, not
+    # empty it, so fall back to the columns that have always been there.
+    cols = "id, model, started_at, message_count, cwd, last_activity_at"
     try:
         db = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-        rows = db.execute(
-            "SELECT id, model, started_at, message_count FROM sessions "
-            "WHERE ended_at IS NULL AND id NOT LIKE 'cron_%' ORDER BY started_at DESC"
-        ).fetchall()
+        try:
+            rows = db.execute(
+                f"SELECT {cols} FROM sessions "
+                "WHERE ended_at IS NULL AND id NOT LIKE 'cron_%' ORDER BY started_at DESC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = [r + (None, None) for r in db.execute(
+                "SELECT id, model, started_at, message_count FROM sessions "
+                "WHERE ended_at IS NULL AND id NOT LIKE 'cron_%' ORDER BY started_at DESC"
+            ).fetchall()]
     except sqlite3.Error:
         return out
-    for sid, model, started, count in rows:
-        # started_at bounds it: a session cannot have been open at a boot it
-        # began after. Without an end time this is the only timestamp there is.
-        if not all_open and (started or 0) < cutoff - 30 * 86400:
+    for sid, model, started, count, cwd, last_act in rows:
+        # A session cannot have been open at a boot it began after. `ended_at`
+        # is null by definition here, so last_activity_at is the closest thing
+        # to a last-write time; started_at is the floor when even that is unset.
+        when = last_act or started or 0
+        if not all_open and when < cutoff - 30 * 86400:
             continue
         out.append({
             "harness": "hermes", "session": sid, "path": p,
-            "cwd": "", "last_write": started or 0,
+            "cwd": cwd or "", "last_write": when,
             "evidence": "ended_at IS NULL, no end_reason (definitive)",
             "confidence": "definitive",
             "first_user": f"model={model} messages={count}", "last_user": None,
@@ -286,7 +344,7 @@ def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
             sid = re.sub(r"\.jsonl$", "", fn)
             out.append({
                 "harness": harness, "session": sid, "path": p,
-                "cwd": os.path.basename(root), "last_write": mtime,
+                "cwd": recorded_cwd(p, n=40) or "", "last_write": mtime,
                 "evidence": "unfinished turn + write in pre-boot gap (2 signals)",
                 "confidence": "heuristic",
                 "first_user": first_u, "last_user": last_u,
@@ -308,6 +366,87 @@ def collect(cutoff, all_open=False):
         "codex resume {id}")
     found.sort(key=lambda r: -(r["last_write"] or 0))
     return found
+
+
+# ── restoring ───────────────────────────────────────────────────────────
+
+TMUX_SESSION = "recovered"
+
+
+def launch_command(r):
+    """The shell line that reopens one session where it was running.
+
+    `exec $SHELL` keeps the pane alive after the harness exits, so a session
+    that fails to resume leaves its error on screen instead of closing the
+    window before it can be read.
+    """
+    cwd = r.get("cwd") or HOME
+    return f"cd {shlex.quote(cwd)} && {r['resume']}; exec $SHELL"
+
+
+def restore(found, assume_yes=False):
+    """Reopen chosen sessions, each in its own tmux window in its own directory.
+
+    tmux rather than terminal windows: it works the same over SSH and inside
+    WSL where there may be no usable X display, it survives the terminal that
+    launched it, and it puts every recovered session in one place to attach to.
+    """
+    if not found:
+        print("nothing to restore")
+        return 0
+    if not shutil.which("tmux"):
+        print("tmux is not installed; run these by hand:\n")
+        for r in found:
+            print(f"  ({r['harness']})  {launch_command(r).rsplit(';', 1)[0]}")
+        return 1
+
+    chosen = found
+    if not assume_yes:
+        ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%m-%d %H:%M") if e else "?"
+        print(f"\n  {len(found)} session(s) open at shutdown\n")
+        for i, r in enumerate(found, 1):
+            print(f"  [{i}] {r['harness']:11s} {ts(r['last_write'])}  {r.get('cwd') or '?'}")
+            hint = r.get("last_user") or r.get("first_user") or ""
+            if hint:
+                print(f"      {hint[:88]}")
+        print()
+        try:
+            sel = input("  restore which? (1-%d, a=all, q=quit) " % len(found)).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if not sel or sel.lower().startswith("q"):
+            return 1
+        if not sel.lower().startswith("a"):
+            picked = []
+            for tok in re.split(r"[,\s]+", sel):
+                if tok.isdigit() and 1 <= int(tok) <= len(found):
+                    picked.append(found[int(tok) - 1])
+            if not picked:
+                print("  nothing selected")
+                return 1
+            chosen = picked
+
+    existing = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+                              capture_output=True).returncode == 0
+    for r in chosen:
+        cwd = r.get("cwd") or HOME
+        if not os.path.isdir(cwd):
+            print(f"  !! {r['harness']} {r['session'][:12]}: {cwd} no longer exists, "
+                  f"opening in $HOME")
+            cwd = HOME
+        name = f"{r['harness'].split()[0]}-{r['session'][:8]}"
+        cmd = launch_command({**r, "cwd": cwd})
+        if not existing:
+            subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION,
+                            "-n", name, "-c", cwd, cmd])
+            existing = True
+        else:
+            subprocess.run(["tmux", "new-window", "-t", TMUX_SESSION,
+                            "-n", name, "-c", cwd, cmd])
+        print(f"  -> {r['harness']:11s} {r['session'][:12]}  in {cwd}")
+    print(f"\n  attach with:  tmux attach -t {TMUX_SESSION}")
+    return 0
 
 
 def render(found, boot, cutoff, show_resume):
@@ -339,6 +478,10 @@ def main():
     ap.add_argument("--since", help="ISO timestamp; default is the current boot")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--resume", action="store_true", help="print resume commands only")
+    ap.add_argument("--restore", action="store_true",
+                    help="reopen sessions in tmux, each in its recorded directory")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --restore, reopen everything without asking")
     ap.add_argument("--all-open", action="store_true",
                     help="every never-closed session, not just the last crash")
     args = ap.parse_args()
@@ -357,6 +500,8 @@ def main():
     if not args.all_open:
         found = [r for r in found if (r["last_write"] or 0) < boot]
 
+    if args.restore:
+        return restore(found, assume_yes=args.yes)
     if args.json:
         print(json.dumps(found, indent=1))
     elif args.resume:
