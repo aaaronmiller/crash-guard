@@ -371,6 +371,11 @@ def collect(cutoff, all_open=False):
     found += scan_transcript_only(
         cutoff, "~/.codex/sessions", "codex", r"^rollout-.*\.jsonl$",
         "codex resume {id}")
+    # qwen writes claude's schema exactly -- uuid/parentUuid/sessionId/cwd/message
+    # per record -- so the same scanner reads it with no format work at all.
+    found += scan_transcript_only(
+        cutoff, "~/.qwen/projects", "qwen", r"^[0-9a-f-]{36}\.jsonl$",
+        "qwen --resume {id}")
     found.sort(key=lambda r: -(r["last_write"] or 0))
     return found
 

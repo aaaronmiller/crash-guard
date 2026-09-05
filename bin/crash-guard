@@ -3436,6 +3436,31 @@ def cmd_restore(args):
         msg = "no archived sessions to restore" if args.from_archive else "no sessions to restore"
         print("crash-guard: %s." % msg)
         if not args.from_archive:
+            # "No sentinels" and "nothing was running" are different facts, and
+            # reporting the first as if it were the second is how this command
+            # returned an empty list after a crash that had three sessions open.
+            # Sentinels only exist for what was launched through `cg_run`; the
+            # marker detector reads the harnesses' own stores and needs no
+            # wrapper, so it is the better answer whenever the ledger is empty.
+            found = _detector("cg-recover") or []
+            if found:
+                print()
+                print("  The ledger is empty -- nothing was launched through "
+                      "\033[1mcg_run\033[0m this boot.")
+                print("  Reading the harnesses' own close markers instead found "
+                      "\033[1m%d\033[0m session(s):" % len(found))
+                print()
+                for r in found:
+                    when = r.get("last_write") or 0
+                    stamp = (dt.datetime.fromtimestamp(when).strftime("%m-%d %H:%M")
+                             if when else "?")
+                    print("    %-8s %s  %s" % (r.get("harness", "?"), stamp,
+                                               r.get("cwd") or ""))
+                    if r.get("resume"):
+                        print("             %s" % r["resume"])
+                print()
+                print("  Restore them with: \033[1mcrash-guard recover --restore\033[0m")
+                return 0
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
             print("   \033[1m--all\033[0m to also reveal old prior-boot sessions auto-expired as stale,")
             print("   \033[1m--from-archive\033[0m for archived ones, or")
