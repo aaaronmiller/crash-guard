@@ -18,7 +18,16 @@ Thumbs.db
 *.tmp
 *.bak
 *.log
+
+# Per-tool local state that lives inside the checkout. `.claude/` was previously
+# only covered by a machine-global excludes file, so a fresh clone on another
+# machine would have offered to commit it; `.remember/` carries its own
+# self-ignoring .gitignore, and is listed here so that stays true if it doesn't.
+.claude/
+.remember/
+
+# Ralph loop scaffolding. The runner recreates this on every run, and the one
+# run this repo has seen recorded "status: timeout, progress=false" on all eight
+# iterations before being deleted -- worth ignoring rather than re-committing.
 .ralph-runner/
-maximum-iterations-*/
-staged-for-deletion/
 archive/

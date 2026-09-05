@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- **`crash-guard recover`** — one entry point for crash detection. Reads the close markers harnesses actually write (omp's `session_exit` record, hermes' `ended_at`/`end_reason` in `state.db`) instead of inferring a crash from file mtimes. `--restore` reopens chosen sessions in tmux, each in the directory it was running in, read from the session's own log rather than reconstructed from the store's `<cwd-slug>` directory name (which is ambiguous: `-code-crash-guard` is equally `/code/crash/guard` and `/code/crash-guard`).
+- **`crash-guard recover --compare`** — runs the marker and forensic detectors together and prints where they disagree, so the answer does not depend on which binary you happen to run. On the reference machine this surfaced a false positive: cg-forensic's sole result ("three converging signals, 5s before the crash") carries a `session_exit` record, so it had closed cleanly.
+- **`bin/cg-session-end`** — a Claude Code `SessionEnd` hook that appends omp's exact `session_exit` marker, giving Claude the same definitive tell. It can only rule a session *out*, never in, since transcripts written before the hook existed lack the marker too. Every failure path exits 0; a hook that raises on shutdown is worse than a missing marker.
+
+### Changed
+- README documented one of seven tools in `bin/`. It now covers all of them, states which harnesses each half of the system actually reaches, and names the six with no scanner yet (`qwen`, `gemini`, `opencode`, `kilo`, `jcode`, `agy`).
+- `.gitignore` now covers `.claude/` in-repo. It had been ignored only via a machine-global excludes file, so a fresh clone elsewhere would have offered to commit it.
+
+### Removed
+- `staged-for-deletion/` (17 `.pyc` and pytest-cache files staged by an earlier commit and never actually deleted), `archive/maximum-iterations-10-…/` and `.ralph-runner/` (a Ralph loop whose own summary records `status: timeout`, `progress=false` on all eight iterations and "No changed files recorded"). All three held zero git-tracked files. 6.3M → 5.1M.
+
 ### Fixed
 - **Ghostty spawn no longer reports false success on native Linux.** `ghostty_spawn` used the nonexistent `+new-window` CLI action and returned "ok" the instant `Popen` started, so a window that opened and immediately died was logged as `restore_ok`. Now spawns with plain `ghostty -e` (works in both single-instance and standalone modes) and verifies the child didn't exit non-zero before reporting success.
 - **Ghostty pre-flight was theater.** It probed `ghostty +list-windows` (not a real action), silently fell back to `--version`, and always "passed". Replaced with an honest `--version` liveness check.

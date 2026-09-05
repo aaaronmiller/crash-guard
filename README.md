@@ -26,13 +26,35 @@ tags: [wsl2, session-recovery, terminal, agentic-cli, crash-recovery, zsh]
 
 Crash-guard keeps a durable recovery ledger for agentic CLI / TUI sessions and
 restores them after WSL restarts, terminal crashes, or failed restore attempts.
-It tracks Claude, Codex, opencode, Hermes, pi, Kilo, ante, and wrapper-launched
-commands such as `rtk`/`xx`. The built-in program configs cover:
-`claude`, `codex`, `opencode`, `hermes`, `pi`, `kilo`, `ante`, `rtk`.
 
 It is not a PTY recorder. It stores enough metadata to relaunch the right
 continue/resume command in the right working directory, through the same
 captured non-secret proxy-routing environment.
+
+### What it covers
+
+The two halves cover different sets, and the difference matters when you are
+trying to work out why a session you remember having open was not reported.
+
+**Sentinels** (`cg_run`, the ledger) work for anything launched through the
+wrapper: `claude`, `codex`, `opencode`, `hermes`, `pi`, `kilo`, `ante`, `rtk`,
+and wrapper-launched commands such as `rtk`/`xx`. Anything started outside
+`cg_run` is invisible to this half, however it was installed.
+
+**Detection** (`crash-guard recover`) reads harness session stores directly and
+needs no wrapper, but only where a scanner exists:
+
+| harness | how it is decided |
+|---|---|
+| omp | definitive -- `session_exit` record |
+| hermes | definitive -- `ended_at` / `end_reason` in `state.db` |
+| claude code | definitive once `cg-session-end` is installed; heuristic before that |
+| codex | heuristic -- unfinished turn + write in the pre-boot gap |
+| pi (legacy `~/.pi`) | heuristic -- predates the `session_exit` marker |
+
+Not yet scanned: `qwen`, `gemini`, `opencode`, `kilo`, `jcode`, `agy`. Their
+session files exist and are readable; the scanners are simply not written, so
+those harnesses are covered only by the sentinel half.
 
 ## Two ways to find a lost session
 
