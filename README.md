@@ -51,10 +51,11 @@ needs no wrapper, but only where a scanner exists:
 | claude code | definitive once `cg-session-end` is installed; heuristic before that |
 | codex | heuristic -- unfinished turn + write in the pre-boot gap |
 | pi (legacy `~/.pi`) | heuristic -- predates the `session_exit` marker |
+| qwen | heuristic -- writes claude's schema, so the same scanner reads it |
 
-Not yet scanned: `qwen`, `gemini`, `opencode`, `kilo`, `jcode`, `agy`. Their
-session files exist and are readable; the scanners are simply not written, so
-those harnesses are covered only by the sentinel half.
+Not yet scanned: `gemini`, `opencode`, `kilo`, `jcode`, `agy`. Their session
+files exist and are readable; the scanners are simply not written, so those
+harnesses are covered only by the sentinel half.
 
 ## How recovery works
 
