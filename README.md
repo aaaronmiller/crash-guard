@@ -56,12 +56,11 @@ Not yet scanned: `qwen`, `gemini`, `opencode`, `kilo`, `jcode`, `agy`. Their
 session files exist and are readable; the scanners are simply not written, so
 those harnesses are covered only by the sentinel half.
 
-## Two ways to find a lost session
+## How recovery works
 
-Crash-guard answers "what was open when the machine died?" twice, because the
-harnesses fall into two groups.
+Recovery needs two different facts, and no single source has both.
 
-**Markers.** omp ends a clean session with a final
+**Which sessions were open — markers.** omp ends a clean session with a final
 `{"type":"custom","customType":"session_exit"}` record, and hermes sets
 `ended_at` + `end_reason` in `~/.hermes/state.db`. For those the answer is a
 fact: the marker is there or it isn't. Claude Code gains the same tell once
@@ -70,17 +69,35 @@ legacy `~/.pi` write no terminal record at all, so they fall back to requiring
 two signals — a last write inside the pre-boot gap *and* an unfinished final
 turn (a `tool_use` with no `tool_result`, or a user turn with no reply).
 
-**Sentinels.** The original design writes a sentinel when a session starts,
-via `cg_run`. It captures richer relaunch metadata, but only for sessions
-started through the wrapper.
+This half is complete and needs no instrumentation: it reads what the harness
+already wrote, so it sees sessions crash-guard never launched.
 
-They disagree sometimes, and that is worth seeing rather than guessing at:
+**How to bring one back — sentinels.** `cg_run` records the argv a session was
+launched with, including any wrapper (`rtk hermes`), and the proxy-routing
+environment the alias injected (`OPENAI_BASE_URL=...`). None of that is
+recoverable from a transcript. Resuming `hermes --resume <id>` without it
+reconnects to a *different backend* than the session was using and drops the
+wrapper's output filtering — the session comes back, but not the session you
+had.
+
+So they are not two implementations of the same thing, and not an A/B test.
+Markers find the sessions; sentinels say how to relaunch them faithfully. One
+command uses both:
 
 ```bash
-crash-guard recover              # marker-based, the usual answer
-crash-guard recover --restore    # reopen chosen sessions in tmux, in their own dirs
-crash-guard recover --compare    # run both detectors, show where they differ
+crash-guard recover              # every open session, from the markers
+crash-guard recover --restore    # reopen chosen ones in tmux, in their own dirs
+crash-guard recover --compare    # cross-check against the inferential detector
 ```
+
+A session with a matching sentinel is restored with its environment replayed
+and is labelled `launch  sentinel matched`. One without still restores — just
+with the plain resume command, which is what the harness itself would do.
+
+`crash-guard restore` (the `cgr` alias) drives the sentinel ledger directly.
+When that ledger is empty — nothing launched through `cg_run` this boot — it
+falls back to the markers rather than reporting nothing, because "no sentinels"
+and "nothing was running" are different facts.
 
 A session that carries a `session_exit` record closed cleanly no matter how
 close to the crash it was last written — which is exactly the case where

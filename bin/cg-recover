@@ -377,6 +377,70 @@ def collect(cutoff, all_open=False):
         cutoff, "~/.qwen/projects", "qwen", r"^[0-9a-f-]{36}\.jsonl$",
         "qwen --resume {id}")
     found.sort(key=lambda r: -(r["last_write"] or 0))
+    attach_sentinels(found, load_sentinels())
+    return found
+
+
+# ── sentinels ───────────────────────────────────────────────────────────
+
+SENTINEL_DIRS = ("~/.local/share/crash-guard/live",
+                 "~/.local/share/crash-guard/archive")
+
+
+def load_sentinels():
+    """Launch records written by `cg_run`, indexed by working directory.
+
+    Markers and sentinels answer different questions, which is why both exist.
+    A marker says *which* sessions were open -- completely, for anything the
+    harness wrote, with no instrumentation. A sentinel says *how* one was
+    launched: the argv including any wrapper (`rtk hermes`), and the
+    proxy-routing env the alias injected (`OPENAI_BASE_URL=...`).
+
+    Neither substitutes for the other. Resuming `hermes --resume <id>` without
+    that env reconnects to a different backend than the session was talking to,
+    and drops the wrapper's output filtering -- so the session comes back, but
+    not the session you had.
+    """
+    out = {}
+    for d in SENTINEL_DIRS:
+        base = os.path.expanduser(d)
+        if not os.path.isdir(base):
+            continue
+        for fn in os.listdir(base):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(base, fn), encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            cwd = rec.get("cwd")
+            if cwd:
+                out.setdefault(cwd, []).append(rec)
+    return out
+
+
+def attach_sentinels(found, sentinels):
+    """Enrich each detected session with its launch record, where one exists.
+
+    Matched on working directory, then on the harness name appearing in the
+    sentinel's argv or wrapper key -- a directory can hold sessions from
+    several harnesses, and relaunching one with another's command line would
+    be worse than having no sentinel at all.
+    """
+    for r in found:
+        cwd = r.get("cwd")
+        if not cwd:
+            continue
+        harness = (r.get("harness") or "").split()[0].lower()
+        for rec in sentinels.get(cwd, []):
+            hay = " ".join(rec.get("argv") or []) + " " + str(rec.get("key") or "")
+            if harness and harness not in hay.lower():
+                continue
+            r["launch_argv"] = rec.get("argv")
+            r["launch_env"] = rec.get("env") or {}
+            r["launch_key"] = rec.get("key")
+            break
     return found
 
 
@@ -388,12 +452,24 @@ TMUX_SESSION = "recovered"
 def launch_command(r):
     """The shell line that reopens one session where it was running.
 
+    When a sentinel matched, its env prefix is replayed so the session
+    reconnects through the same proxy chain it was using; without it the
+    harness would come back pointed at its default backend.
+
     `exec $SHELL` keeps the pane alive after the harness exits, so a session
     that fails to resume leaves its error on screen instead of closing the
     window before it can be read.
     """
     cwd = r.get("cwd") or HOME
-    return f"cd {shlex.quote(cwd)} && {r['resume']}; exec $SHELL"
+    prefix = ""
+    env = r.get("launch_env") or {}
+    if env:
+        # The proxy stack may not be running yet after a reboot; the shell
+        # function is defined by the user's rc file and is a no-op elsewhere.
+        prefix = ("command -v _proxy_stack_auto_start >/dev/null 2>&1 && "
+                  "_proxy_stack_auto_start; ")
+        prefix += " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items()) + " "
+    return f"cd {shlex.quote(cwd)} && {prefix}{r['resume']}; exec $SHELL"
 
 
 def restore(found, assume_yes=False):
@@ -480,6 +556,10 @@ def render(found, boot, cutoff, show_resume):
             print(f"       opened  {r['first_user'][:96]}")
         if r.get("last_user"):
             print(f"       last    {r['last_user'][:96]}")
+        if r.get("launch_env") or r.get("launch_argv"):
+            env = r.get("launch_env") or {}
+            detail = ", ".join(sorted(env)) if env else (r.get("launch_key") or "")
+            print(f"       launch  sentinel matched -- will replay {detail}")
         if show_resume:
             print(f"       resume  {r['resume']}")
         print()
