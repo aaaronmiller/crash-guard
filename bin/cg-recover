@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import glob
 import json
 import os
 import re
@@ -198,9 +199,38 @@ def unfinished_turn(recs):
     return role == "user"
 
 
+# ── harness registry ────────────────────────────────────────────────────
+#
+# Adding a harness should be a row, not a function. A store that does not exist
+# is skipped silently, so a harness can be registered before it is installed --
+# `omx` below is listed for exactly that reason and starts working the day its
+# directory appears.
+
+# Forks of the pi/omp core: `<store>/<cwd-slug>/<ts>_<uuid>.jsonl`, `cwd` on the
+# `session` record, and `custom/session_exit` as the close marker where the fork
+# is new enough to write one. Older forks simply never match the marker and fall
+# through to the mtime cutoff, which is the same treatment legacy `~/.pi` gets.
+PI_FAMILY = (
+    ("omp", "~/.omp/agent/sessions", "omp -r {short}"),
+    ("ante", "~/.ante/sessions", "ante -r {short}"),
+    ("omx", "~/.omx/agent/sessions", "omx -r {short}"),
+)
+
+# One JSON document per session rather than a JSONL transcript. These carry no
+# close marker at all, so they are judged purely on the mtime cutoff -- the
+# unfinished-turn test needs a record stream to look at, and there isn't one.
+#   (harness, glob, cwd field, id field, resume template)
+JSON_SESSION_STORES = (
+    ("jcode", "~/.jcode/sessions/session_*.json",
+     "working_dir", "id", "jcode --resume {id}"),
+    ("agy", "~/.gemini/tmp/*/chats/session-*.json",
+     None, "sessionId", "agy --resume {id}"),
+)
+
+
 # ── per-harness scanners ────────────────────────────────────────────────
 
-def scan_omp(cutoff, store, harness):
+def scan_omp(cutoff, store, harness, resume_fmt="omp -r {short}"):
     """Definitive: final record is `custom/session_exit`, or the session was open.
 
     Only `<cwd-slug>/<ts>_<uuid>.jsonl` is a session. The store also holds
@@ -243,8 +273,62 @@ def scan_omp(cutoff, store, harness):
                             + (f"; spawned {subs} subagent(s)" if subs else ""),
                 "confidence": "definitive",
                 "first_user": first_u, "last_user": last_u,
-                "resume": f"omp -r {sid.split('-')[0]}",
+                "resume": resume_fmt.format(short=sid.split("-")[0], id=sid),
             })
+    return out
+
+
+def scan_json_sessions(cutoff, harness, pattern, cwd_field, id_field, resume_fmt):
+    """A store that keeps one JSON document per session instead of a transcript.
+
+    There is no close marker and no record stream, so the only evidence is the
+    file's mtime against the boot cutoff. That is one signal, not two, so these
+    are reported as heuristic and will over-report a session that was closed
+    cleanly and simply never touched again.
+    """
+    out = []
+    for p in glob.glob(os.path.expanduser(pattern)):
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        sid = str(doc.get(id_field) or os.path.basename(p).rsplit(".", 1)[0])
+        cwd = doc.get(cwd_field) if cwd_field else None
+        # Messages are stored inline here; take the first and last human turn
+        # for the same "which window was this" identification the others get.
+        first_u = last_u = None
+        msgs = doc.get("messages")
+        if isinstance(msgs, list):
+            for msg in msgs:
+                if not isinstance(msg, dict) or msg.get("role") != "user":
+                    continue
+                c = msg.get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                if not isinstance(c, str) or len(c.strip()) < 8:
+                    continue
+                t = " ".join(c.split())[:400]
+                if first_u is None:
+                    first_u = t
+                last_u = t
+        out.append({
+            "harness": harness, "session": sid, "path": p,
+            "cwd": cwd if isinstance(cwd, str) and cwd.startswith("/") else "",
+            "last_write": mtime,
+            "evidence": "no close marker in this format; mtime in pre-boot gap",
+            "confidence": "heuristic",
+            "first_user": first_u, "last_user": last_u,
+            "resume": resume_fmt.format(id=sid),
+        })
     return out
 
 
@@ -362,7 +446,10 @@ def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
 
 def collect(cutoff, all_open=False):
     found = []
-    found += scan_omp(cutoff, "~/.omp/agent/sessions", "omp")
+    for harness, store, resume in PI_FAMILY:
+        found += scan_omp(cutoff, store, harness, resume)
+    for harness, pattern, cwd_f, id_f, resume in JSON_SESSION_STORES:
+        found += scan_json_sessions(cutoff, harness, pattern, cwd_f, id_f, resume)
     found += scan_pi(cutoff)
     found += scan_hermes(cutoff, all_open)
     found += scan_transcript_only(
