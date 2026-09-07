@@ -59,6 +59,9 @@ Usage:
     cg-recover --resume            print resume commands only
     cg-recover --json              machine-readable
     cg-recover --all-open          every never-closed session, not just the crash
+    cg-recover --history           group every never-closed session by the boot
+                                   that ended it, to mine past crashes for
+                                   work that was cut off
 """
 from __future__ import annotations
 
@@ -88,6 +91,35 @@ def boot_time():
                 return dt.datetime.now().timestamp() - float(fh.read().split()[0])
         except Exception:
             return 0.0
+
+
+def boot_history():
+    """Every boot start time `last reboot` knows about, oldest first.
+
+    wtmp survives in WSL, so the boot boundaries are real rather than inferred.
+    The oldest entry is where the log begins, not where the machine's history
+    begins -- so sessions older than it all appear to have died at that first
+    boundary. `--history` labels that bucket rather than ranking it, for that reason.
+    """
+    try:
+        out = subprocess.run(["last", "reboot"], capture_output=True,
+                             text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    year = dt.date.today().year
+    stamps = []
+    for line in out.splitlines():
+        m = re.search(r"(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+)", line)
+        if not m:
+            continue
+        for y in (year, year - 1):
+            try:
+                stamps.append(dt.datetime.strptime(
+                    f"{m.group(1)} {y}", "%a %b %d %H:%M %Y").timestamp())
+                break
+            except ValueError:
+                continue
+    return sorted(set(stamps))
 
 
 def tail_json(path, probe=8):
@@ -624,6 +656,43 @@ def restore(found, assume_yes=False):
     return 0
 
 
+def render_history(found, boots, top=12):
+    """Group never-closed sessions by the boot boundary that ended them.
+
+    A session that was never closed died at the first boot *after* its last
+    write. Sessions older than the wtmp window all attribute to its earliest
+    entry, which is an artefact of where the log starts rather than a single
+    catastrophic crash, so that bucket is labelled instead of ranked.
+    """
+    if not boots:
+        print("cg-recover: no boot history available (`last reboot` returned nothing)")
+        return
+    ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%Y-%m-%d %H:%M")
+    buckets, undated = {}, []
+    for r in found:
+        w = r.get("last_write") or 0
+        after = [b for b in boots if b > w]
+        (buckets.setdefault(after[0], []).append(r) if after else undated.append(r))
+
+    print(f"{len(boots)} boot boundaries, {ts(boots[0])} -> {ts(boots[-1])}")
+    print(f"{len(found)} never-closed session(s); "
+          f"{sum(len(v) for v in buckets.values())} attributable, "
+          f"{len(undated)} still open since the last boot\n")
+
+    ordered = sorted(buckets.items(), key=lambda kv: -len(kv[1]))
+    for b, rs in ordered[:top]:
+        tag = "  (everything older than the log -- not one crash)" if b == boots[0] else ""
+        print(f"  {ts(b)}  {len(rs):>3} session(s){tag}")
+        if b == boots[0]:
+            continue
+        for r in sorted(rs, key=lambda r: -(r.get("last_write") or 0))[:6]:
+            print(f"      {r['harness']:<12} {r.get('cwd') or '?'}")
+            hint = r.get("last_user") or r.get("first_user")
+            if hint:
+                print(f"        last: {hint[:88]}")
+        print()
+
+
 def render(found, boot, cutoff, show_resume):
     ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%Y-%m-%d %H:%M") if e else "?"
     print(f"boot {ts(boot)} · looking for sessions last written before it\n")
@@ -663,6 +732,8 @@ def main():
                     help="with --restore, reopen everything without asking")
     ap.add_argument("--all-open", action="store_true",
                     help="every never-closed session, not just the last crash")
+    ap.add_argument("--history", action="store_true",
+                    help="group every never-closed session by the boot that ended it")
     args = ap.parse_args()
 
     boot = boot_time()
@@ -679,6 +750,9 @@ def main():
     if not args.all_open:
         found = [r for r in found if (r["last_write"] or 0) < boot]
 
+    if args.history:
+        render_history(collect(0, all_open=True), boot_history())
+        return 0
     if args.restore:
         return restore(found, assume_yes=args.yes)
     if args.json:
