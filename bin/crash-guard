@@ -3459,8 +3459,17 @@ def cmd_restore(args):
                     if r.get("resume"):
                         print("             %s" % r["resume"])
                 print()
-                print("  Restore them with: \033[1mcrash-guard recover --restore\033[0m")
-                return 0
+                # Actually restore them. Printing the list and then naming a
+                # second, differently-spelled command is how `cgr` managed to
+                # be simultaneously correct and useless after a real crash:
+                # it knew the answer and made the user retype it elsewhere.
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "cg-recover")
+                flags = ["--restore"]
+                if args.yes or args.batch:
+                    flags.append("--yes")
+                print()
+                return subprocess.call([sys.executable, path, *flags])
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
             print("   \033[1m--all\033[0m to also reveal old prior-boot sessions auto-expired as stale,")
             print("   \033[1m--from-archive\033[0m for archived ones, or")
