@@ -29,9 +29,9 @@ one exists and falls back to the heuristic only where none does.
 
 ## Where no marker exists
 
-**claude code** and **codex** write no terminal record of any kind -- a
-transcript simply stops, and a clean `/exit` is indistinguishable from a power
-cut by record type. For those, two signals must agree:
+**codex** and legacy **pi** write no terminal record of any kind -- a transcript
+simply stops, and a clean exit is indistinguishable from a power cut by record
+type. For those, two signals must agree:
 
 1. the last write falls in the gap before the current boot, and
 2. the final turn is *unfinished* -- an assistant `tool_use` with no matching
@@ -40,8 +40,13 @@ cut by record type. For those, two signals must agree:
 An idle session that was closed cleanly fails (2); a background process touching
 a file fails it too. Requiring both is what keeps precision high.
 
-**legacy pi** (`~/.pi`) predates the `session_exit` marker entirely -- zero of
-its files carry one -- so it is treated as untellable and scored heuristically.
+**claude code** starts out in that group and graduates: installing
+`bin/cg-session-end` as a `SessionEnd` hook gives it omp's marker. From the
+first transcript that carries one, a *missing* marker on a later session is
+definitive rather than heuristic -- `marker_epoch()` calibrates that cutoff from
+the data instead of trusting a settings-file mtime, because transcripts written
+before the hook existed have no marker either and must not be misread as
+crashes.
 
 ## Reopening them in the right place
 
@@ -226,9 +231,50 @@ def unfinished_turn(recs):
                     saw_tool_use = False
     if saw_tool_use:
         return True
-    last = recs[-1]
-    role = (last.get("message") or {}).get("role") or last.get("type")
-    return role == "user"
+    # Find the last actual conversation turn. Claude Code interleaves records
+    # that are not turns at all -- `system`, `attachment`, `last-prompt`,
+    # `file-history-snapshot` -- and writes them *after* the final exchange.
+    # Reading recs[-1] blindly therefore inspects a `system` record and
+    # concludes the session ended cleanly, which is how a genuinely crashed
+    # session went unreported.
+    for r in reversed(recs):
+        role = (r.get("message") or {}).get("role")
+        if role in ("user", "assistant"):
+            return role == "user"
+    return False
+
+
+def marker_epoch(store, pattern):
+    """When a close-marker hook started working for this store, or None.
+
+    `cg-session-end` gives Claude Code the marker it otherwise lacks, but only
+    from the moment it was installed -- every transcript written before that
+    also has no marker, so absence cannot mean "crashed" for those.
+
+    Rather than trusting a settings-file mtime (which changes on any unrelated
+    edit), calibrate from the data: the oldest transcript that *does* carry a
+    marker is proof the hook was live by then. After that point, a missing
+    marker is evidence; before it, it is silence.
+    """
+    oldest = None
+    base = os.path.expanduser(store)
+    if not os.path.isdir(base):
+        return None
+    for root, _dirs, files in os.walk(base):
+        for fn in files:
+            if not re.match(pattern, fn):
+                continue
+            p = os.path.join(root, fn)
+            last, _ = tail_json(p, probe=2)
+            if last is None or last.get("customType") != "session_exit":
+                continue
+            try:
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            if oldest is None or mtime < oldest:
+                oldest = mtime
+    return oldest
 
 
 # ── harness registry ────────────────────────────────────────────────────
@@ -437,8 +483,10 @@ def scan_hermes(cutoff, all_open=False):
 
 
 def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
-    """claude / codex: no terminal record, so require two agreeing signals."""
+    """claude / codex: no terminal record, so require two agreeing signals
+    -- unless a close-marker hook is live, in which case absence is proof."""
     out = []
+    marker_since = marker_epoch(store, pattern)
     base = os.path.expanduser(store)
     if not os.path.isdir(base):
         return out
@@ -461,15 +509,22 @@ def scan_transcript_only(cutoff, store, harness, pattern, resume_fmt):
             # out, never in -- absence still has to earn its verdict below.
             if last is not None and last.get("customType") == "session_exit":
                 continue
-            if not unfinished_turn(recs):
+            # Once a close-marker hook is live for this store, a session
+            # written after it with no marker did not close cleanly -- that is
+            # a fact, not a heuristic, and it does not depend on guessing
+            # whether the final turn looks finished.
+            definitive = marker_since is not None and mtime > marker_since
+            if not definitive and not unfinished_turn(recs):
                 continue  # stopped cleanly between turns — not evidence of a crash
             first_u, last_u = first_last_user_text(p)
             sid = re.sub(r"\.jsonl$", "", fn)
             out.append({
                 "harness": harness, "session": sid, "path": p,
                 "cwd": recorded_cwd(p, n=40) or "", "last_write": mtime,
-                "evidence": "unfinished turn + write in pre-boot gap (2 signals)",
-                "confidence": "heuristic",
+                "evidence": ("no session_exit since the hook went live (definitive)"
+                             if definitive else
+                             "unfinished turn + write in pre-boot gap (2 signals)"),
+                "confidence": "definitive" if definitive else "heuristic",
                 "first_user": first_u, "last_user": last_u,
                 "resume": resume_fmt.format(id=sid, path=p),
             })
@@ -652,7 +707,20 @@ def restore(found, assume_yes=False):
             subprocess.run(["tmux", "new-window", "-t", TMUX_SESSION,
                             "-n", name, "-c", cwd, cmd])
         print(f"  -> {r['harness']:11s} {r['session'][:12]}  in {cwd}")
-    print(f"\n  attach with:  tmux attach -t {TMUX_SESSION}")
+
+    # Attach, rather than printing a third command to type. Restoring sessions
+    # and then leaving the user outside the tmux session holding them is the
+    # same mistake as printing a list and naming another command to act on it.
+    if os.environ.get("TMUX"):
+        # Already inside tmux -- attaching would nest. Switch instead.
+        print(f"\n  restored into tmux session '{TMUX_SESSION}'")
+        subprocess.call(["tmux", "switch-client", "-t", TMUX_SESSION])
+        return 0
+    if not sys.stdout.isatty():
+        print(f"\n  attach with:  tmux attach -t {TMUX_SESSION}")
+        return 0
+    print(f"\n  attaching to '{TMUX_SESSION}' -- detach with ctrl-b d")
+    os.execvp("tmux", ["tmux", "attach", "-t", TMUX_SESSION])
     return 0
 
 
