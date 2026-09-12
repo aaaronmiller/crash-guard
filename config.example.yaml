@@ -1,0 +1,81 @@
+# crash-guard configuration
+#
+# Copy to ~/.config/crash-guard/config.yaml and edit. Every value here is a
+# default -- delete any line you do not want to change and the built-in applies.
+# Nothing in this file is required for crash-guard to run.
+
+# ── Where harnesses keep their sessions ────────────────────────────────────
+#
+# Only set these if a harness lives somewhere non-standard on your machine.
+# A store that does not exist is skipped silently, so listing a harness you
+# have not installed costs nothing -- which is why `omx` is listed below
+# despite not being installed here. It starts working the day it appears.
+stores:
+  # pi/omp-family forks: <store>/<cwd-slug>/<ts>_<uuid>.jsonl, `cwd` on the
+  # session record, `custom/session_exit` as the close marker.
+  pi_family:
+    omp: ~/.omp/agent/sessions
+    ante: ~/.ante/sessions
+    omx: ~/.omx/agent/sessions
+
+  # One JSON document per session. No close marker and no record stream, so
+  # these are judged on mtime alone -- one signal, hence always heuristic.
+  json_sessions:
+    jcode: ~/.jcode/sessions/session_*.json
+    agy: ~/.gemini/tmp/*/chats/session-*.json
+
+  claude: ~/.claude/projects
+  codex: ~/.codex/sessions
+  qwen: ~/.qwen/projects
+  pi_legacy: ~/.pi/agent/sessions
+  hermes_db: ~/.hermes/state.db
+
+# ── Recovery behaviour ─────────────────────────────────────────────────────
+recover:
+  # How far back to look for sessions open at the last boot. Sessions older
+  # than this are ignored unless --all-open is passed.
+  lookback_days: 7
+
+  # tmux session name that `--restore` opens windows in.
+  tmux_session: recovered
+
+  # Attach to tmux after restoring instead of printing the attach command.
+  # Restoring sessions and leaving you outside the session holding them is
+  # the same mistake as listing them and naming another command.
+  attach_after_restore: true
+
+  # Replay each session's captured proxy/routing env when a sentinel matched.
+  # Without this a restored session reconnects to its harness's default
+  # backend rather than the proxy it was actually talking to.
+  replay_launch_env: true
+
+# ── Telemetry ──────────────────────────────────────────────────────────────
+telemetry:
+  enabled: true
+
+  # Where the collector writes. The dashboard reads from here.
+  data_dir: ~/.local/state/crash-guard/telemetry
+
+  # Keep this many days of collected snapshots. Crash history itself is
+  # reconstructed from harness stores on demand, so this is only the
+  # per-run record, not the source of truth.
+  retain_days: 90
+
+  # Rendered dashboard destination. Points into the Living Documents dossier
+  # so the page sits beside the project's other pages.
+  html_out: ~/LIVING_DOCUMENTS/projects/crash-guard/telemetry.html
+
+# ── Scheduling ─────────────────────────────────────────────────────────────
+#
+# Installed by `scripts/install-cron.sh`. Times are local.
+schedule:
+  # Daily collection: cheap, reads harness stores, writes one snapshot.
+  daily_collect: "07:30"
+
+  # Weekly rollup: regenerates the dashboard from all retained snapshots.
+  weekly_report: "Mon 08:00"
+
+  # cass reindex. Memory-bound rather than CPU-bound -- on a memory-capped
+  # machine run it when nothing else is, or offload it entirely. Set to null
+  # to disable if another machine owns rebuilds.
+  cass_reindex: "04:40"   # 04:00 is taken by the existing cronjobs digest+prune

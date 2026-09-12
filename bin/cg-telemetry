@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-09-12 00:00:00 PT
+# ---
+"""Collect crash telemetry, and render it.
+
+`collect` writes one snapshot per run: every session cg-recover can see, which
+boot boundary ended it, and whether its final turn was finished. `report`
+renders the accumulated snapshots as a single self-contained HTML page.
+
+The snapshots are not the source of truth. Crash history is reconstructed from
+the harness stores on demand, so a lost snapshot costs nothing but a gap in the
+chart -- which is why retention here is a convenience setting rather than a
+data-safety one.
+
+Usage:
+    cg-telemetry collect    write today's snapshot
+    cg-telemetry report     render the dashboard from all snapshots
+    cg-telemetry show       print the written summary to stdout
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
+                     "crash-guard", "telemetry")
+HTML_OUT = os.path.join(HOME, "LIVING_DOCUMENTS", "projects", "crash-guard",
+                        "telemetry.html")
+
+# One colour per harness, reused by both the chart and the written summary so a
+# row in the table and a band in the chart are recognisably the same thing.
+HARNESS_COLOUR = {
+    "omp": "#4c9aff", "hermes": "#c792ea", "claude code": "#f78c6c",
+    "codex": "#7fd1b9", "qwen": "#ffcb6b", "pi (legacy)": "#8c9eb3",
+    "jcode": "#f07178", "agy": "#89ddff", "ante": "#c3e88d",
+}
+FALLBACK_COLOUR = "#6b7a8f"
+
+
+def _load_recover():
+    """Import cg-recover as a module. It is a sibling script, not a package."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cg-recover")
+    loader = importlib.machinery.SourceFileLoader("cg_recover", path)
+    spec = importlib.util.spec_from_loader("cg_recover", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def collect(_args):
+    m = _load_recover()
+    sessions = m.collect(0, all_open=True)
+    boots = m.boot_history()
+
+    rows = []
+    for r in sessions:
+        when = r.get("last_write") or 0
+        after = [b for b in boots if b > when]
+        rows.append({
+            "harness": r.get("harness"),
+            "session": r.get("session"),
+            "cwd": r.get("cwd") or "",
+            "last_write": when,
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence"),
+            # The boot that ended it. None means it is still open since the
+            # most recent boot -- not yet a crash, just unfinished.
+            "died_at_boot": after[0] if after else None,
+            "first_user": (r.get("first_user") or "")[:300],
+            "last_user": (r.get("last_user") or "")[:300],
+            "has_launch_record": bool(r.get("launch_env") or r.get("launch_argv")),
+        })
+
+    snap = {
+        "generated_at": dt.datetime.now().astimezone().isoformat(),
+        "boot_boundaries": boots,
+        "oldest_boundary_is_log_start": bool(boots),
+        "sessions": rows,
+    }
+    os.makedirs(STATE, exist_ok=True)
+    out = os.path.join(STATE, dt.datetime.now().strftime("%Y-%m-%d") + ".json")
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump(snap, fh, indent=1)
+    print("wrote %s  (%d sessions, %d boot boundaries)"
+          % (out, len(rows), len(boots)))
+    return 0
+
+
+def _latest_snapshot():
+    if not os.path.isdir(STATE):
+        return None
+    snaps = sorted(f for f in os.listdir(STATE) if f.endswith(".json"))
+    if not snaps:
+        return None
+    with open(os.path.join(STATE, snaps[-1]), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _crash_table(snap):
+    """Crash events, harnesses affected, projects, completion at crash time."""
+    boots = snap.get("boot_boundaries") or []
+    oldest = boots[0] if boots else None
+    events = {}
+    for r in snap["sessions"]:
+        b = r.get("died_at_boot")
+        if b is None:
+            continue
+        events.setdefault(b, []).append(r)
+    # Drop the oldest bucket: everything predating the wtmp window attributes
+    # there, so it is a log artefact rather than one catastrophic crash.
+    return sorted(((b, rs) for b, rs in events.items() if b != oldest),
+                  key=lambda kv: -kv[0])
+
+
+def report(_args):
+    snap = _latest_snapshot()
+    if snap is None:
+        print("no snapshots yet -- run `cg-telemetry collect` first", file=sys.stderr)
+        return 1
+    events = _crash_table(snap)
+    ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%Y-%m-%d %H:%M")
+
+    harnesses = sorted({r["harness"] for r in snap["sessions"] if r["harness"]})
+    rowsH = []
+    for h in harnesses:
+        colour = HARNESS_COLOUR.get(h, FALLBACK_COLOUR)
+        cells = []
+        for b, rs in events:
+            mine = [r for r in rs if r["harness"] == h]
+            if not mine:
+                cells.append('<td class="e"></td>')
+                continue
+            # Size encodes how many sessions that harness lost at this crash;
+            # the hatch overlay marks any that were mid-turn when they died.
+            unfinished = any("unfinished" in (r.get("evidence") or "") for r in mine)
+            size = min(100, 30 + 18 * len(mine))
+            cls = "c hatched" if unfinished else "c"
+            tip = html.escape("; ".join(
+                (r["cwd"] or "?") + (" — " + r["last_user"][:70] if r["last_user"] else "")
+                for r in mine)[:400])
+            cells.append(
+                f'<td class="{cls}" title="{tip}">'
+                f'<span style="background:{colour};width:{size}%;height:{size}%"></span>'
+                f'<i>{len(mine)}</i></td>')
+        rowsH.append(
+            f'<tr><th><span class="dot" style="background:{colour}"></span>'
+            f'{html.escape(h)}</th>{"".join(cells)}</tr>')
+
+    head = "".join(f'<th class="v"><span>{ts(b)}</span></th>' for b, _ in events)
+
+    written = []
+    for b, rs in events:
+        projects = sorted({os.path.basename(r["cwd"]) or "?" for r in rs})
+        unfinished = [r for r in rs if "unfinished" in (r.get("evidence") or "")]
+        written.append(
+            f'<tr><td class="w">{ts(b)}</td>'
+            f'<td>{len(rs)}</td>'
+            f'<td>{html.escape(", ".join(sorted({r["harness"] for r in rs})))}</td>'
+            f'<td>{html.escape(", ".join(projects)[:120])}</td>'
+            f'<td>{len(unfinished)} mid-turn</td></tr>')
+
+    doc = f"""<!doctype html>
+<meta charset="utf-8"><title>crash-guard telemetry</title>
+<style>
+ :root{{color-scheme:light dark}}
+ body{{font:14px/1.5 ui-sans-serif,system-ui,sans-serif;margin:2rem;max-width:1200px}}
+ h1{{font-size:1.4rem;margin:0 0 .2rem}}
+ .sub{{opacity:.65;margin-bottom:2rem}}
+ .scroll{{overflow-x:auto}}
+ table{{border-collapse:collapse}}
+ th,td{{padding:2px 4px;font-size:12px}}
+ th.v span{{writing-mode:vertical-rl;transform:rotate(180deg);opacity:.7;font-weight:400}}
+ tbody th{{text-align:right;white-space:nowrap;font-weight:500;padding-right:.6rem}}
+ .dot{{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px}}
+ td.c,td.e{{width:34px;height:34px;position:relative;border:1px solid rgba(128,128,128,.15)}}
+ td.c span{{position:absolute;inset:0;margin:auto;border-radius:3px}}
+ td.c i{{position:absolute;inset:0;display:grid;place-items:center;
+        font-style:normal;font-size:10px;color:#000;mix-blend-mode:luminosity}}
+ td.hatched span{{background-image:repeating-linear-gradient(45deg,
+        rgba(0,0,0,.45) 0 2px,transparent 2px 5px)}}
+ table.w{{margin-top:2.5rem;width:100%}}
+ table.w th{{text-align:left;border-bottom:1px solid rgba(128,128,128,.35)}}
+ table.w td{{border-bottom:1px solid rgba(128,128,128,.15);font-size:13px}}
+ td.w{{white-space:nowrap;font-variant-numeric:tabular-nums}}
+ .legend{{margin-top:1.2rem;opacity:.7;font-size:12px}}
+</style>
+<h1>crash-guard telemetry</h1>
+<div class="sub">{len(events)} crash events &middot;
+ {len(snap['sessions'])} sessions tracked &middot;
+ generated {html.escape(snap['generated_at'][:16])}</div>
+
+<div class="scroll"><table>
+ <thead><tr><th></th>{head}</tr></thead>
+ <tbody>{"".join(rowsH)}</tbody>
+</table></div>
+<div class="legend">One row per harness, one column per crash. Square size is how
+ many sessions that harness lost; the number repeats it. Diagonal hatching marks
+ a crash where at least one session died <em>mid-turn</em> rather than between
+ turns. Hover a square for the projects and last prompts. The oldest boot
+ boundary is omitted: every session predating the wtmp window attributes there,
+ which is where the log starts, not a single catastrophic crash.</div>
+
+<table class="w">
+ <thead><tr><th>crash</th><th>sessions</th><th>harnesses</th>
+   <th>projects</th><th>completion at crash</th></tr></thead>
+ <tbody>{"".join(written)}</tbody>
+</table>
+"""
+    out = os.environ.get("CG_TELEMETRY_HTML", HTML_OUT)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+    print("wrote %s  (%d crash events, %d harnesses)" % (out, len(events), len(harnesses)))
+    return 0
+
+
+def show(_args):
+    snap = _latest_snapshot()
+    if snap is None:
+        print("no snapshots yet", file=sys.stderr)
+        return 1
+    ts = lambda e: dt.datetime.fromtimestamp(e).strftime("%Y-%m-%d %H:%M")
+    for b, rs in _crash_table(snap):
+        projects = sorted({os.path.basename(r["cwd"]) or "?" for r in rs})
+        print("%s  %2d session(s)  %s" % (
+            ts(b), len(rs), ", ".join(sorted({r["harness"] for r in rs}))))
+        print("    projects: %s" % ", ".join(projects)[:100])
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("collect").set_defaults(func=collect)
+    sub.add_parser("report").set_defaults(func=report)
+    sub.add_parser("show").set_defaults(func=show)
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
