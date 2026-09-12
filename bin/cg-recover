@@ -798,6 +798,9 @@ def main():
                     help="reopen sessions in tmux, each in its recorded directory")
     ap.add_argument("--yes", action="store_true",
                     help="with --restore, reopen everything without asking")
+    ap.add_argument("--only", default=None,
+                    help="with --restore, reopen only these session ids "
+                         "(comma-separated); lets a caller do the picking")
     ap.add_argument("--all-open", action="store_true",
                     help="every never-closed session, not just the last crash")
     ap.add_argument("--history", action="store_true",
@@ -822,6 +825,14 @@ def main():
         render_history(collect(0, all_open=True), boot_history())
         return 0
     if args.restore:
+        if args.only:
+            wanted = {x.strip() for x in args.only.split(",") if x.strip()}
+            # Match on a prefix so a caller can pass the short id it displayed
+            # rather than having to echo the full uuid back.
+            found = [r for r in found
+                     if any(r["session"].startswith(w) or w == r["session"]
+                            for w in wanted)]
+            return restore(found, assume_yes=True)
         return restore(found, assume_yes=args.yes)
     if args.json:
         print(json.dumps(found, indent=1))

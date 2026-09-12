@@ -3459,7 +3459,8 @@ def cmd_restore(args):
                     if r.get("resume"):
                         print("             %s" % r["resume"])
                 print()
-                # Actually restore them. Printing the list and then naming a
+                # Actually restore them, through the same arrow-key picker the
+                # sentinel path uses. Printing the list and then naming a
                 # second, differently-spelled command is how `cgr` managed to
                 # be simultaneously correct and useless after a real crash:
                 # it knew the answer and made the user retype it elsewhere.
@@ -3468,6 +3469,30 @@ def cmd_restore(args):
                 flags = ["--restore"]
                 if args.yes or args.batch:
                     flags.append("--yes")
+                else:
+                    items = []
+                    for r in found:
+                        when = r.get("last_write") or 0
+                        stamp = (dt.datetime.fromtimestamp(when).strftime("%m-%d %H:%M")
+                                 if when else "?")
+                        hint = (r.get("last_user") or r.get("first_user") or "")[:60]
+                        items.append({
+                            "key": "%s %s" % (r.get("harness", "?"), stamp),
+                            "cwd": r.get("cwd") or "?",
+                            "argv": None,
+                            "_history_status": hint,
+                        })
+                    try:
+                        picked = multi_select(items, "Select sessions to restore",
+                                              cfg=cfg)
+                    except (KeyboardInterrupt, EOFError):
+                        print("\naborted.")
+                        return 0
+                    if not picked:
+                        print("nothing selected.")
+                        return 0
+                    ids = ",".join(found[i]["session"] for i in picked)
+                    flags += ["--only", ids]
                 print()
                 return subprocess.call([sys.executable, path, *flags])
             print("  (try \033[1m--include-closed\033[0m for closed sessions,")
