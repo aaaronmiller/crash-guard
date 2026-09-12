@@ -785,7 +785,16 @@ def render(found, boot, cutoff, show_resume):
             detail = ", ".join(sorted(env)) if env else (r.get("launch_key") or "")
             print(f"       launch  sentinel matched -- will replay {detail}")
         if show_resume:
-            print(f"       resume  {r['resume']}")
+            # Print the `cd` too. Several harnesses scope resume to the current
+            # directory -- claude's `--resume` and `--continue` both look only
+            # at the session list for the cwd -- so a bare resume command
+            # copied out of this listing reports "no sessions found" from
+            # anywhere else, which looks like the session is gone.
+            cwd = r.get("cwd")
+            if cwd:
+                print(f"       resume  cd {shlex.quote(cwd)} && {r['resume']}")
+            else:
+                print(f"       resume  {r['resume']}")
         print()
 
 

@@ -3457,7 +3457,13 @@ def cmd_restore(args):
                     print("    %-8s %s  %s" % (r.get("harness", "?"), stamp,
                                                r.get("cwd") or ""))
                     if r.get("resume"):
-                        print("             %s" % r["resume"])
+                        # Include the cd: claude scopes --resume to the cwd,
+                        # so a bare resume line pasted elsewhere reports "no
+                        # sessions found" as though the session were lost.
+                        cwd = r.get("cwd")
+                        cmd = ("cd %s && %s" % (shlex.quote(cwd), r["resume"])
+                               if cwd else r["resume"])
+                        print("             %s" % cmd)
                 print()
                 # Actually restore them, through the same arrow-key picker the
                 # sentinel path uses. Printing the list and then naming a
