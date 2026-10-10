@@ -442,6 +442,48 @@ class CgrTests(unittest.TestCase):
         for f in (w.live, w.deaths, self.cg.STATE / "cgr-handled.json"):
             self.assertEqual(mode(f), 0o600, f.name)
 
+    def test_another_accounts_agents_are_neither_recorded_nor_trusted(self):
+        # Its argv is the other account's to choose (`claude --mcp-config=...`),
+        # and reopening it would run that as you.
+        shell = self.agent_in_a_terminal()
+        self.addCleanup(lambda: (os.killpg(shell, signal.SIGKILL), os.waitpid(shell, 0)))
+        agent = self.watched_agent(self.cg.Watcher(), shell)  # seen while it is ours
+        self.cg.ME = os.getuid() + 1                            # now it is someone else's
+        try:
+            w = self.cg.Watcher()
+            for _ in range(3):
+                w.scan()
+            self.assertNotIn(agent["pid"], w.agents)
+            self.assertNotIn("--fast", self.cg.running_words())
+        finally:
+            self.cg.ME = os.getuid()
+
+    def test_state_files_another_account_owns_are_not_read(self):
+        # A typed line in them is run as a shell command when reopened.
+        d = self.cg.watch_dir()
+        d.mkdir(parents=True)
+        rec = {"pid": 1, "ticks": "1", "started": self.prev + 100, "harness": "kilo",
+               "argv": ["kilo"], "cwd": "/k", "leader": 2, "leader_ticks": "1",
+               "boot": "old", "session": None, "typed": "kilo; touch /tmp/owned"}
+        (d / "live-old.json").write_text(json.dumps([rec]))
+        os.utime(d / "live-old.json", (self.crash, self.crash))
+        self.assertEqual(len(self.cg.collect()), 1)  # ours: read
+        self.cg.ME = os.getuid() + 1
+        try:
+            self.assertEqual(self.cg.collect(), [])
+        finally:
+            self.cg.ME = os.getuid()
+
+    def test_titles_and_commands_cannot_send_escape_sequences(self):
+        # Titles come from prompts and model-written thread names; an escape in
+        # one could rewrite the screen or the clipboard while you pick.
+        s = self.cg.session("codex", "t", "/p\x1b]0;x\x07", time.time(), "machine went down",
+                            "fix\x1b[2J\x1b]52;c;ZXZpbA==\x07 it\x9b")
+        s["typed"] = "codex -m y\x1b[8m"
+        for text in (self.cg.row(s), self.cg.tab_title(s), self.cg.runnable(s)):
+            self.assertFalse([c for c in text if ord(c) < 32 or 127 <= ord(c) < 160], repr(text))
+        self.assertIn("fix?[2J", self.cg.row(s))
+
     # -- reopening -----------------------------------------------------------
 
     def test_run_argv_carries_the_typed_line_and_keeps_a_shell_open(self):

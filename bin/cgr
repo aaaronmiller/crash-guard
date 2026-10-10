@@ -62,6 +62,7 @@ HOME = Path.home()
 STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "crash-guard"
 WTMP = Path("/var/log/wtmp")
 HZ = os.sysconf("SC_CLK_TCK")
+ME = os.getuid()
 
 # glibc x86_64 `struct utmp`, 384 bytes. ut_type 2 is BOOT_TIME; field 9 is tv_sec.
 UTMP = struct.Struct("hi32s4s32s256shhiii16s20s")
@@ -131,7 +132,7 @@ def boot_start():
     btime, boot_id = current_boot()
     path = watch_dir() / ("boot-%s" % boot_id)
     try:
-        return int(path.read_text()), boot_id
+        return int(read_own(path)), boot_id
     except (OSError, ValueError):
         pass
     try:
@@ -193,6 +194,24 @@ def proc_argv(pid):
 
 def alive(pid, ticks):
     return ticks is not None and proc_ticks(pid) == ticks
+
+
+def mine(pid):
+    """A process of this account. Another account chooses its own argv
+    (`claude --mcp-config=...`), and reopening it would run that as you."""
+    try:
+        return os.stat("/proc/%d" % int(pid)).st_uid == ME
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def read_own(path):
+    """A state file's text, only if this account owns it: a typed line in it
+    runs as a shell command when its session is reopened."""
+    with open(path) as fh:
+        if os.fstat(fh.fileno()).st_uid != ME:
+            raise OSError("%s: owned by another account" % path)
+        return fh.read()
 
 
 def harness_of(argv):
@@ -356,7 +375,7 @@ class Watcher:
         self.live = watch_dir() / ("live-%s.json" % self.boot)
         self.deaths = watch_dir() / "deaths.jsonl"
         try:  # what an earlier run saw at launch: dated then, not re-dated from an age
-            self.seen = {(r["pid"], r["ticks"]): r for r in json.loads(self.live.read_text())}
+            self.seen = {(r["pid"], r["ticks"]): r for r in json.loads(read_own(self.live))}
         except (OSError, ValueError, TypeError, KeyError):
             self.seen = {}
 
@@ -392,8 +411,8 @@ class Watcher:
 
     def consider(self, pid):
         st = proc_stat(pid)
-        if not st or st[2] == 0:
-            return None  # gone already, or no terminal: a daemon or a pipe
+        if not st or st[2] == 0 or not mine(pid):
+            return None  # gone already, no terminal (a daemon or a pipe), or not ours
         argv = proc_argv(pid)
         hit = harness_of(argv)
         if not hit:
@@ -485,12 +504,12 @@ def watched(boot_id, since):
         if f.stem[5:] == boot_id or mtime(f) < since:
             continue
         try:
-            recs = json.loads(f.read_text())
+            recs = json.loads(read_own(f))
         except (OSError, ValueError):
             continue
         out += [dict(r, how="machine went down", last=mtime(f)) for r in recs]
     try:
-        lines = (watch_dir() / "deaths.jsonl").read_text().splitlines()
+        lines = read_own(watch_dir() / "deaths.jsonl").splitlines()
     except OSError:
         lines = []
     for line in lines:
@@ -799,7 +818,7 @@ def running_words():
     records that: a resumed claude writes its pid file late."""
     words = set()
     for p in os.listdir("/proc"):
-        if p.isdigit():
+        if p.isdigit() and mine(p):  # another account could hide yours by naming them
             argv = proc_argv(int(p))
             if harness_of(argv):
                 words.update(argv)
@@ -809,7 +828,7 @@ def running_words():
 
 def load_handled():
     try:
-        return json.loads((STATE / "cgr-handled.json").read_text())
+        return json.loads(read_own(STATE / "cgr-handled.json"))
     except (OSError, ValueError):
         return {}
 
@@ -918,6 +937,16 @@ def command(s):
 
 # -- showing -----------------------------------------------------------------
 
+CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """Text safe for the terminal. Titles are prompts and model-written thread
+    names, so a control character in one is shown as '?', never sent as an
+    escape sequence."""
+    return CONTROL.sub(lambda m: " " if m.group() in "\t\n\r" else "?", str(text))
+
+
 def short_path(p):
     home = str(HOME)
     return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
@@ -925,8 +954,13 @@ def short_path(p):
 
 def row(s):
     when = time.strftime("%m-%d %H:%M", time.localtime(s["last"]))
-    return "%-8s  %-26s  %-11s  %-17s  %s" % (
-        s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"])
+    return clean("%-8s  %-26s  %-11s  %-17s  %s" % (
+        s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"]))
+
+
+def runnable(s):
+    """The line to paste to reopen a session by hand, as printed."""
+    return clean("cd %s && %s" % (shlex.quote(s["cwd"]), command(s)))
 
 
 def choose(items):
@@ -990,7 +1024,7 @@ def run_argv(s):
 
 
 def tab_title(s):
-    return "%s %s" % (s["harness"], short_path(s["cwd"]))
+    return clean("%s %s" % (s["harness"], short_path(s["cwd"])))
 
 
 def wezterm_window(cli):
@@ -1083,7 +1117,7 @@ def reopen(items):
     if left:
         print("run these yourself:" if how is None else "not reopened -- run these yourself:")
         for s in left:
-            print("  cd %s && %s" % (shlex.quote(s["cwd"]), command(s)))
+            print("  " + runnable(s))
     if done and how == "tmux session 'cgr'" and sys.stdout.isatty():
         os.execvp("tmux", ["tmux", "attach", "-t", "cgr"])
     return 0 if not left else 1
@@ -1116,7 +1150,7 @@ def main(argv=None):
         return 0
     if args.notify:
         if items:
-            names = ", ".join("%s %s" % (s["harness"], short_path(s["cwd"])) for s in items[:3])
+            names = ", ".join(tab_title(s) for s in items[:3])
             more = " and %d more" % (len(items) - 3) if len(items) > 3 else ""
             print("\033[33mcgr:\033[0m %d agent session%s died (%s%s) -- run \033[1mcgr\033[0m "
                   "to reopen" % (len(items), "" if len(items) == 1 else "s", names, more))
@@ -1139,7 +1173,7 @@ def main(argv=None):
         for s in items:
             print("  " + row(s)[:shutil.get_terminal_size((120, 20)).columns - 3])
             if args.list or args.dry_run or not interactive:
-                print("      cd %s && %s" % (shlex.quote(s["cwd"]), s["command"]))
+                print("      " + runnable(s))
         if args.list or args.dry_run:
             return 0
         if not args.yes:

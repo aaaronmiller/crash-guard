@@ -334,6 +334,12 @@ it is a tracked agent.
 
 `consider()` and `harness_of()` accept a process only when all of these hold:
 
+- **It belongs to this account** (`mine()`: the owner of `/proc/<pid>`).
+  Another account chooses its own argv, for example
+  `claude --mcp-config=/tmp/x.json`. If its process were recorded, picking it
+  would run that as you. `running_words()` applies the same rule, so another
+  account cannot hide your sessions by naming their ids. Added 2026-10-10
+  after an automated security review.
 - **It has a controlling terminal** (`tty_nr` is not 0). Daemons, pipes and
   background helpers have none. The same discriminator removed three false
   positives in the August snapshot work (two muse helpers, one Claude SDK
@@ -724,8 +730,16 @@ whole system.
     the tabs `cgr` opens: a tmux server it starts would create every file in
     those sessions owner-only. What remains: the files are plain text, and
     anything running as the same user can read them.
-12. **Single user.** The watcher can only read the cwd and environment of
-    processes owned by its own user.
+12. **Single user, enforced 2026-10-10.** The watcher could only read the cwd
+    and environment of its own account's processes, but it used to record
+    other accounts' agents from their argv alone. Such a record, picked in
+    `cgr`, would have run another account's flags as you. Now:
+    - `mine()` keeps only this account's processes;
+    - `read_own()` reads a state file only if this account owns it, so a
+      planted record with a crafted typed line is ignored;
+    - `clean()` shows control characters in titles and commands as `?`.
+
+    Pinned by three tests, each written first and failing.
 13. **WezTerm window choice** is a heuristic (the client with focus that was
     most recently active). With several windows and no focus data, a new
     window opens.
@@ -748,7 +762,7 @@ Use a throwaway directory, and never probe while a real crashed session is
 waiting to be restored.
 
 ```bash
-# 0. The suite: 30 cgr tests (4 against real processes in a pty), 66 in all
+# 0. The suite: 33 cgr tests (5 against real processes in a pty), 69 in all
 cd /home/cheta/code/crash-guard && python3 -m pytest tests/test_cgr.py -q && python3 -m pytest tests -q
 
 # 0b. Clock drift: btime now, the boot start cgr uses, and wtmp's stamp for this boot
@@ -832,7 +846,8 @@ In rough order of value against cost:
 
 All state is under `~/.local/state/crash-guard/` (or `$XDG_STATE_HOME`).
 Directories are `0700` and files `0600` (`private_dir()`,
-`write_private()`). Files are rewritten atomically (temp file, then
+`write_private()`), and `cgr` reads only files this account owns
+(`read_own()`). Files are rewritten atomically (temp file, then
 `os.replace`), except the append-only `deaths.jsonl`.
 
 | path | written by | read by | content |

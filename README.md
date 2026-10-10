@@ -248,6 +248,11 @@ arguments. The directories are owner-only (`0700`) and the files `0600`, the
 same rule the ledger's `history.jsonl` follows. Older files with looser modes
 are repaired when the watcher starts.
 
+**Other accounts.** The watcher records only your own processes, and `cgr`
+reads only state files you own. Titles and commands are printed with control
+characters shown as `?`, so a prompt or a model-written thread name cannot
+send escape sequences to your terminal.
+
 ## Troubleshooting `cgr`
 
 | symptom | cause and fix |
