@@ -260,6 +260,13 @@ class CgrTests(unittest.TestCase):
             time.sleep(0.1)
         self.fail("watcher never saw the agent")
 
+    def reap(self, shell):
+        try:
+            os.killpg(shell, signal.SIGKILL)
+            os.waitpid(shell, 0)
+        except (ProcessLookupError, ChildProcessError):
+            pass
+
     def deaths(self):
         try:
             text = (self.cg.watch_dir() / "deaths.jsonl").read_text()
@@ -483,6 +490,120 @@ class CgrTests(unittest.TestCase):
         for text in (self.cg.row(s), self.cg.tab_title(s), self.cg.runnable(s)):
             self.assertFalse([c for c in text if ord(c) < 32 or 127 <= ord(c) < 160], repr(text))
         self.assertIn("fix?[2J", self.cg.row(s))
+
+    # -- omp and command lines -----------------------------------------------
+
+    def omp_session(self, sid, records, when, cwd="/m"):
+        head = [{"type": "session", "id": sid, "cwd": cwd, "timestamp": "2026-10-01T10:00:00Z"}]
+        jsonl(self.home / ".omp" / "agent" / "sessions" / "-m" / ("2026_%s.jsonl" % sid),
+              head + records, when)
+
+    def test_omp_closed_by_a_signal_is_cut_off_and_dispose_is_not(self):
+        # omp writes session_exit on SIGHUP too, naming the signal (2026-09-12:
+        # five tabs at once); cgr took any session_exit for a deliberate one.
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        self.omp_session("hup", [say, exit_marker("sighup")], self.crash)
+        self.omp_session("bye", [say, exit_marker("dispose")], self.crash)
+        found = self.found()
+        self.assertEqual(found[("omp", "hup")]["how"], "window closed")
+        self.assertNotIn(("omp", "bye"), found)
+
+    def test_a_session_named_on_the_command_line_is_the_one_reopened(self):
+        # `codex resume <id>` ran that thread, whichever thread in its directory
+        # was touched last (2026-10-10: its own subagents were).
+        t = int(time.time())
+        self.codex_db([("named", "/p", "the work", t - 50, t - 9000, "cli", "user"),
+                       ("newer", "/p", "other", t - 5, t - 60, "cli", "user")], [])
+        rec = {"harness": "codex", "cwd": "/p", "started": t - 100, "last": t, "how": "x",
+               "argv": ["node", "/n/bin/codex", "-m", "y", "resume", "named"], "typed": None}
+        s = self.cg.resolve(rec, set(), set())
+        self.assertEqual((s["id"], s["title"]), ("named", "the work"))
+
+    # -- a planned restart (cgr --save) ----------------------------------------
+
+    def test_save_records_what_runs_and_lists_it_once_it_is_gone(self):
+        self.history([(time.time() - 1, "cgrtestagent --fast")])
+        shell = self.agent_in_a_terminal()
+        self.addCleanup(self.reap, shell)
+        self.watched_agent(self.cg.Watcher(), shell)  # wait until it runs
+        (s,) = [x for x in self.cg.save() if x["harness"] == "cgrtestagent"]
+        self.assertEqual((s["cwd"], s["typed"]), (str(self.home), "cgrtestagent --fast"))
+        self.assertEqual(os.stat(self.cg.saved_path()).st_mode & 0o777, 0o600)
+        self.assertEqual([x for x in self.cg.collect() if x["harness"] == "cgrtestagent"], [])
+        self.reap(shell)  # exited, closed or rebooted: all the same now
+        time.sleep(0.2)
+        (back,) = [x for x in self.cg.collect() if x["harness"] == "cgrtestagent"]
+        self.assertEqual((back["how"], self.cg.command(back)), ("saved", "cgrtestagent --fast"))
+        self.cg.mark_handled([back])
+        self.assertEqual([x for x in self.cg.collect() if x["harness"] == "cgrtestagent"], [])
+
+    def test_saved_sessions_from_the_boot_before_are_listed_by_id(self):
+        sessions = [dict(self.cg.session("codex", "t1", "/p", self.crash, "saved", "work"),
+                         pid=1, ticks="1", boot="old", typed="codex -m y")]
+        self.cg.private_dir(self.cg.STATE)
+        self.cg.saved_path().write_text(json.dumps({"saved": self.crash, "sessions": sessions}))
+        (s,) = self.cg.collect()
+        self.assertEqual((s["how"], self.cg.command(s)), ("saved", "codex -m y resume t1"))
+
+    # -- every session, in one database (cgr --history) ----------------------
+
+    def history_rows(self):
+        rows, failed = self.cg.build_index()
+        self.assertEqual(failed, set())
+        out = [dict(zip(self.cg.COLUMNS, t)) for t in self.cg.write_index(rows, failed)]
+        return {(r["harness"], r["id"]): r for r in out}
+
+    def test_turn_reads_every_harness_shape(self):
+        st = self.cg.step
+        self.assertEqual(self.cg.turn([st("assistant", [{"type": "tool_use"}]),
+                                       st("user", "fix it")]), (True, "fix it"))
+        self.assertEqual(self.cg.turn([st("assistant", [{"type": "text", "text": "done"}]),
+                                       st("user", "fix it")]), (False, "fix it"))
+        self.assertEqual(self.cg.turn([st("model", [{"functionCall": {}}])])[0], True)
+        self.assertEqual(self.cg.turn([st("user", [{"functionResponse": {}}])])[0], True)
+        self.assertEqual(self.cg.turn([st("assistant", [], "aborted")])[0], False)
+        self.assertEqual(self.cg.turn([st("assistant", [], "error")])[0], True)
+        self.assertEqual(self.cg.turn([st("user", "[Request interrupted by user]"),
+                                       st("user", "go")]), (False, "go"))
+        self.assertIsNone(st("user", "<command-name>/exit</command-name>"))
+
+    def test_history_flags_what_was_cut_off_or_left_mid_turn(self):
+        t = time.time() - 3600
+        call = {"type": "assistant", "message": {"role": "assistant",
+                                                 "content": [{"type": "tool_use"}]}}
+        self.transcript("closed", [prompt("one"), REPLY, exit_marker("prompt_input_exit")], t - 600)
+        self.transcript("nomark", [prompt("two"), call], t)   # newer than the first marker
+        self.transcript("hup", [prompt("three"), REPLY, exit_marker("other")], t)
+        self.transcript("sdk", [prompt("four", entry="sdk-cli"), call], t)
+        jdir = self.home / ".jcode" / "sessions"
+        jdir.mkdir(parents=True)
+        (jdir / "session_x.json").write_text(json.dumps({
+            "id": "jx", "working_dir": "/j", "status": {"Crashed": {"message": "exited"}},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "build"}]}]}))
+        rows = self.history_rows()
+        status = lambda k: (rows[k]["status"], rows[k]["how"])
+        self.assertEqual(status(("claude", "closed")), ("closed", "exit record: prompt_input_exit"))
+        self.assertEqual(status(("claude", "nomark")), ("cut off", "no end record"))
+        self.assertEqual(status(("claude", "hup")), ("cut off", "window closed"))
+        self.assertEqual(status(("jcode", "jx")), ("cut off", "status Crashed: exited"))
+        self.assertEqual((rows[("claude", "nomark")]["mid_turn"],
+                          rows[("claude", "nomark")]["last_prompt"]), (1, "two"))
+        self.assertEqual(rows[("claude", "nomark")]["resume"], "cd /w && claude --resume nomark")
+        self.assertEqual(rows[("claude", "sdk")]["interactive"], 0)
+        con = sqlite3.connect(str(self.cg.db_path()))
+        audit = {r[0] for r in con.execute("SELECT id FROM audit")}
+        con.close()
+        self.assertEqual(audit, {"nomark", "hup", "jx"})
+        self.assertEqual(os.stat(self.cg.db_path()).st_mode & 0o777, 0o600)
+
+    def test_history_keeps_a_session_its_harness_deleted(self):
+        self.transcript("gone", [prompt("hi"), REPLY, exit_marker("other")], time.time() - 60)
+        self.history_rows()
+        (self.home / ".claude" / "projects" / "-w" / "gone.jsonl").unlink()
+        self.transcript("other", [prompt("x"), REPLY], time.time() - 30)
+        r = self.history_rows()[("claude", "gone")]
+        self.assertEqual((r["in_store"], r["status"], r["title"]), (0, "cut off", "hi"))
 
     # -- reopening -----------------------------------------------------------
 

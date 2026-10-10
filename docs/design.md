@@ -16,7 +16,9 @@ follow the audit procedure in section 12. To change it, start from the known
 limits in section 11 and the backlog in section 13.
 
 Code references name functions in `bin/cgr` rather than line numbers, which
-drift. State as of 2026-10-09.
+drift. State as of 2026-10-10. Sections 16 and 17 (2026-10-10) cover the two
+later features: saving the running set before a planned restart, and the
+database of every session from every harness.
 
 Contents:
 
@@ -35,6 +37,8 @@ Contents:
 13. Improvement backlog
 14. Files and record formats
 15. Relationship to the rest of crash-guard
+16. A planned restart: `cgr --save`
+17. Every session in one database: `cgr --history`
 
 ## 1. What the user asked for
 
@@ -61,7 +65,21 @@ from June 2026.
 > occurred … and finally if I could use the cgr command and launch all 12
 > sessions that would be great."
 
-Those messages give eight goals. Section 10 and the traceability table in
+A fifth message, on 2026-10-10, asked for two more things (sections 16 and
+17):
+
+> "ok now whate i want is a flag that enables the system to proactively
+> record the current running harnessess so if i want ot do a restart , i can
+> easily shutodwn and get back to the current state) - also i want ot be able
+> ot use the heuristics we have to find historicla sessions which were crashed
+> or incomplete (it shuold create a master list of all sesions from all
+> harnesses, and flag those which were closed unexpectedly, so i cant then
+> audit thoses seessions and determine if there are unfished taskes associated
+> with said session - it should record as much in fo as possible in a
+> sdatabase (session id, folder, session harness type, date,/time , size (if
+> easy), etc."
+
+Those messages give ten goals. Section 10 and the traceability table in
 section 11 refer to them by number.
 
 | # | goal | source |
@@ -74,6 +92,8 @@ section 11 refer to them by number.
 | G6 | Reopen with the launch arguments originally used, taken from command history. | message 3 |
 | G7 | Stay simple: one command, pick, reopen. | messages 1 and 3 |
 | G8 | Each session comes back in its own directory, as the same conversation where possible, in a new tab. | standing goal, 2026-06-13 |
+| G9 | Before a planned restart, record what is running with one flag, so the same set comes back afterwards however it was shut down. | message 5 |
+| G10 | One database of every session from every harness, with id, folder, harness, times and size, flagging those that ended unexpectedly or were left unfinished, for audit. | message 5 |
 
 ## 2. Why the previous `cgr` failed
 
@@ -289,10 +309,21 @@ a teardown), so a closed codex window needs the watcher.
 
 ### 5.3 omp
 
-omp ends a cleanly closed transcript with `{"type":"custom",
-"customType":"session_exit"}`. A transcript under
+omp ends a transcript with `{"type":"custom", "customType":"session_exit",
+"reason": ...}` on every exit it gets to run. A transcript under
 `~/.omp/agent/sessions/*/` that was last written before this boot and has no
 such record after its last message is listed as **not closed** (`omp()`).
+
+**Fixed 2026-10-10.** omp also writes the record when a signal ends it, and
+names the signal: `sighup` when its window closed, `sigterm` when it was
+killed. `cgr` had read any `session_exit` as a deliberate exit, so a closed
+omp window was invisible without the watcher, and the watcher's own record
+for it could not be matched to its id. Of 129 transcripts on 2026-10-10, 82
+end `dispose` (a quit), 14 `sighup`, 5 `sigterm`, 1 `exit`, and 27 with no
+record. `CUT_EXITS` now maps `sighup` to "window closed" and `sigterm` to
+"killed" for omp and claude alike. Pinned by
+`test_omp_closed_by_a_signal_is_cut_off_and_dispose_is_not`, which fails on
+the previous code.
 
 ### 5.4 hermes
 
@@ -666,7 +697,9 @@ whole system.
 | G5 all harnesses | one detection rule for all; resume flags for 15 harnesses | opencode recorded through an alias (live); `HARNESSES` table from each `--help` | detection verified for codex, opencode, claude; others reasoned from the same rule |
 | G6 launch arguments from history | `typed_for()` at launch, dated by `btime` read then; `command()` rebuild | `codex -m gpt-6-sol` and `oc-direct` captured live; six `test_command_*` tests; the clock-drift defect of 2026-10-10 and its two tests (6.5) | verified, with limits 7 and 8 |
 | G7 simple | one command, a picker with everything ticked, Enter | `cgr --list` output checked against the 2026-10-09 crash. End to end on 2026-10-10: the VM died at 08:14:34; at 08:21:21 the user typed `cgr`, and at 08:21:33 it reopened all three sessions that were running (claude 65949efa, claude 9a3daff8, codex 01a1246e), each in its own directory, as the same conversation. One reopen carried a wrongly matched typed line (6.5) | verified |
-| G8 own directory, same conversation, new tab | cwd from `/proc` or the store; resume by id for four harnesses; four tab openers | `wezterm.exe cli spawn` into the WSL domain and `zsh -lic` alias expansion measured by hand; the openers have no automated test | exact conversation for claude, codex, omp, hermes; newest-in-directory for the rest |
+| G8 own directory, same conversation, new tab | cwd from `/proc` or the store; resume by id for four harnesses, plus any harness whose id is on the command line (`argv_id()`); four tab openers | `wezterm.exe cli spawn` into the WSL domain and `zsh -lic` alias expansion measured by hand; the openers have no automated test | exact conversation for claude, codex, omp, hermes; newest-in-directory for the rest |
+| G9 planned restart | `cgr --save` writes the running set with ids; `cgr` lists each once its process is gone (section 16) | 2026-10-10: four running sessions saved, each with its exact id (claude by pid file, codex by its command line, omp by its store); two tests, one against a real process in a pty | verified, not yet across a real restart |
+| G10 database of every session | `cgr --history` reads 11 harnesses' stores into `sessions.db`, with status, evidence, mid-turn and last prompt (section 17) | 2026-10-10: 1,455 sessions, 383 flagged; mid-turn verdicts spot-checked against raw transcripts for claude, gemini, pi and qwen; three tests | verified |
 
 ### Limits, each with its consequence and the next step
 
@@ -747,6 +780,8 @@ whole system.
     without the watcher, the boot's start is first read by the first `cgr`
     run of the boot, usually the login notice. If that comes hours late, the
     boundary carries the drift accumulated by then.
+15. **`cgr --save` and `cgr --history`** have their own limits, listed in
+    sections 16.4 and 17.7.
 
 ## 12. Audit procedure
 
@@ -762,7 +797,7 @@ Use a throwaway directory, and never probe while a real crashed session is
 waiting to be restored.
 
 ```bash
-# 0. The suite: 33 cgr tests (5 against real processes in a pty), 69 in all
+# 0. The suite: 40 cgr tests (6 against real processes in a pty), 76 in all
 cd /home/cheta/code/crash-guard && python3 -m pytest tests/test_cgr.py -q && python3 -m pytest tests -q
 
 # 0b. Clock drift: btime now, the boot start cgr uses, and wtmp's stamp for this boot
@@ -811,6 +846,17 @@ claude --help | grep -E -- '--resume|--continue'; codex --help | grep -E 'resume
 
 # 6. What cgr would do now, without doing it
 cgr --list; cgr --json | python3 -m json.tool | head -40
+
+# 7. cgr --save, without touching the real saved set: every running agent, each with an id
+XDG_STATE_HOME=$(mktemp -d) cgr --save
+
+# 8. The session database: rebuild it, then spot-check a mid-turn verdict by hand
+cgr --history
+sqlite3 -box ~/.local/state/crash-guard/sessions.db \
+  "SELECT harness, status, count(*), sum(mid_turn) FROM sessions GROUP BY 1, 2"
+p=$(sqlite3 ~/.local/state/crash-guard/sessions.db \
+  "SELECT path FROM sessions WHERE harness='claude' AND mid_turn=1 LIMIT 1")
+tail -3 "$p" | python3 -c "import sys,json; [print(json.loads(l).get('type'), str(json.loads(l).get('message',''))[:120]) for l in sys.stdin]"
 ```
 
 When a check disagrees with this document, the code and the measurement win.
@@ -822,11 +868,13 @@ Record the disagreement and the fix in the Living Documents dossier
 In rough order of value against cost:
 
 1. ~~Owner-only watcher state~~ (limit 11). Done 2026-10-09.
-2. **Session id readers for more harnesses** (limit 5). muse (the session
-   directory name is the id), agy (the conversation id is the presence-lock
-   filename), opencode and kilo (their SQLite stores), pi (its session log).
-   Each turns "newest in directory" into an exact resume. The `HARNESSES`
-   table already has the resume-by-id arguments.
+2. **Session id readers for more harnesses** (limit 5). The index (section
+   17) now reads the stores of muse, opencode, kilo, pi, jcode, gemini and
+   qwen. `resolve()` does not use them yet: matching a dead process to one of
+   their sessions by directory and start time would turn "newest in
+   directory" into an exact resume. agy still has no reader (its conversation
+   id is the presence-lock filename). A session named on the command line is
+   already resumed exactly, for every harness (`argv_id()`, 2026-10-10).
 3. **Keep a flag's value when dropping prompts** (limit 7). Strip whitespace
    arguments only when they are positional.
 4. **bash history** (`HISTTIMEFORMAT` timestamps) and fish history (limit 8).
@@ -837,10 +885,15 @@ In rough order of value against cost:
 6. **Formal retirement of the August machinery.** Neither `cg-snapshot` nor
    `cg-forensic` is needed for recovery any more (section 15). Decide whether
    to delete them or keep them for reference.
-7. **Optional: `pidfd` exit notification** (A8) for exits faster than the
+7. **Turn state for muse** (17.7). Its log has turn-start events but no
+   verified turn-end event, so `mid_turn` is left empty.
+8. **A reviewed mark in `sessions.db`.** The audit view has no way to record
+   "looked at, nothing left to do". A `reviewed` column set by a flag would
+   let the list shrink as it is worked.
+9. **Optional: `pidfd` exit notification** (A8) for exits faster than the
    2-second scan. Only worth it if something time-sensitive is added.
-8. **Optional: the process connector on native Linux** (A6), where pids are
-   in the same namespace. Not on WSL2.
+10. **Optional: the process connector on native Linux** (A6), where pids are
+    in the same namespace. Not on WSL2.
 
 ## 14. Files and record formats
 
@@ -857,6 +910,8 @@ Directories are `0700` and files `0600` (`private_dir()`,
 | `watch/watch.pid` | watcher at start | `cgr` | two lines: pid, boot id |
 | `watch/boot-<boot_id>` | first watcher or `cgr` run of the boot | `cgr`, watcher | this boot's start (epoch): `btime` as first read, before it drifts |
 | `cgr-handled.json` | `cgr` after reopening or `--forget` | `cgr` | `{"<harness>:<id or cwd@started>": epoch}`; entries kept 30 days |
+| `saved.json` | `cgr --save` (replaced by each save) | `cgr` | `{"saved": epoch, "sessions": [...]}`: `cgr --json` items plus `pid`, `ticks` and `boot` |
+| `sessions.db` | `cgr --history`; the watcher once a day | you, with `sqlite3` | SQLite: table `sessions`, view `audit` (section 17.5) |
 
 **Agent record** (watcher; a real record, the Claude session that wrote this
 document):
@@ -896,7 +951,7 @@ run).
 
 | component | status after 2026-10-09 |
 |---|---|
-| `bin/cgr`, `cgr-watch` | **the recovery path**: what to run after a crash or a closed window |
+| `bin/cgr`, `cgr-watch` | **the recovery path**: what to run after a crash or a closed window; also `--save` before a planned restart and `--history`, the database of every session |
 | `bin/cg-session-end` | kept: gives claude the `window closed` reason; fires once at session end |
 | `bin/crash-guard` (`restore`, `cg_run` ledger, `ledger` bridge) | unchanged and still works for the ledger and for `cg_run` launches; no longer the answer to "what died" |
 | `bin/cg-recover`, `bin/cg-forensic` | superseded for recovery (A2); kept for reference and `crash-guard recover --compare` |
@@ -907,3 +962,238 @@ The project's dated decisions, the evidence behind them, and the task state
 live in the Living Documents dossier:
 `/home/cheta/LIVING_DOCUMENTS/projects/crash-guard/` (start with
 `start-here.md`; this design is summarized in `theory-of-operation.md`).
+
+## 16. A planned restart: `cgr --save`
+
+Added 2026-10-10 for goal G9.
+
+### 16.1 What it does
+
+`cgr --save` records every agent running on a terminal right now, each with
+the id its harness gave it, in `saved.json`. You can then shut down however
+you like: exit each agent, close the windows, `wsl --shutdown`, or reboot
+Windows. The next `cgr` lists each saved session once its process is gone,
+with how `saved`, and reopens the ones you pick as usual. Each `--save`
+replaces the previous one. A saved session leaves the list once `cgr` has
+reopened it or `cgr --forget` has hidden it (the same `cgr-handled.json` rule
+as every other item).
+
+```
+$ cgr --save
+cgr: saved 4 running sessions. After the restart, run cgr to reopen them.
+
+  omp       ~/tmp                       10-10 12:01  saved              SPACE: Find unused space ...
+      cd /home/cheta/tmp && omp --resume 01a12668-bc63-7316-a6ef-4528aad4c185
+  claude    ~/code/crash-guard          10-10 12:01  saved              this completly failed ...
+      cd /home/cheta/code/crash-guard && claude --resume 65949efa-0d87-45b9-850e-8078441cd263
+  codex     ~/code/pareto               10-10 12:01  saved              continue
+      cd /home/cheta/code/pareto && codex continue resume 01a1246e-87e1-71b1-9388-85f7ab17d02a
+  ...
+```
+
+(Measured 2026-10-10 in a scratch state directory, so the real saved set was
+not touched.)
+
+### 16.2 How it works
+
+`running_sessions()` builds a fresh `Watcher` and runs its `consider()` on
+every process in `/proc`. That gives the same records the watcher keeps: only
+this account's agents, only the outermost agent on each terminal, the typed
+line kept from the watcher's live file when it has one. So `--save` works
+whether or not the watcher is running. Each record is then resolved to a
+session id:
+
+- **claude**: its pid file names the session, following `/clear` and
+  `/resume`. All running claude ids are reserved first, so a fresh claude with
+  no transcript yet cannot take another running session's id.
+- **any harness with an id on its command line** (`codex resume <id>`,
+  `omp --resume <id>`): that id (`argv_id()`).
+- **codex, omp, hermes otherwise**: the newest session in the process's
+  directory touched since it started (`resolve()`, the crash path's lookup).
+- **the rest**: no id; reopening uses the harness's "continue the newest
+  session here" flag.
+
+`saved()` hides a saved session while its process is alive in the same boot
+(same pid and start ticks), so a save never lists anything while you are
+still working.
+
+### 16.3 Why this design
+
+| option | why not, or why |
+|---|---|
+| rely on the watcher's live set alone | It already answers machine death and closed windows. But a restart where you exit each agent first looks like deliberate exits, which `cgr` correctly ignores. A save states intent, so it must be explicit. |
+| a systemd `ExecStop` or shutdown hook that saves automatically | A WSL VM shutdown (`wsl --shutdown`, a Windows update) does not reliably stop user services in order, and a crash runs nothing. It would also save on every reboot, including ones you meant to start fresh from. |
+| a terminal-multiplexer snapshot (tmux-resurrect style) | Only covers agents inside that multiplexer, and restores a process, not a conversation id. The user runs WezTerm and Windows Terminal tabs too. |
+| **an explicit flag that saves ids and reuses the reopen path** | One command before, one after. Same picker, same rebuilt launch line, same tab opening. Nothing runs that would not run anyway. |
+
+### 16.4 Limits
+
+1. **Two sessions of one harness in one directory**, for codex, omp or hermes
+   without an id on the command line: the newest-touched session is matched
+   to the newest-started process, which can swap them.
+2. **A fresh claude with no transcript** resolves to no id and reopens with
+   `--continue`.
+3. **Not yet verified across a real restart.** Verified: the save, the
+   resolution of four live sessions to their exact ids, hiding while alive,
+   listing once dead, and hiding after a reopen (tests
+   `test_save_records_what_runs_and_lists_it_once_it_is_gone` against a real
+   process in a pty, and `test_saved_sessions_from_the_boot_before_are_listed_by_id`).
+
+## 17. Every session in one database: `cgr --history`
+
+Added 2026-10-10 for goal G10.
+
+### 17.1 What it does
+
+`cgr --history` reads every session store on the machine, decides how each
+session ended, and upserts one row per session into
+`~/.local/state/crash-guard/sessions.db`. It prints a table per harness and
+the newest 40 sessions worth an audit (`--all` prints every one, `--json`
+every row). The watcher refreshes the database once a day in a low-priority
+child process (`refresh_index()`), so sessions are captured before their
+harness prunes them: claude keeps transcripts 30 days.
+
+First run, 2026-10-10: **1,455 sessions** from 11 harnesses, February to
+October 2026, in 29 s cold and 10.6 s warm. **383** were flagged for audit;
+263 automated runs are in the database but never flagged.
+
+| harness | sessions | flagged | mostly because |
+|---|---:|---:|---|
+| hermes | 613 | 214 | `ended_at` never set (157), or hermes's own orphan repair |
+| omp | 129 | 45 | no `session_exit`, or one naming SIGHUP/SIGTERM |
+| opencode | 154 | 38 | stops mid-turn, no end record kept |
+| pi | 126 | 29 | stops mid-turn |
+| qwen | 50 | 28 | stops mid-turn |
+| claude | 59 | 8 | pid file left, reason `other`, or no `SessionEnd` record |
+| muse | 37 | 6 | no `session.end`, or `exit_reason` `incomplete` |
+| gemini | 43 | 5 | stops mid-turn |
+| codex | 137 | 4 | no shutdown line in its log, or mid-turn |
+| openclaw | 55 | 3 | window status `failed` |
+| jcode | 52 | 3 | status `Crashed` |
+
+### 17.2 Where each harness's sessions come from
+
+| harness | store | end record | turn state |
+|---|---|---|---|
+| claude | `~/.claude/projects/*/<id>.jsonl` | `session_exit` from `cg-session-end` (`SessionEnd`); a pid file left behind | last message: tool call, tool result, prompt, or reply |
+| codex | `state_*.sqlite` `threads`, plus the rollout file | `Agent loop exited` or `op.dispatch.shutdown` in `logs_*.sqlite` (covers about 10 days) | `task_started` with no `task_complete` or `turn_aborted` after it |
+| omp, pi | `~/.omp/agent/sessions`, `~/.pi/agent/sessions` | omp: `session_exit` with its reason; pi writes none | last message, including `stopReason` `aborted` and `error` |
+| hermes | `~/.hermes/state.db` `sessions` and `messages` | `ended_at`, `end_reason` | last message; `Operation interrupted` counts as stopped |
+| jcode | `~/.jcode/sessions/*.json` | `status`: `Closed`, or `Crashed` with a message | last message |
+| muse | `~/.local/share/muse/sessions/Y/M/D/<id>/session.jsonl` | `session.end` with `exit_reason` | not read (17.7) |
+| gemini | `~/.gemini/tmp/<project>/chats/*.json`, cwd from `.project_root` | none | last message; tool calls with no text count as a call |
+| qwen | `~/.qwen/projects/*/chats/*.jsonl` | none | last message (`functionCall`, `functionResponse`) |
+| opencode, kilo | `opencode.db` / `kilo.db` `session`, `message`, `part` | none (`time_archived` counts as closed) | last message: no `time.completed`, `finish` `tool-calls`, or `error` |
+| openclaw | `agents/*/agent/openclaw-agent.sqlite` `session_windows` | `status` `done` or `failed` | not kept |
+
+Each store was opened and sampled on 2026-10-10 before its reader was
+written. kilo has no store on this machine yet, and ante and agy keep none
+that `cgr` can read.
+
+### 17.3 How a status is decided
+
+Each row gets one status. The first rule that applies wins:
+
+1. **running**: a live process holds it (`running_sessions()`, Claude's live
+   pid files, or its id on a running command line).
+2. **cut off**: the crash path found it (`cut_off(everything=True)`): a
+   watcher death or live-set record, a stale Claude pid file, and so on. Its
+   `how` is the crash path's: `machine went down`, `window closed`, `killed`,
+   `not closed`. Sessions only saved with `--save` are not evidence of
+   anything.
+3. **the harness's own end record**: closed (`exit record: dispose`,
+   `status Closed`, `end record: cli_close`) or cut off (`CUT_EXITS`, jcode
+   `Crashed`, hermes `HERMES_CUT`, muse `exit_reason` other than `clean`,
+   codex with log lines but no shutdown, openclaw `failed`).
+4. **no end record where one is always written**: for claude (interactive
+   only), omp and muse (`WRITES_EXIT`), a session with no end record that is
+   newer than the first one seen in that store never got to exit: **cut off**,
+   `no end record`. Older ones predate the record and stay unknown.
+5. **unknown**: no evidence either way.
+
+**Mid-turn** is separate from status: the record stops on your prompt, a tool
+call, a tool result, or an error, so the agent was still working. A deliberate
+stop (`[Request interrupted by user]`, omp `aborted`, codex `turn_aborted`)
+ends the turn. `turn()` reads conversation steps newest first and takes the
+first one; `step()` maps every harness's message shape onto the same six
+kinds.
+
+**Flagged for audit** (`flagged()`, the `audit` view): sessions you ran
+(`interactive` = 1) that are cut off, or unknown and mid-turn. A harness's
+clean-exit record outranks mid-turn: hermes ends a session mid-turn on purpose
+when it compresses it into a continuation. Automated runs (`AUTOMATED`: SDK,
+`exec`, `mcp`, subagents, cron, kanban, gateway) are kept with
+`interactive` = 0.
+
+**Measured, not assumed.** The mid-turn verdict was checked by hand against
+the raw transcript for one flagged session each of claude (last record a
+`tool_use`), gemini (tool calls with no text), pi (a prompt answered by an
+`error`) and qwen (a prompt with no answer). hermes's end reasons were read
+from its source: `startup_orphan_reap` and `ws_orphan_reap` close rows whose
+process died, and `orphaned_compression` closes a continuation that was never
+used or closed.
+
+### 17.4 Persistence
+
+Rows are upserted, never deleted. A session its harness has since deleted
+keeps its row with `in_store` = 0, so the database becomes the longer
+history. A `cut off` verdict is sticky: if the evidence for it is pruned
+later (the watcher keeps 30 days), the row does not fall back to `unknown`.
+`typed` and `reopened` keep their last known value. A store that fails to
+read is reported and its rows are not marked gone. Columns added by a later
+`cgr` are added to an older database in place.
+
+### 17.5 Using it
+
+```bash
+cgr --history                      # refresh, summary, newest 40 to audit
+cgr --history --all                # every flagged session
+sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
+sqlite3 -box ~/.local/state/crash-guard/sessions.db \
+  "SELECT harness, id, cwd, datetime(last,'unixepoch','localtime'), how, last_prompt
+   FROM sessions WHERE cwd LIKE '%/pareto%' ORDER BY last DESC"
+```
+
+Columns: `harness`, `id`, `cwd`, `source`, `interactive`, `started`, `last`
+(epoch seconds), `status`, `how`, `exit_record` (verbatim), `mid_turn`,
+`title`, `last_prompt` (both cut to 400 characters), `messages` (where the
+harness counts them: hermes, opencode, jcode, gemini), `bytes` (transcript
+size, where the session is a file), `model`, `branch`, `path`, `typed`,
+`resume` (the line that reopens it), `reopened`, `in_store`, `first_seen`,
+`last_seen`. The `audit` view adds `last_active` in local time.
+
+### 17.6 Why this design
+
+| option | why not, or why |
+|---|---|
+| cass (`cass search`) as the inventory | cass indexes most of these harnesses, but it is a separate archive with its own staleness (`cass-reindex`), and it records content, not how a session ended. The end-state signals live in each harness's own store, so they have to be read there anyway. |
+| file modification times only | An idle session writes nothing, and a clean exit and a crash look the same. That is what failed on 2026-10-09 (section 2). |
+| a JSON or CSV file | The user asked for a database, and the audit is a query: by folder, by harness, by date, by status. SQLite is in Python's standard library and `sqlite3` is on the machine. |
+| rebuild from scratch each run | Loses sessions their harness has deleted. Upsert with `in_store` keeps them. |
+| count every transcript line for a message count | Measured: 7 s just to read 1.27 GB of JSONL, for a number that means records, not messages. `bytes` gives the size cheaply; `messages` is filled only where the harness stores a real count. |
+| **one reader per store, one status rule, one table** | Each reader is about 20 lines and reads only the head and tail of a transcript. One precedence rule (17.3) decides every status, so a verdict can be traced to its evidence in `how`. |
+
+### 17.7 Limits
+
+1. **pi, gemini, qwen and opencode record no end.** Their sessions are
+   `unknown` unless the watcher saw them die, and only mid-turn ones are
+   flagged. A session idle at the prompt when its window closed, before the
+   watcher existed, is not flagged.
+2. **opencode and qwen headless runs look interactive.** `opencode run` and
+   probe prompts ("Reply with exactly: OK") are stored like TUI sessions, so
+   some flagged rows are scripted probes.
+3. **codex's log covers about 10 days** (`logs_2.sqlite` from 2026-09-30).
+   Older threads are `unknown`, except mid-turn ones from the rollout.
+4. **claude sessions before 2026-09-04**, when `cg-session-end` was installed,
+   have no end record; they are `unknown` unless a pid file or the watcher
+   says otherwise.
+5. **muse turn state is not read**: its log has turn-start events, but no
+   turn-end event was verified.
+6. **openclaw has no working directory** (it runs as a gateway); `cwd` is
+   empty and `resume` is only `openclaw resume`.
+7. **Prompts are stored.** `title` and `last_prompt` hold the first and last
+   prompts. The database is `0600` in the owner-only state directory, like the
+   rest of `cgr`'s state.
+8. **Formats move.** Each reader depends on a private store layout. A reader
+   that fails prints `cgr: <harness>: <error>` and the rest still run; re-run
+   audit check 8 after a harness upgrade.

@@ -9,6 +9,10 @@
     cgr --yes         reopen all of them without asking
     cgr --all         include sessions that died before the previous boot
     cgr --forget      stop listing the sessions shown now
+    cgr --save        before a planned restart: record every agent running now,
+                      so the next `cgr` reopens them however they get closed
+    cgr --history     every session of every harness into one database
+                      (sessions.db), and list the ones cut off or left mid-task
     cgr --notify      one line if anything died (the login hook calls this)
     cgr --json
     cgr --watch       the watcher; systemd runs it as cgr-watch.service
@@ -17,7 +21,8 @@ A session is listed when it was running and nobody exited it: the machine went
 down under it, or its window closed. It reopens in a new tab, in its own
 directory, with the command line you originally typed (alias, flags, proxy
 variables and all), minus any old session flags, plus that harness's resume
-flag.
+flag. A session recorded by `cgr --save` is listed once its process is gone,
+whatever ended it.
 
 Nothing hooks a shell or a harness. There are two sources:
 
@@ -476,13 +481,29 @@ class Watcher:
             write_private(self.deaths, "".join(l + "\n" for l in keep))
 
 
+def refresh_index():
+    """`cgr --history` in a low-priority child, so the scan loop never waits on it."""
+    return subprocess.Popen([sys.executable, os.path.realpath(__file__), "--history", "--json"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True, preexec_fn=lambda: os.nice(10))
+
+
 def watch(interval=2.0):
     w = Watcher()
     w.prune()
     write_private(watch_dir() / "watch.pid", "%d\n%s\n" % (os.getpid(), w.boot))
+    # sessions.db once a day, before the harnesses prune their old sessions
+    # (claude keeps 30 days); first look ten minutes in, clear of the boot.
+    check, child = time.time() + 600, None
     while True:
         try:
             w.scan()
+            if child is not None and child.poll() is not None:
+                child = None
+            if child is None and time.time() >= check:
+                check = time.time() + 3600
+                if mtime(db_path()) < time.time() - 86400:
+                    child = refresh_index()
         except Exception as e:  # one bad /proc read must not stop the watcher
             print("cgr --watch: %r" % e, file=sys.stderr, flush=True)
         time.sleep(interval)
@@ -540,6 +561,11 @@ def tail(path, size=262144):
             continue
         if isinstance(rec, dict):
             yield rec
+
+
+# session_exit reasons that mean the session did not choose to end: claude's
+# SessionEnd says "other" on SIGHUP, omp names the signal.
+CUT_EXITS = {"other": "window closed", "sighup": "window closed", "sigterm": "killed"}
 
 
 def exit_reason(path):
@@ -632,8 +658,8 @@ def claude(since, btime, live, dead):
         if last < since or sid in live:
             continue
         reason = exit_reason(path)
-        if reason == "other":
-            how = "window closed"
+        if reason in CUT_EXITS:
+            how = CUT_EXITS[reason]
         elif reason is None and sid in dead:
             how = "machine went down" if last < btime else "killed"
         else:
@@ -659,7 +685,8 @@ def claude_in(cwd, since, live, taken):
         last, sid = mtime(path), path.stem
         if last < since:
             break
-        if sid in live or ("claude", sid) in taken or exit_reason(path) not in (None, "other"):
+        reason = exit_reason(path)
+        if sid in live or ("claude", sid) in taken or not (reason is None or reason in CUT_EXITS):
             continue
         entry, _, title = head(path)
         if entry in (None, "cli") and title:
@@ -728,17 +755,21 @@ def codex(since, btime):
 # -- omp / hermes ------------------------------------------------------------
 
 def omp_files(since, until):
+    """omp transcripts with no session_exit, or one a signal wrote (window closed, killed)."""
     for path in glob.glob(str(HOME / ".omp" / "agent" / "sessions" / "*" / "*.jsonl")):
         last = mtime(path)
-        if since <= last < until and exit_reason(path) is None:
+        if not since <= last < until:
+            continue
+        reason = exit_reason(path)
+        if reason is None or reason in CUT_EXITS:
             _, cwd, title = head(path, limit=40)
             if title:
-                yield path, last, cwd, title
+                yield path, last, cwd, title, CUT_EXITS.get(reason, "not closed")
 
 
 def omp(since, btime):
-    return [session("omp", Path(path).stem.split("_", 1)[-1], cwd, last, "not closed", title)
-            for path, last, cwd, title in omp_files(since, btime)]
+    return [session("omp", Path(path).stem.split("_", 1)[-1], cwd, last, how, title)
+            for path, last, cwd, title, how in omp_files(since, btime)]
 
 
 def hermes_rows(where, params):
@@ -767,11 +798,34 @@ def hermes(since, btime):
 
 # -- watcher records to sessions ---------------------------------------------
 
+def argv_id(h, argv):
+    """The session a command line names: `codex resume <id>`, `claude --resume <id>`."""
+    by_id = HARNESSES.get(h, (None,))[0]
+    hit = harness_of(argv or [])
+    if not by_id or not hit:
+        return None
+    rest = argv[hit[1] + 1:]
+    for i, a in enumerate(rest):
+        if a == by_id[0] and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+            return rest[i + 1]
+        if a.startswith(by_id[0] + "=") and by_id[0].startswith("-"):
+            return a.split("=", 1)[1] or None
+    return None
+
+
 def resolve(rec, live, taken):
     """The session a dead agent process was running, looked up in its harness's store."""
     h, cwd, since = rec["harness"], rec["cwd"], rec["started"] - 5
     hit = None
-    if h == "claude":
+    named = argv_id(h, rec.get("argv"))
+    if h != "claude" and named and (h, named) not in taken:
+        # Claude's pid file follows /clear and /resume; for the rest, a session
+        # named on the command line is the one it ran.
+        hit = session(h, named, cwd, rec["last"], rec["how"], "")
+        if h == "codex":
+            for _, _, title, updated, _ in codex_threads("id = ?", (named,)):
+                hit.update(title=title or "", last=updated)
+    elif h == "claude":
         path = rec.get("session") and claude_transcript(rec["session"])
         if path:
             hit = session(h, rec["session"], cwd, mtime(path), rec["how"], head(path)[2])
@@ -786,8 +840,8 @@ def resolve(rec, live, taken):
                 hit = session(h, tid, cwd, updated, rec["how"], title)
                 break
     elif h == "omp":
-        for path, last, ocwd, title in sorted(omp_files(since, time.time() + 1),
-                                              key=lambda x: -x[1]):
+        for path, last, ocwd, title, _ in sorted(omp_files(since, time.time() + 1),
+                                                 key=lambda x: -x[1]):
             sid = Path(path).stem.split("_", 1)[-1]
             if ocwd == cwd and ("omp", sid) not in taken:
                 hit = session(h, sid, cwd, last, rec["how"], title)
@@ -844,7 +898,21 @@ def mark_handled(items):
     os.replace(tmp, STATE / "cgr-handled.json")
 
 
-def collect(everything=False):
+def item_key(s):
+    return (s["harness"], s["id"]) if s["id"] else (s["harness"], s["cwd"], s["started"])
+
+
+def merge(items, s):
+    k = item_key(s)
+    if k in items:
+        items[k].update({f: s[f] for f in ("typed", "argv", "started") if s.get(f)})
+    else:
+        items[k] = s
+
+
+def cut_off(everything=False):
+    """{key: session} for every session cut off since the previous boot began
+    (ever, with `everything`), before the reopened and running ones are dropped."""
     btime, boot_id = boot_start()
     since = 0 if everything else previous_boot_start(btime) - 120
     live, dead = claude_pids(btime)
@@ -855,18 +923,21 @@ def collect(everything=False):
     taken = set()
     for rec in sorted(watched(boot_id, since), key=lambda r: -r["started"]):
         s = resolve(rec, live, taken)
-        k = (s["harness"], s["id"]) if s["id"] else (s["harness"], s["cwd"], rec["started"])
-        taken.add(k)
-        if k in items:
-            items[k].update({f: s[f] for f in ("typed", "argv", "started") if s[f]})
-        else:
-            items[k] = s
+        taken.add(item_key(s))
+        merge(items, s)
+    for s in saved(since):
+        merge(items, s)
     hist, amap = None, None
     for s in items.values():
         if not s["typed"] and s["started"]:
             if hist is None:
                 hist, amap = history(), aliases()
             s["typed"] = typed_for(s["harness"], s["started"], hist, amap)
+    return items
+
+
+def collect(everything=False):
+    items = cut_off(everything)
     handled = load_handled()
     running = running_words()
     shown, continued = [], set()
@@ -880,6 +951,723 @@ def collect(everything=False):
             continued.add((s["harness"], s["cwd"]))
         shown.append(s)
     return shown
+
+
+# -- a planned restart (cgr --save) ------------------------------------------
+
+def saved_path():
+    return STATE / "saved.json"
+
+
+def running_sessions():
+    """Every agent running on a terminal now, as sessions with the ids their
+    harnesses gave them where one can be found. The watcher's own rules, read
+    fresh, so this works with the watcher stopped too."""
+    w = Watcher()
+    for pid in sorted(int(p) for p in os.listdir("/proc") if p.isdigit()):
+        rec = w.consider(pid)
+        if rec:
+            w.agents[pid] = rec
+    recs = sorted(w.agents.values(), key=lambda r: -r["started"])
+    # A running claude names its own session; the others must not take it.
+    taken = {("claude", r["session"]) for r in recs if r.get("session")}
+    now, out = time.time(), []
+    for rec in recs:
+        s = resolve(dict(rec, how="saved", last=now), set(), taken)
+        taken.add(item_key(s))
+        s.update(pid=rec["pid"], ticks=rec["ticks"], boot=rec["boot"], last=now)
+        out.append(s)
+    return out
+
+
+def save():
+    items = running_sessions()
+    private_dir(STATE)
+    tmp = saved_path().with_suffix(".tmp")
+    write_private(tmp, json.dumps({"saved": time.time(), "sessions": items}, indent=1))
+    os.replace(tmp, saved_path())
+    return items
+
+
+def saved(since):
+    """What `cgr --save` recorded, once each process is gone, however it went:
+    exited, its window closed, or the machine restarted."""
+    try:
+        data = json.loads(read_own(saved_path()))
+    except (OSError, ValueError):
+        return []
+    boot = current_boot()[1]
+    out = []
+    for s in data.get("sessions") or []:
+        if not isinstance(s, dict) or s.get("last", 0) < since:
+            continue
+        if s.get("boot") == boot and alive(s.get("pid"), s.get("ticks")):
+            continue
+        out.append(dict(s, how="saved"))
+    return out
+
+
+# -- every session, in one database (cgr --history) ---------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    harness     TEXT NOT NULL,
+    id          TEXT NOT NULL,
+    cwd         TEXT,
+    source      TEXT,     -- what started it: cli, exec, subagent, sdk-cli, cron ...
+    interactive INTEGER,  -- 1: you ran it at a prompt; 0: a script, subagent or schedule did
+    started     REAL,     -- epoch seconds
+    last        REAL,     -- last activity
+    status      TEXT,     -- running | closed | cut off | unknown
+    how         TEXT,     -- the evidence for status
+    exit_record TEXT,     -- the end record the harness wrote, verbatim
+    mid_turn    INTEGER,  -- 1: it stops on your prompt, a tool step or an error
+    title       TEXT,     -- the harness's title, else your first prompt
+    last_prompt TEXT,
+    messages    INTEGER,  -- where the harness counts them
+    bytes       INTEGER,  -- transcript size
+    model       TEXT,
+    branch      TEXT,
+    path        TEXT,     -- the transcript or database it was read from
+    typed       TEXT,     -- the command line that started it, when the watcher saw it
+    resume      TEXT,     -- the line that reopens it
+    reopened    REAL,     -- when cgr last reopened or forgot it
+    in_store    INTEGER,  -- 0: its harness has since deleted it; this row is all that is left
+    first_seen  REAL,
+    last_seen   REAL,
+    PRIMARY KEY (harness, id)
+);
+"""
+AUDIT_VIEW = """
+DROP VIEW IF EXISTS audit;
+CREATE VIEW audit AS
+SELECT harness, id, cwd, datetime(last, 'unixepoch', 'localtime') AS last_active,
+       status, how, mid_turn, title, last_prompt, resume
+FROM sessions
+WHERE interactive = 1 AND (status = 'cut off' OR (status = 'unknown' AND mid_turn = 1))
+ORDER BY last DESC;
+"""
+COLUMNS = ("harness", "id", "cwd", "source", "interactive", "started", "last", "status", "how", "exit_record",
+           "mid_turn", "title", "last_prompt", "messages", "bytes", "model", "branch", "path",
+           "typed", "resume", "reopened", "in_store", "first_seen", "last_seen")
+SNIP = 400                      # characters of a prompt kept
+TOOL_BLOCKS = {"tool_use", "toolCall", "functionCall"}
+RESULT_BLOCKS = {"tool_result", "functionResponse"}
+# Harnesses that write an end record on every exit they get to run, so a
+# session with none, newer than the first one seen, never got to exit.
+WRITES_EXIT = {"claude", "omp", "muse"}
+# Sources that are a program's runs, not a session you would sit down to finish.
+AUTOMATED = {"exec", "mcp", "subagent", "sdk-cli", "sdk-py", "cron", "kanban", "gateway"}
+
+
+def db_path():
+    return STATE / "sessions.db"
+
+
+def epoch(v):
+    """Seconds since the epoch from the harnesses' assorted timestamps."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v / 1e6 if v > 1e14 else v / 1000 if v > 1e11 else float(v)
+    m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?$",
+                 str(v).strip())
+    if not m:
+        return None
+    import datetime
+    zone = m.group(4) if m.group(4) not in (None, "Z") else "+00:00"
+    return datetime.datetime.fromisoformat("%sT%s%s%s" % (m.group(1), m.group(2),
+                                                          (m.group(3) or "")[:7], zone)).timestamp()
+
+
+def blocks(content):
+    """[(kind, text)] for a message body in any harness's shape."""
+    if isinstance(content, str):
+        return [("text", content)]
+    out = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, str):
+            out.append(("text", b))
+        elif isinstance(b, dict):
+            kind = b.get("type") or b.get("kind") or (
+                "thinking" if b.get("thought") else
+                next((k for k in ("functionCall", "functionResponse") if k in b), "text"))
+            out.append((kind, b["text"] if isinstance(b.get("text"), str) else ""))
+    return out
+
+
+def step(role, content, stop=None):
+    """A conversation record as the turn sees it: ("prompt", text), ("tool", ""),
+    ("call", ""), ("reply", ""), ("error", ""), ("stopped", ""), or None."""
+    parts = blocks(content)
+    kinds = {k for k, _ in parts}
+    if role in ("tool", "toolResult") or kinds & RESULT_BLOCKS:
+        return "tool", ""
+    if role == "user":
+        text = " ".join(" ".join(t for k, t in parts if k in ("text", "input_text")).split())
+        if text.startswith("[Request interrupted"):
+            return "stopped", ""
+        if not text or text.startswith(("<", "Caveat:")):
+            return None  # a slash command's echo or injected context
+        return "prompt", text
+    if role in ("assistant", "model", "gemini"):
+        if stop == "aborted":
+            return "stopped", ""
+        if stop == "error":
+            return "error", ""
+        return ("call", "") if kinds & TOOL_BLOCKS else ("reply", "")
+    return None
+
+
+def turn(steps):
+    """(mid_turn, last prompt) from conversation steps, newest first. Mid-turn:
+    the record stops on your prompt, a tool call or result, or an error, so the
+    agent was still at work when it ended."""
+    mid, prompt = None, ""
+    for st in steps:
+        if not st:
+            continue
+        if mid is None:
+            mid = st[0] in ("prompt", "tool", "call", "error")
+        if st[0] == "prompt":
+            prompt = st[1]
+            break
+    return mid, prompt[:SNIP]
+
+
+def message_step(rec):
+    """step() for transcripts with one message per record: claude, qwen, omp, pi."""
+    m = rec.get("message")
+    if not isinstance(m, dict) or rec.get("isMeta") or rec.get("isSidechain"):
+        return None, None
+    content = m["content"] if "content" in m else m.get("parts")
+    return step(m.get("role"), content, m.get("stopReason")), m.get("model")
+
+
+def first_records(path, limit=300):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= limit:
+                    return
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    yield rec
+    except OSError:
+        return
+
+
+def head_meta(path, step_of=message_step):
+    """cwd, start, branch, source and first prompt from the start of a transcript."""
+    meta = {}
+    for rec in first_records(path):
+        for k, field in (("cwd", "cwd"), ("branch", "gitBranch"), ("source", "entrypoint"),
+                         ("started", "timestamp"), ("id", "sessionId")):
+            if rec.get(field) and k not in meta:
+                meta[k] = rec[field]
+        if rec.get("type") == "session" and rec.get("id"):
+            meta.setdefault("id", rec["id"])  # pi and omp open with a session header
+        if "title" not in meta:
+            st = step_of(rec)[0]
+            title = prompt_text(rec) or (st[1] if st and st[0] == "prompt" else "")
+            if title:
+                meta["title"] = title[:SNIP]
+    return meta
+
+
+def tail_scan(path, step_of=message_step):
+    """(end record, mid_turn, last prompt, model) from the end of a transcript."""
+    end, steps, model, talked = None, [], None, False
+    for rec in tail(path):
+        if rec.get("customType") == "session_exit" and not talked and end is None:
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            end = rec.get("reason") or data.get("reason") or "unknown"
+        if rec.get("type") == "last-prompt" and isinstance(rec.get("lastPrompt"), str):
+            steps.append(("last-prompt", " ".join(rec["lastPrompt"].split())))
+        st, mdl = step_of(rec)
+        model = model or mdl
+        if st:
+            talked = True
+            steps.append(st)
+    mid, prompt = turn(s for s in steps if s[0] != "last-prompt")
+    if not prompt:  # claude notes your last prompt even when the turn ran past the tail
+        prompt = next((s[1] for s in steps if s[0] == "last-prompt"), "")[:SNIP]
+    return end, mid, prompt, model
+
+
+def entry(harness, sid, path=None, **kw):
+    r = dict.fromkeys(COLUMNS)
+    r.update(harness=harness, id=str(sid), path=str(path) if path else None, verdict=None)
+    if path and os.path.isfile(path):
+        r["bytes"] = os.path.getsize(path)
+        r["last"] = mtime(path)
+    r.update({k: v for k, v in kw.items() if v is not None})
+    for k in ("started", "last"):
+        r[k] = epoch(r[k])
+    for k in ("title", "last_prompt"):
+        r[k] = " ".join(str(r[k]).split())[:SNIP] if r[k] else None
+    return r
+
+
+def exit_verdict(end):
+    if end is None:
+        return None
+    if end in CUT_EXITS:
+        return "cut off", CUT_EXITS[end]
+    return "closed", "exit record: %s" % end
+
+
+def index_claude():
+    for path in glob.glob(str(HOME / ".claude" / "projects" / "*" / "*.jsonl")):
+        meta = head_meta(path)
+        end, mid, prompt, model = tail_scan(path)
+        source = meta.get("source") or "cli"
+        r = entry("claude", Path(path).stem, path, cwd=meta.get("cwd"), source=source,
+                  started=meta.get("started"), title=meta.get("title"), exit_record=end,
+                  mid_turn=mid, last_prompt=prompt, model=model, branch=meta.get("branch"))
+        r["verdict"] = exit_verdict(end) or (
+            None if source == "cli" else ("unknown", "%s run: no end record" % source))
+        yield r
+
+
+def jsonl_index(harness, pattern, sid_of):
+    for path in glob.glob(str(HOME / pattern)):
+        meta = head_meta(path)
+        end, mid, prompt, model = tail_scan(path)
+        r = entry(harness, sid_of(path, meta), path, cwd=meta.get("cwd"),
+                  started=meta.get("started"), title=meta.get("title"), exit_record=end,
+                  mid_turn=mid, last_prompt=prompt, model=model, branch=meta.get("branch"),
+                  source="cli")
+        r["verdict"] = exit_verdict(end)
+        yield r
+
+
+def index_omp():
+    return jsonl_index("omp", ".omp/agent/sessions/*/*.jsonl",
+                       lambda p, m: Path(p).stem.split("_", 1)[-1])
+
+
+def index_pi():
+    return jsonl_index("pi", ".pi/agent/sessions/*/*.jsonl",
+                       lambda p, m: Path(p).stem.split("_", 1)[-1])
+
+
+def index_qwen():
+    return jsonl_index("qwen", ".qwen/projects/*/chats/*.jsonl",
+                       lambda p, m: m.get("id") or Path(p).stem)
+
+
+def codex_step(rec):
+    p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+    if rec.get("type") != "event_msg":
+        return None, None
+    t = p.get("type")
+    if t == "user_message":
+        text = " ".join(str(p.get("message") or "").split())
+        return (("prompt", text) if text else None), None
+    return {"task_started": ("call", ""), "task_complete": ("reply", ""),
+            "turn_aborted": ("stopped", ""), "error": ("error", "")}.get(t), None
+
+
+def index_codex():
+    db = codex_db("state_*.sqlite")
+    if not db:
+        return
+    ends, span = {}, None
+    logs = codex_db("logs_*.sqlite")
+    if logs:
+        try:
+            con = ro(logs)
+            try:
+                span = con.execute("SELECT MIN(ts) FROM logs").fetchone()[0]
+                for tid, last, ended in con.execute(
+                        "SELECT thread_id, MAX(ts), MAX(CASE WHEN feedback_log_body LIKE "
+                        "'%Agent loop exited%' OR feedback_log_body LIKE '%op.dispatch.shutdown%' "
+                        "THEN ts END) FROM logs GROUP BY thread_id"):
+                    ends[tid] = (last, ended)
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+    con = ro(db)
+    try:
+        con.row_factory = sqlite3.Row
+        rows = con.execute("SELECT * FROM threads").fetchall()
+    finally:
+        con.close()
+    for t in rows:
+        t = dict(t)
+        path = t.get("rollout_path")
+        _, mid, prompt, _ = tail_scan(path, codex_step) if path else (None, None, "", None)
+        src = t.get("source") or ""
+        r = entry("codex", t["id"], path, cwd=t.get("cwd"),
+                  source="subagent" if src.startswith("{") else src,
+                  started=t.get("created_at"), title=t.get("title") or t.get("first_user_message"),
+                  mid_turn=mid, last_prompt=prompt, model=t.get("model"),
+                  branch=t.get("git_branch"))
+        r["last"] = epoch(t.get("updated_at")) or r["last"]
+        last, ended = ends.get(t["id"], (None, None))
+        if t.get("archived"):
+            r["verdict"] = ("closed", "archived")
+        elif ended is not None and ended >= (last or 0) - 120:
+            r["exit_record"] = "Agent loop exited"
+            r["verdict"] = ("closed", "shut down (codex log)")
+        elif last is not None:
+            r["verdict"] = ("cut off", "no shutdown in codex log")
+        elif span and (r["last"] or 0) >= span:
+            r["verdict"] = ("unknown", "nothing in codex log")
+        yield r
+
+
+# hermes's end reasons for a session whose process went away without closing
+# it (its own hermes_state_common.py and finalize_orphaned_compression_sessions).
+HERMES_CUT = {"startup_orphan_reap", "ws_orphan_reap", "orphaned_compression"}
+
+
+def index_hermes():
+    db = HOME / ".hermes" / "state.db"
+    if not db.exists():
+        return
+    con = ro(db)
+    try:
+        con.row_factory = sqlite3.Row
+        for s in [dict(x) for x in con.execute("SELECT * FROM sessions")]:
+            msgs = con.execute("SELECT role, content, tool_calls FROM messages WHERE session_id = ? "
+                               "ORDER BY id DESC LIMIT 60", (s["id"],)).fetchall()
+            steps = []
+            for role, content, calls in msgs:
+                if role == "assistant" and str(content or "").startswith("Operation interrupted"):
+                    steps.append(("stopped", ""))
+                elif role == "assistant" and calls and calls not in ("[]", "null"):
+                    steps.append(("call", ""))
+                else:
+                    steps.append(step(role, content if isinstance(content, str) else ""))
+            mid, prompt = turn(steps)
+            r = entry("hermes", s["id"], db, cwd=s.get("cwd"), source=s.get("source"),
+                      started=s.get("started_at"), title=s.get("title"),
+                      exit_record=s.get("end_reason"), mid_turn=mid, last_prompt=prompt,
+                      messages=s.get("message_count"), model=s.get("model"),
+                      branch=s.get("git_branch"))
+            r["bytes"] = None
+            r["last"] = epoch(s.get("last_activity_at") or s.get("ended_at") or s.get("started_at"))
+            reason = s.get("end_reason")
+            if s.get("ended_at") is None:
+                r["verdict"] = ("cut off", "not closed")
+            elif reason in HERMES_CUT:
+                r["verdict"] = ("cut off", "end record: %s" % reason)
+            else:
+                r["verdict"] = ("closed", "end record: %s" % (reason or "ended"))
+            yield r
+    finally:
+        con.close()
+
+
+def index_jcode():
+    for path in glob.glob(str(HOME / ".jcode" / "sessions" / "*.json")):
+        try:
+            d = json.loads(Path(path).read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        msgs = d.get("messages") if isinstance(d.get("messages"), list) else []
+        mid, prompt = turn(step(m.get("role"), m.get("content"))
+                           for m in reversed(msgs) if isinstance(m, dict))
+        first = next((st[1] for st in (step(m.get("role"), m.get("content"))
+                                       for m in msgs if isinstance(m, dict))
+                      if st and st[0] == "prompt"), None)
+        status = d.get("status")
+        r = entry("jcode", d.get("id") or Path(path).stem, path, cwd=d.get("working_dir"),
+                  source="cli", started=d.get("created_at"),
+                  title=d.get("title") or d.get("short_name") or first, mid_turn=mid,
+                  last_prompt=prompt, messages=len(msgs), model=d.get("model"),
+                  exit_record=status if isinstance(status, str) or status is None
+                  else json.dumps(status)[:SNIP])
+        r["last"] = epoch(d.get("last_active_at") or d.get("updated_at")) or r["last"]
+        if status == "Closed":
+            r["verdict"] = ("closed", "status Closed")
+        elif isinstance(status, dict) and "Crashed" in status:
+            msg = (status["Crashed"] or {}).get("message") if isinstance(status["Crashed"], dict) else None
+            r["verdict"] = ("cut off", "status Crashed" + (": " + msg if msg else ""))
+        else:
+            r["verdict"] = ("cut off", "left %s" % (status or "open"))
+        yield r
+
+
+def index_muse():
+    for path in glob.glob(str(HOME / ".local/share/muse/sessions/*/*/*/*/session.jsonl")):
+        meta = {}
+        for rec in first_records(path):
+            p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+            inner = p.get("record") if isinstance(p.get("record"), dict) else {}
+            meta.setdefault("started", rec.get("recorded_at"))
+            if inner.get("cwd"):
+                meta.setdefault("cwd", inner["cwd"])
+            if inner.get("model_id"):
+                meta.setdefault("model", inner["model_id"])
+            if rec.get("payload_type") == "runtime.user_intent.accepted" and "title" not in meta:
+                meta["title"] = muse_prompt(p)
+        end = prompt = None
+        for rec in tail(path):
+            p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+            if rec.get("payload_type") == "session.end" and end is None:
+                end = (p.get("record") or {}).get("exit_reason") or "ended"
+            if rec.get("payload_type") == "runtime.user_intent.accepted" and prompt is None:
+                prompt = muse_prompt(p)
+        r = entry("muse", Path(path).parent.name, path, cwd=meta.get("cwd"), source="cli",
+                  started=meta.get("started"), title=meta.get("title"), exit_record=end,
+                  last_prompt=prompt or meta.get("title"), model=meta.get("model"))
+        if end:
+            r["verdict"] = ("closed", "session.end: %s" % end) if end == "clean" else \
+                ("cut off", "session.end: %s" % end)
+        yield r
+
+
+def muse_prompt(payload):
+    for m in payload.get("model_messages") or []:
+        text = " ".join(t for _, t in blocks(m.get("content") if isinstance(m, dict) else None))
+        if text.strip():
+            return text
+    return None
+
+
+def index_gemini():
+    for path in glob.glob(str(HOME / ".gemini" / "tmp" / "*" / "chats" / "*.json")):
+        try:
+            d = json.loads(Path(path).read_text(errors="replace"))
+            cwd = (Path(path).parent.parent / ".project_root").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        msgs = [m for m in d.get("messages") or [] if isinstance(m, dict)]
+
+        def gstep(m):
+            if m.get("type") == "user":
+                return step("user", m.get("content"))
+            if m.get("type") == "gemini":
+                return ("call", "") if m.get("toolCalls") and not m.get("content") else ("reply", "")
+            return ("error", "") if m.get("type") == "error" else None
+        mid, prompt = turn(gstep(m) for m in reversed(msgs))
+        first = next((st[1] for st in map(gstep, msgs) if st and st[0] == "prompt"), None)
+        model = next((m.get("model") for m in reversed(msgs) if m.get("model")), None)
+        r = entry("gemini", d.get("sessionId") or Path(path).stem, path, cwd=cwd, source="cli",
+                  started=d.get("startTime"), title=first, mid_turn=mid, last_prompt=prompt,
+                  messages=len(msgs), model=model)
+        r["last"] = epoch(d.get("lastUpdated")) or r["last"]
+        yield r
+
+
+def index_opencode():
+    for harness, db in (("opencode", HOME / ".local/share/opencode/opencode.db"),
+                        ("kilo", HOME / ".local/share/kilo/kilo.db")):
+        if not db.exists():
+            continue
+        con = ro(db)
+        try:
+            sessions = con.execute("SELECT id, directory, title, time_created, time_updated, "
+                                   "parent_id, time_archived FROM session").fetchall()
+            for sid, cwd, title, created, updated, parent, archived in sessions:
+                msgs = con.execute("SELECT id, data FROM message WHERE session_id = ? "
+                                   "ORDER BY time_created DESC", (sid,)).fetchall()
+                steps, model = [], None
+                for mid_, data in msgs[:200]:
+                    try:
+                        m = json.loads(data)
+                    except ValueError:
+                        continue
+                    mm = m.get("model")
+                    model = model or m.get("modelID") or (mm.get("modelID")
+                                                          if isinstance(mm, dict) else None)
+                    if m.get("role") == "user":
+                        text = " ".join(json.loads(d).get("text") or "" for (d,) in con.execute(
+                            "SELECT data FROM part WHERE message_id = ? ORDER BY id", (mid_,))
+                            if '"type":"text"' in d)
+                        steps.append(step("user", text))
+                        if steps[-1]:
+                            break  # the last prompt: turn() reads no further
+                    elif m.get("error"):
+                        steps.append(("error", ""))
+                    elif not (m.get("time") or {}).get("completed") or m.get("finish") == "tool-calls":
+                        steps.append(("call", ""))
+                    else:
+                        steps.append(("reply", ""))
+                mid, prompt = turn(steps)
+                r = entry(harness, sid, db, cwd=cwd, source="subagent" if parent else "cli",
+                          started=created, title=title, mid_turn=mid, last_prompt=prompt,
+                          messages=len(msgs), model=model)
+                r["bytes"] = None
+                r["last"] = epoch(updated)
+                if archived:
+                    r["verdict"] = ("closed", "archived")
+                yield r
+        finally:
+            con.close()
+
+
+def index_openclaw():
+    for db in glob.glob(str(HOME / ".openclaw" / "agents" / "*" / "agent" / "openclaw-agent.sqlite")):
+        con = ro(db)
+        try:
+            rows = con.execute("SELECT session_id, started_at, created_at, updated_at, ended_at, "
+                               "status, model, display_name, chat_type FROM session_windows").fetchall()
+        except sqlite3.Error:
+            rows = []
+        finally:
+            con.close()
+        for sid, started, created, updated, ended, status, model, name, kind in rows:
+            r = entry("openclaw", sid, db, source=kind or "gateway", started=started or created,
+                      title=name, exit_record=status, model=model)
+            r["bytes"] = None
+            r["last"] = epoch(ended or updated)
+            r["verdict"] = {"done": ("closed", "status done"),
+                            "failed": ("cut off", "status failed")}.get(status)
+            yield r
+
+
+INDEXERS = (index_claude, index_codex, index_omp, index_pi, index_hermes, index_jcode,
+            index_muse, index_gemini, index_qwen, index_opencode, index_openclaw)
+
+
+def build_index():
+    """Every session every harness on this machine kept, with how each one ended."""
+    rows, failed = {}, set()
+    for indexer in INDEXERS:
+        try:
+            for r in indexer():
+                rows[(r["harness"], r["id"])] = r
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as e:
+            failed.add(indexer.__name__[6:])  # its rows not read this time are not gone
+            print("cgr: %s: %s" % (indexer.__name__[6:], e), file=sys.stderr)
+    first = {}
+    for r in rows.values():
+        if r["exit_record"] and r["harness"] in WRITES_EXIT:
+            first[r["harness"]] = min(first.get(r["harness"], r["last"] or 0),
+                                      r["started"] or r["last"] or 0)
+    btime = boot_start()[0]
+    live, _ = claude_pids(btime)
+    running = {("claude", sid) for sid in live}
+    running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
+    named = running_words()
+    # What `cgr --save` recorded is not evidence of anything going wrong.
+    evidence = {k: s for k, s in cut_off(everything=True).items() if s["how"] != "saved"}
+    for s in evidence.values():
+        if not s["id"]:  # no store says which session it was; keep what the watcher saw
+            r = entry(s["harness"], "@%d" % int(s["started"] or s["last"]), cwd=s["cwd"],
+                      source="cli", started=s["started"], title=s["title"])
+            r["last"] = s["last"]
+            rows[(r["harness"], r["id"])] = dict(r, verdict=None, evidence=s)
+    handled = load_handled()
+    now = time.time()
+    for k, r in rows.items():
+        ev = r.pop("evidence", None) or evidence.get(k)
+        if k in running or r["id"] in named:
+            r["status"], r["how"] = "running", "process alive"
+        elif ev:
+            r["status"], r["how"] = "cut off", ev["how"]
+        elif r["verdict"]:
+            r["status"], r["how"] = r["verdict"]
+        elif r["harness"] in first and (r["last"] or 0) >= first[r["harness"]]:
+            r["status"], r["how"] = "cut off", "no end record"
+        else:
+            r["status"], r["how"] = "unknown", "no end record"
+        s = dict(session(r["harness"], None if r["id"].startswith("@") else r["id"],
+                         r["cwd"], r["last"] or now, r["how"], r["title"]),
+                 typed=(ev or {}).get("typed"), argv=(ev or {}).get("argv"))
+        r["typed"] = s["typed"]
+        r["resume"] = runnable(s)
+        r["reopened"] = handled.get(key(s))
+        r["in_store"] = 0 if r["id"].startswith("@") else 1
+        r["interactive"] = 0 if r["source"] in AUTOMATED else 1
+        r["last_seen"] = r["first_seen"] = now
+    return [rows[k] for k in sorted(rows, key=lambda k: -(rows[k]["last"] or 0))], failed
+
+
+def write_index(rows, failed=()):
+    """Upsert into sessions.db. A row outlives its transcript: once a harness
+    deletes an old session, the row keeps what was known, with in_store 0."""
+    private_dir(STATE)
+    path = db_path()
+    con = sqlite3.connect(str(path), timeout=10)
+    try:
+        os.chmod(path, 0o600)
+        con.executescript(SCHEMA)
+        have = {c[1] for c in con.execute("PRAGMA table_info(sessions)")}
+        for c in COLUMNS:
+            if c not in have:  # a database an older cgr made
+                con.execute("ALTER TABLE sessions ADD COLUMN %s" % c)
+        con.executescript(AUDIT_VIEW)
+        keep = ("first_seen",)
+        sticky = ("status", "how")  # a cut-off verdict outlives the evidence for it
+        sets = []
+        for c in COLUMNS[2:]:
+            if c in keep:
+                continue
+            if c in sticky:
+                sets.append("%s = CASE WHEN excluded.status = 'unknown' AND sessions.status = "
+                            "'cut off' THEN sessions.%s ELSE excluded.%s END" % (c, c, c))
+            elif c in ("typed", "reopened"):
+                sets.append("%s = COALESCE(excluded.%s, sessions.%s)" % (c, c, c))
+            else:
+                sets.append("%s = excluded.%s" % (c, c))
+        read = sorted({r["harness"] for r in rows} - set(failed))
+        with con:
+            if read:
+                con.execute("UPDATE sessions SET in_store = 0 WHERE harness IN (%s)"
+                            % ",".join("?" * len(read)), read)
+            con.executemany(
+                "INSERT INTO sessions (%s) VALUES (%s) ON CONFLICT(harness, id) DO UPDATE SET %s"
+                % (", ".join(COLUMNS), ", ".join("?" * len(COLUMNS)), ", ".join(sets)),
+                [tuple(r[c] for c in COLUMNS) for r in rows])
+        return con.execute("SELECT %s FROM sessions ORDER BY last DESC" % ", ".join(COLUMNS)) \
+            .fetchall()
+    finally:
+        con.close()
+
+
+def flagged(r):
+    """Worth an audit: you ran it, and it was cut off, or stopped mid-turn with
+    no record of how it ended. A clean exit record outranks mid-turn: hermes
+    closes a session mid-turn to continue it in a compressed one."""
+    return bool(r["interactive"]) and (
+        r["status"] == "cut off" or (r["status"] == "unknown" and bool(r["mid_turn"])))
+
+
+def history_row(r):
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["last"] or 0))
+    mark = "mid-turn" if r["mid_turn"] else ""
+    return clean("%-8s  %-24s  %s  %-8s  %-24s  %s" % (
+        r["harness"], short_path(r["cwd"] or "")[-24:], when, mark, (r["how"] or "")[:24],
+        r["last_prompt"] or r["title"] or ""))
+
+
+def show_history(everything=False, as_json=False):
+    rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
+    if as_json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    by = {}
+    for r in rows:
+        c = by.setdefault(r["harness"], dict.fromkeys(
+            ("sessions", "running", "closed", "cut off", "unknown", "mid-turn"), 0))
+        c["sessions"] += 1
+        c[r["status"]] = c.get(r["status"], 0) + 1
+        c["mid-turn"] += 1 if r["mid_turn"] else 0
+    print("cgr: %d sessions from %d harnesses, in\n%s\n" % (len(rows), len(by), db_path()))
+    cols = ("sessions", "running", "closed", "cut off", "unknown", "mid-turn")
+    print("  %-9s" % "harness" + "".join("%9s" % c for c in cols))
+    for h in sorted(by, key=lambda h: -by[h]["sessions"]):
+        print("  %-9s" % h + "".join("%9d" % by[h][c] for c in cols))
+    bad = [r for r in rows if flagged(r)]
+    limit = len(bad) if everything else 40
+    width = shutil.get_terminal_size((160, 20)).columns
+    print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (
+        len(bad), "" if len(bad) <= limit else " (the %d newest; --all shows every one)" % limit))
+    for r in bad[:limit]:
+        print("  " + history_row(r)[:width - 3])
+    print("\naudit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
+    return 0
 
 
 # -- the command a tab runs --------------------------------------------------
@@ -1134,6 +1922,11 @@ def main(argv=None):
     ap.add_argument("--all", "-a", action="store_true",
                     help="include sessions that died before the previous boot")
     ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
+    ap.add_argument("--save", action="store_true",
+                    help="record every agent running now; the next cgr reopens them")
+    ap.add_argument("--history", action="store_true",
+                    help="index every session of every harness into sessions.db and list "
+                         "the ones cut off or left mid-turn (--all lists every one)")
     ap.add_argument("--notify", action="store_true", help="one line if anything died")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--watch", action="store_true", help="run the watcher (systemd does this)")
@@ -1141,6 +1934,19 @@ def main(argv=None):
 
     if args.watch:
         return watch()
+    if args.history:
+        return show_history(everything=args.all, as_json=args.json)
+    if args.save:
+        items = save()
+        if not items:
+            print("cgr: no agent is running on a terminal, so there is nothing to save")
+            return 0
+        print("cgr: saved %d running session%s. After the restart, run cgr to reopen them.\n"
+              % (len(items), "" if len(items) == 1 else "s"))
+        for s in items:
+            print("  " + row(s)[:shutil.get_terminal_size((120, 20)).columns - 3])
+            print("      " + runnable(s))
+        return 0
     items = collect(everything=args.all)
     for s in items:
         s["command"] = command(s)

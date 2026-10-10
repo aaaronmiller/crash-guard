@@ -30,6 +30,14 @@ that were cut off and reopens the ones you pick, each in a new tab, in its own
 directory, with the command line you originally typed plus that harness's
 resume flag. Sessions you exited yourself are not listed.
 
+Two more jobs use the same machinery:
+
+- **Before a planned restart**, `cgr --save` records every agent running now.
+  Shut down however you like; afterwards `cgr` reopens that same set.
+- **For an audit**, `cgr --history` puts every session from every harness on
+  the machine into one SQLite database, and flags the ones that were cut off
+  or left mid-task.
+
 It needs no launcher prefix, no shell hook and no harness plugin. A small
 background watcher reads `/proc`, and `cgr` reads the records each harness
 already keeps.
@@ -47,6 +55,8 @@ cgr --yes         # reopen all of them without asking
 cgr --all         # also sessions from before the previous boot
 cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
+cgr --save        # before a planned restart: record what runs now
+cgr --history     # every session of every harness into sessions.db; list the unfinished
 ```
 
 Example, after the 2026-10-09 WSL crash that this tool was rebuilt for. The
@@ -71,6 +81,56 @@ to run by hand.
 
 The first interactive shell of each boot prints one line if anything died
 (`cgr --notify`, from the shell integration).
+
+## Before a planned restart: `cgr --save`
+
+```bash
+cgr --save        # records each running agent with its session id
+# ...exit them, close the windows, wsl --shutdown, reboot: any of these...
+cgr               # after the restart: the saved sessions are listed; Enter reopens them
+```
+
+Each saved session is listed once its process is gone, however it ended, and
+leaves the list once it is reopened or forgotten. Saving again replaces the
+previous set. `--save` prints what it recorded and the exact command each one
+will reopen with, so you can check the ids before you shut down. Claude
+sessions are saved by their pid file, any session named on its command line
+(`codex resume <id>`) by that id, and codex, omp and hermes otherwise by the
+newest session in their directory.
+
+## Every session, in one database: `cgr --history`
+
+```bash
+cgr --history          # refresh the database, print a summary and the newest 40 to audit
+cgr --history --all    # every session worth an audit
+sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
+```
+
+It reads the stores of 11 harnesses (claude, codex, omp, pi, hermes, jcode,
+muse, gemini, qwen, opencode/kilo, openclaw) and keeps one row per session:
+id, folder, harness, start and last activity, size, model, git branch, first
+and last prompt, how it ended, and the line that reopens it. First run on this
+machine: 1,455 sessions, 383 to audit.
+
+Each session gets one **status**, with its evidence in the `how` column:
+
+| status | meaning |
+|---|---|
+| `running` | a process holds it now |
+| `closed` | the harness recorded an exit it chose (`/exit`, quit, `status Closed`) |
+| `cut off` | it ended without choosing to: machine went down, window closed, killed, a crash status, or no end record where the harness always writes one |
+| `unknown` | the harness keeps no end record and nothing else saw it end (pi, gemini, qwen, opencode) |
+
+`mid_turn` = 1 means the record stops on your prompt, a tool call, a tool
+result or an error: the agent was still working. The `audit` view lists
+sessions you ran yourself (not SDK, `exec`, subagent or scheduled runs) that
+are cut off, or unknown and mid-turn, newest first, with the last prompt you
+gave each one.
+
+Rows are never deleted. When a harness prunes an old session (claude keeps 30
+days), its row stays with `in_store` = 0. The watcher refreshes the database
+once a day. How each harness's store and end record are read, and why, is in
+`docs/design.md` section 17.
 
 ## How it works
 
@@ -100,7 +160,7 @@ enough.
    |---|---|
    | claude | `~/.claude/sessions/<pid>.json` left behind (Claude deletes it on every exit it gets to run, SIGHUP included); a closed window also leaves `SessionEnd` reason `other` |
    | codex | no `Agent loop exited` for the thread in `~/.codex/logs_*.sqlite` (codex logs one on `/quit` and after a closed window, but not when the machine dies) |
-   | omp | no `session_exit` record at the end of the transcript |
+   | omp | no `session_exit` record at the end of the transcript, or one naming `sighup` (window closed) or `sigterm` (killed) |
    | hermes | `ended_at` still NULL in `~/.hermes/state.db` |
 
 By default `cgr` only looks back to the start of the previous boot (read from
@@ -238,12 +298,15 @@ All under `~/.local/state/crash-guard/`:
 | `watch/watch.pid` | the watcher's pid and boot id |
 | `watch/boot-<boot_id>` | when this boot started, read once early on, before the clock drifts |
 | `cgr-handled.json` | sessions already reopened or forgotten, hidden until they die again |
+| `saved.json` | what `cgr --save` recorded, with session ids |
+| `sessions.db` | `cgr --history`: every session from every harness (SQLite) |
 
 Records older than 30 days are pruned when the watcher starts. Field-level
 formats are in `docs/design.md`, section 14.
 
 **Privacy.** These files hold each agent's working directory, arguments and
-typed command line, in plain text. Do not pass secrets as command-line
+typed command line, in plain text, and `sessions.db` holds each session's
+first and last prompt. Do not pass secrets as command-line
 arguments. The directories are owner-only (`0700`) and the files `0600`, the
 same rule the ledger's `history.jsonl` follows. Older files with looser modes
 are repaired when the watcher starts.
@@ -269,7 +332,7 @@ send escape sequences to your terminal.
 ## Repository layout
 
 ```text
-bin/cgr                cgr: find cut-off sessions and reopen them; `cgr --watch` is the watcher
+bin/cgr                cgr: find cut-off sessions and reopen them; --save, --history; --watch is the watcher
 systemd/cgr-watch.service  the watcher as a systemd user service
 bin/cg-session-end     Claude Code SessionEnd hook: records how a session ended
 docs/design.md         theory of operation, alternatives, limits, audit procedure
