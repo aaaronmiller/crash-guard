@@ -1,0 +1,16 @@
+# cgr watcher: notes which agent sessions lose their terminal, so `cgr` can
+# reopen them. Reads /proc every 2s; touches no shell and no harness.
+# Install: scripts/install.sh, or
+#   cp systemd/cgr-watch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cgr-watch
+[Unit]
+Description=cgr watcher: records agent sessions whose terminal dies
+
+[Service]
+ExecStart=%h/.local/bin/cgr --watch
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target

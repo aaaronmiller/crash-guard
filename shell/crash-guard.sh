@@ -8,8 +8,9 @@
 # crash-guard shell integration. Source this from ~/.zshrc or ~/.bashrc:
 #     source ~/.config/crash-guard/crash-guard.sh
 #
-# Works in bash and zsh. Defines the cg_run launcher primitive, the cgr/cgs
-# aliases, and a once-per-boot login notice when crashed sessions are detected.
+# Works in bash and zsh. Defines the cg_run launcher primitive, the cgs/cgh
+# aliases, and a once-per-boot login notice when sessions died. It installs no
+# per-command hook: closed windows are spotted by the cgr-watch user service.
 # It does NOT redefine your tool aliases; compose cg_run into your launcher
 # aliases in your shell rc.
 
@@ -90,20 +91,22 @@ cg_run() {
   return $rc
 }
 
-alias cgr='crash-guard restore'
-alias cgr-batch='crash-guard restore --batch'
+# `cgr` is bin/cgr on PATH, not an alias: it finds dead sessions from the
+# harnesses' own records, so it works whether or not cg_run launched them.
+unalias cgr 2>/dev/null
+alias cgr-batch='cgr --yes'
 alias cgs='crash-guard status'
 alias cgr-archive='crash-guard restore --from-archive --terminal ghostty'
 alias cgh='crash-guard history'
 
-# Once-per-boot crash notice on an interactive shell. The marker file is keyed
-# to the current boot_id, so after the first interactive shell this boot the
-# test below short-circuits with zero python cost.
+# Once-per-boot notice on an interactive shell when sessions died. The marker
+# is keyed to the boot_id, so every later shell this boot skips python entirely.
 if [ -n "${PS1:-}" ] || case "$-" in *i*) true;; *) false;; esac; then
   _cg_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   _cg_marker="${XDG_DATA_HOME:-$HOME/.local/share}/crash-guard/.notified-${_cg_boot}"
   if [ -n "${_cg_boot}" ] && [ ! -e "${_cg_marker}" ]; then
-    command crash-guard notify 2>/dev/null
+    mkdir -p "${_cg_marker%/*}" 2>/dev/null && : >| "${_cg_marker}"
+    command cgr --notify 2>/dev/null
   fi
   unset _cg_boot _cg_marker
 fi

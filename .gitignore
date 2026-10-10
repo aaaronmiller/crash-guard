@@ -31,3 +31,5 @@ Thumbs.db
 # iterations before being deleted -- worth ignoring rather than re-committing.
 .ralph-runner/
 archive/
+.gstack/
+.omc/

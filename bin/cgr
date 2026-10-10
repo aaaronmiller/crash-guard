@@ -1,0 +1,1158 @@
+#!/usr/bin/env python3
+# ---
+# date: 2026-10-09 00:00:00 PT
+# ---
+"""cgr -- reopen the agent sessions that died with your terminal or your machine.
+
+    cgr               pick with the arrow keys, reopen each one in a new tab
+    cgr --list        print what died and the command each one would run
+    cgr --yes         reopen all of them without asking
+    cgr --all         include sessions that died before the previous boot
+    cgr --forget      stop listing the sessions shown now
+    cgr --notify      one line if anything died (the login hook calls this)
+    cgr --json
+    cgr --watch       the watcher; systemd runs it as cgr-watch.service
+
+A session is listed when it was running and nobody exited it: the machine went
+down under it, or its window closed. It reopens in a new tab, in its own
+directory, with the command line you originally typed (alias, flags, proxy
+variables and all), minus any old session flags, plus that harness's resume
+flag.
+
+Nothing hooks a shell or a harness. There are two sources:
+
+The watcher (`cgr --watch`) lists /proc every 2s and only reads processes it
+has not seen before. For each agent running on a terminal it records the
+directory, the argv, and the command line you typed, matched by timestamp in
+~/.zsh_history. When an agent goes away it asks one question: did the shell
+that owned its terminal go with it? A shell still at its prompt means you
+exited; a dead shell means the window closed. The set of live agents is kept
+per boot, so after a crash the previous boot's set is exactly what was
+running. It treats every harness the same way.
+
+The harnesses' own records cover crashes the watcher was not running for:
+  claude  ~/.claude/sessions/<pid>.json is deleted on every exit Claude gets
+          to run; one whose process is gone means the machine died. SIGHUP
+          gives SessionEnd reason "other" (recorded by bin/cg-session-end).
+  codex   logs_*.sqlite gets "Agent loop exited" when a thread shuts down; a
+          thread cut off by a dead machine has none.
+  omp     custom/session_exit ends a cleanly closed transcript.
+  hermes  sessions.ended_at stays NULL for a session that never closed.
+
+Each signal was checked against live processes on 2026-10-09.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import sqlite3
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "crash-guard"
+WTMP = Path("/var/log/wtmp")
+HZ = os.sysconf("SC_CLK_TCK")
+
+# glibc x86_64 `struct utmp`, 384 bytes. ut_type 2 is BOOT_TIME; field 9 is tv_sec.
+UTMP = struct.Struct("hi32s4s32s256shhiii16s20s")
+BOOT_TIME = 2
+KEEP_DAYS = 30
+
+# harness: (resume by id, continue the newest session here, session-picking
+# flags to drop from a typed command before adding ours). Taken from each
+# CLI's own --help on 2026-10-09.
+HARNESSES = {
+    "claude": (["--resume", "{id}"], ["--continue"],
+               {"--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"}),
+    "codex": (["resume", "{id}"], ["resume", "--last"], {"resume", "--last"}),
+    "omp": (["--resume", "{id}"], ["--continue"], {"--resume", "-r", "--continue", "-c"}),
+    "pi": (["--session", "{id}"], ["--continue"],
+           {"--continue", "-c", "--resume", "-r", "--session", "--session-id"}),
+    "hermes": (["--resume", "{id}"], ["--continue"], {"--resume", "--continue"}),
+    "opencode": (["--session", "{id}"], ["--continue"], {"--continue", "-c", "--session", "-s"}),
+    "kilo": (["--session", "{id}"], ["--continue"], {"--continue", "-c", "--session", "-s"}),
+    "agy": (["--conversation", "{id}"], ["--continue"], {"--continue", "-c", "--conversation"}),
+    "jcode": (["--resume", "{id}"], None, {"--resume"}),
+    "ante": (["--resume", "{id}"], ["--continue-session"], {"--resume", "--continue-session", "-c"}),
+    "gemini": (["--resume", "{id}"], ["--resume", "latest"], {"--resume", "-r"}),
+    "qwen": (["--resume", "{id}"], ["--continue"],
+             {"--resume", "-r", "--continue", "-c", "--session-id"}),
+    "muse": (["resume", "{id}"], ["resume", "--last"], {"resume", "--last"}),
+    "openclaw": (None, ["resume"], {"resume"}),
+    "omx": (["--resume", "{id}"], ["--continue"], {"--resume", "-r", "--continue", "-c"}),
+}
+
+INTERPRETERS = re.compile(r"(node|nodejs|bun|deno|python[0-9.]*|sh|bash|dash)$")
+# First positional words that mean a one-shot or a server, not a session.
+NOT_A_SESSION = {"exec", "e", "run", "serve", "server", "app-server", "mcp", "mcp-server", "login",
+                 "logout", "update", "upgrade", "install", "uninstall", "doctor", "auth",
+                 "config", "completion", "gateway", "daemon", "dashboard", "cron", "web"}
+ONE_SHOT_FLAGS = {"-p", "--print", "--version", "--help", "-h"}
+
+
+# -- boots and processes -----------------------------------------------------
+
+def current_boot():
+    """(start epoch, boot_id) of the running kernel."""
+    btime = 0
+    try:
+        with open("/proc/stat") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    btime = int(line.split()[1])
+                    break
+    except OSError:
+        pass
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot_id = ""
+    return btime, boot_id
+
+
+def boot_start():
+    """(start epoch, boot_id) of the running kernel, as first read this boot.
+
+    btime is the wall clock minus uptime, and the two drift apart: in WSL it
+    read 18 minutes early 12 hours into a boot (2026-10-10). Read that late,
+    sessions busy just before a crash would count as this boot's. The watcher
+    starts with the boot, so its reading is kept per boot id and reused.
+    """
+    btime, boot_id = current_boot()
+    path = watch_dir() / ("boot-%s" % boot_id)
+    try:
+        return int(path.read_text()), boot_id
+    except (OSError, ValueError):
+        pass
+    try:
+        private_dir(STATE)
+        private_dir(watch_dir())
+        write_private(path, "%d\n" % btime)
+    except OSError:
+        pass
+    return btime, boot_id
+
+
+def previous_boot_start(btime):
+    """When the boot before this one began, from wtmp.
+
+    Every process alive when that boot ended was started inside it, so this is
+    the floor for "running when the machine went down". wtmp stamps a WSL boot
+    a minute or two after the kernel's btime, hence the margin.
+    """
+    starts = []
+    try:
+        data = WTMP.read_bytes()
+    except OSError:
+        data = b""
+    for off in range(0, len(data) - UTMP.size + 1, UTMP.size):
+        rec = UTMP.unpack_from(data, off)
+        if rec[0] == BOOT_TIME:
+            starts.append(rec[9])
+    earlier = [s for s in starts if s < btime - 60]
+    return max(earlier) if earlier else btime - 86400
+
+
+def proc_stat(pid):
+    """(ppid, session id, tty_nr, start ticks) of a live process, or None.
+
+    A zombie counts as dead: a closed window's shell can sit unreaped for a
+    moment, and it is no longer at any prompt.
+    """
+    try:
+        f = Path("/proc/%d/stat" % int(pid)).read_text().rsplit(")", 1)[1].split()
+    except (OSError, TypeError, ValueError, IndexError):
+        return None
+    if f[0] in ("Z", "X"):
+        return None
+    return int(f[1]), int(f[3]), int(f[4]), f[19]
+
+
+def proc_ticks(pid):
+    st = proc_stat(pid)
+    return st[3] if st else None
+
+
+def proc_argv(pid):
+    try:
+        raw = Path("/proc/%d/cmdline" % int(pid)).read_bytes()
+    except (OSError, TypeError, ValueError):
+        return []
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def alive(pid, ticks):
+    return ticks is not None and proc_ticks(pid) == ticks
+
+
+def harness_of(argv):
+    """(harness, index of its word in argv) for an interactive agent, else None."""
+    i = 0
+    if argv and INTERPRETERS.match(os.path.basename(argv[0])):
+        if len(argv) > 1 and argv[1] == "-c":
+            return None  # `sh -c '...'`: a command string, not a script
+        i = 1
+        while i < len(argv) and argv[i].startswith("-"):
+            i += 1
+    if i >= len(argv):
+        return None
+    name = re.sub(r"\.(c?js|mjs|py)$", "", os.path.basename(argv[i]))
+    if name not in HARNESSES:
+        return None
+    rest = argv[i + 1:]
+    first = next((a for a in rest if not a.startswith("-")), None)
+    if first in NOT_A_SESSION or ONE_SHOT_FLAGS.intersection(rest):
+        return None
+    return name, i
+
+
+# -- what you typed ------------------------------------------------------------
+
+def history(size=1 << 20):
+    """[(epoch, command line)] from the end of the zsh history, oldest first."""
+    path = Path(os.environ.get("HISTFILE") or HOME / ".zsh_history").expanduser()
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - size))
+            raw = fh.read()
+    except OSError:
+        return []
+    if b"\x83" in raw:  # zsh "metafies" bytes >= 0x83 as 0x83, byte ^ 0x20
+        out, it = bytearray(), iter(raw)
+        for b in it:
+            out.append((next(it, 0x20) ^ 0x20) if b == 0x83 else b)
+        raw = bytes(out)
+    entries = []
+    for line in raw.decode("utf-8", "replace").split("\n"):
+        m = re.match(r": (\d+):\d+;(.*)$", line)
+        if m:
+            entries.append([int(m.group(1)), m.group(2)])
+        elif entries and entries[-1][1].endswith("\\"):
+            entries[-1][1] = entries[-1][1][:-1] + "\n" + line
+    return [(t, c) for t, c in entries]
+
+
+def aliases():
+    """{name: expansion} from the alias lines in your zsh startup files."""
+    out = {}
+    for name in (".zshrc", ".zsh_aliases"):
+        try:
+            text = (HOME / name).read_text(errors="replace")
+        except OSError:
+            continue
+        for m in re.finditer(r"^\s*alias\s+([\w.+-]+)=(.*)$", text, re.M):
+            try:
+                words = shlex.split(m.group(2), comments=True)
+            except ValueError:
+                continue
+            if words:
+                out[m.group(1)] = words[0]
+    return out
+
+
+def words_of(text):
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return None
+
+
+def segments(line):
+    return [s.strip() for s in re.split(r"&&|\|\||;|\n", line) if s.strip()]
+
+
+def head_word(words):
+    """Index of the command word, past any VAR=value assignments."""
+    i = 0
+    while i < len(words) - 1 and re.match(r"[A-Za-z_]\w*=", words[i]):
+        i += 1
+    return i
+
+
+def harness_in(line, amap):
+    """The harness the last command of a typed line starts, directly or via an alias."""
+    segs = segments(line)
+    words = words_of(segs[-1]) if segs else None
+    if not words:
+        return None
+    word = words[head_word(words)]
+    if os.path.basename(word) in HARNESSES:
+        return os.path.basename(word)
+    found = [os.path.basename(w) for w in (words_of(amap.get(word, "")) or [])
+             if os.path.basename(w) in HARNESSES]
+    return found[-1] if found else None
+
+
+def typed_for(harness, started, hist, amap):
+    """The command line typed to start `harness` at `started`, from zsh history.
+
+    zsh writes the entry when the command starts, so it sits a moment before
+    the process does -- longer when an alias starts a proxy first.
+    """
+    best = None
+    for t, line in hist:
+        if started - 300 <= t <= started + 5 and harness_in(line, amap) == harness:
+            best = line  # oldest first, so the last match is the closest
+    return best
+
+
+def launch_env(pid):
+    """CGR_LAUNCH from a process environment: the typed line cgr reopened it with."""
+    try:
+        raw = Path("/proc/%d/environ" % pid).read_bytes()
+    except OSError:
+        return None
+    for kv in raw.split(b"\0"):
+        if kv.startswith(b"CGR_LAUNCH="):
+            return kv[11:].decode("utf-8", "replace") or None
+    return None
+
+
+# -- the watcher -------------------------------------------------------------
+
+def watch_dir():
+    return STATE / "watch"
+
+
+def private_dir(path):
+    """Owner-only, like history.jsonl: cgr's state holds argv, cwds and typed
+    command lines. The chmod repairs a directory made before this rule."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+
+
+def write_private(path, text, append=False):
+    """Write a state file owner-only, repairing one created before the rule.
+    Explicit modes rather than a umask, which tabs cgr opens would inherit."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    with os.fdopen(os.open(path, flags, 0o600), "a" if append else "w") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        fh.write(text)
+
+
+class Watcher:
+    """Tracks agents on terminals; records the ones whose terminal died with them."""
+
+    def __init__(self):
+        private_dir(STATE)
+        private_dir(watch_dir())
+        for f in watch_dir().iterdir():
+            os.chmod(f, 0o600)  # files written before the owner-only rule
+        self.boot = boot_start()[1]
+        self.known = set()   # pids already looked at
+        self.agents = {}     # pid -> record
+        self.pending = {}    # agent gone, shell alive: asked once more next scan
+        self.live = watch_dir() / ("live-%s.json" % self.boot)
+        self.deaths = watch_dir() / "deaths.jsonl"
+        try:  # what an earlier run saw at launch: dated then, not re-dated from an age
+            self.seen = {(r["pid"], r["ticks"]): r for r in json.loads(self.live.read_text())}
+        except (OSError, ValueError, TypeError, KeyError):
+            self.seen = {}
+
+    def scan(self):
+        now = time.time()
+        pids = {int(p) for p in os.listdir("/proc") if p.isdigit()}
+        changed = False
+        due, self.pending = self.pending, {}
+        for rec in due.values():
+            if not alive(rec["leader"], rec["leader_ticks"]):
+                self.died(rec, now)
+        for pid, rec in list(self.agents.items()):
+            if pid in pids and alive(pid, rec["ticks"]):
+                changed |= self.refresh(rec)
+                continue
+            del self.agents[pid]
+            changed = True
+            if rec["leader"] == pid:
+                continue  # it owned its own terminal: no shell to ask
+            if alive(rec["leader"], rec["leader_ticks"]):
+                self.pending[pid] = rec  # in case the shell is mid-hangup
+            else:
+                self.died(rec, now)
+        for pid in sorted(pids - self.known):
+            self.known.add(pid)
+            rec = self.consider(pid)
+            if rec:
+                self.agents[pid] = rec
+                changed = True
+        self.known &= pids
+        if changed:
+            self.write_live()
+
+    def consider(self, pid):
+        st = proc_stat(pid)
+        if not st or st[2] == 0:
+            return None  # gone already, or no terminal: a daemon or a pipe
+        argv = proc_argv(pid)
+        hit = harness_of(argv)
+        if not hit:
+            return None
+        parent = st[0]
+        for _ in range(40):  # only the outermost agent on this terminal is a session
+            pst = proc_stat(parent)
+            if not pst or pst[1] != st[1]:
+                break  # past the terminal's shell: another tab or pane is its own session
+            if parent in self.agents or harness_of(proc_argv(parent)):
+                return None
+            parent = pst[0]
+        old = self.seen.pop((pid, st[3]), {})
+        # btime as of now: one read when the watcher started slides with the clock.
+        started = old.get("started") or current_boot()[0] + int(st[3]) / HZ
+        try:
+            cwd = os.readlink("/proc/%d/cwd" % pid)
+        except OSError:
+            cwd = ""
+        rec = {"pid": pid, "ticks": st[3], "started": started, "harness": hit[0],
+               "argv": argv, "cwd": cwd, "leader": st[1], "leader_ticks": proc_ticks(st[1]),
+               "boot": self.boot, "session": None,
+               "typed": old.get("typed") or launch_env(pid)
+               or typed_for(hit[0], started, history(), aliases())}
+        self.refresh(rec)
+        return rec
+
+    def refresh(self, rec):
+        """Claude names its session in its pid file; keep up with /clear and /resume."""
+        if rec["harness"] != "claude":
+            return False
+        try:
+            sid = json.loads((HOME / ".claude" / "sessions" / ("%d.json" % rec["pid"]))
+                             .read_text()).get("sessionId")
+        except (OSError, ValueError):
+            return False
+        if sid and sid != rec["session"]:
+            rec["session"] = sid
+            return True
+        return False
+
+    def died(self, rec, now):
+        write_private(self.deaths, json.dumps(dict(rec, died=now)) + "\n", append=True)
+
+    def write_live(self):
+        tmp = self.live.with_suffix(".tmp")
+        write_private(tmp, json.dumps(list(self.agents.values())))
+        os.replace(tmp, self.live)
+
+    def prune(self):
+        cutoff = time.time() - KEEP_DAYS * 86400
+        for f in list(watch_dir().glob("live-*.json")) + list(watch_dir().glob("boot-*")):
+            if mtime(f) < cutoff:
+                f.unlink()
+        try:
+            lines = self.deaths.read_text().splitlines()
+        except OSError:
+            return
+        keep = [l for l in lines if (json.loads(l).get("died") or 0) >= cutoff]
+        if len(keep) != len(lines):
+            write_private(self.deaths, "".join(l + "\n" for l in keep))
+
+
+def watch(interval=2.0):
+    w = Watcher()
+    w.prune()
+    write_private(watch_dir() / "watch.pid", "%d\n%s\n" % (os.getpid(), w.boot))
+    while True:
+        try:
+            w.scan()
+        except Exception as e:  # one bad /proc read must not stop the watcher
+            print("cgr --watch: %r" % e, file=sys.stderr, flush=True)
+        time.sleep(interval)
+
+
+def watcher_running(boot_id):
+    try:
+        pid, boot = (watch_dir() / "watch.pid").read_text().split()[:2]
+    except (OSError, ValueError):
+        return False
+    return boot == boot_id and "--watch" in proc_argv(int(pid))
+
+
+def watched(boot_id, since):
+    """Agents the watcher saw die: alive at the end of an earlier boot, or
+    gone together with their shell."""
+    out = []
+    for f in watch_dir().glob("live-*.json"):
+        if f.stem[5:] == boot_id or mtime(f) < since:
+            continue
+        try:
+            recs = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        out += [dict(r, how="machine went down", last=mtime(f)) for r in recs]
+    try:
+        lines = (watch_dir() / "deaths.jsonl").read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("died", 0) >= since:
+            out.append(dict(r, how="window closed", last=r["died"]))
+    return out
+
+
+# -- reading transcripts -----------------------------------------------------
+
+def tail(path, size=262144):
+    """Records from the end of a JSONL file, newest first."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - size))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            yield rec
+
+
+def exit_reason(path):
+    """The reason on a session_exit that follows the last message, else None."""
+    for rec in tail(path):
+        if rec.get("customType") == "session_exit":
+            return rec.get("reason") or "unknown"
+        if rec.get("type") in ("user", "assistant", "message"):
+            return None
+    return None
+
+
+def prompt_text(rec):
+    if rec.get("type") == "title" and isinstance(rec.get("title"), str):
+        return rec["title"]  # omp keeps a running title as its first record
+    msg = rec.get("message")
+    if rec.get("isMeta") or not isinstance(msg, dict) or msg.get("role") != "user":
+        return ""
+    text = msg.get("content")
+    if isinstance(text, list):
+        text = " ".join(b.get("text", "") for b in text
+                        if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(text, str):
+        return ""
+    text = " ".join(text.split())
+    return "" if text.startswith(("<", "Caveat:", "[Request interrupted")) else text
+
+
+def head(path, limit=300):
+    """(entrypoint, cwd, first prompt) from the start of a transcript."""
+    entry = cwd = None
+    title = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i >= limit or (entry and cwd and title):
+                    break
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    entry = entry or rec.get("entrypoint")
+                    cwd = cwd or rec.get("cwd")
+                    title = title or prompt_text(rec)
+    except OSError:
+        pass
+    return entry, cwd, title
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def session(harness, sid, cwd, last, how, title, started=None):
+    return {"harness": harness, "id": sid, "cwd": cwd or str(HOME), "last": last, "how": how,
+            "title": title or "", "started": started, "typed": None, "argv": None}
+
+
+# -- claude ------------------------------------------------------------------
+
+def claude_pids(btime):
+    """Session ids with a live process, and pid files whose process is gone."""
+    live, dead = set(), {}
+    for f in (HOME / ".claude" / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        sid = d.get("sessionId")
+        if not sid or d.get("entrypoint", "cli") != "cli":
+            continue  # sdk-cli / sdk-py are `claude -p` and SDK runs, not terminals
+        ticks = d.get("procStart")
+        started = (d.get("startedAt") or 0) / 1000
+        if started >= btime - 5 and (proc_ticks(d.get("pid")) == str(ticks) if ticks
+                                     else os.path.exists("/proc/%s" % d.get("pid"))):
+            live.add(sid)
+        else:
+            dead[sid] = d
+    return live, dead
+
+
+def claude(since, btime, live, dead):
+    out = []
+    for path in glob.glob(str(HOME / ".claude" / "projects" / "*" / "*.jsonl")):
+        last, sid = mtime(path), Path(path).stem
+        if last < since or sid in live:
+            continue
+        reason = exit_reason(path)
+        if reason == "other":
+            how = "window closed"
+        elif reason is None and sid in dead:
+            how = "machine went down" if last < btime else "killed"
+        else:
+            continue  # closed on purpose, or no evidence either way
+        entry, cwd, title = head(path)
+        if entry not in (None, "cli") or not title:
+            continue
+        pid = dead.get(sid, {})
+        out.append(session("claude", sid, pid.get("cwd") or cwd, last, how, title,
+                           (pid.get("startedAt") or 0) / 1000 or None))
+    return out
+
+
+def claude_transcript(sid):
+    found = glob.glob(str(HOME / ".claude" / "projects" / "*" / (sid + ".jsonl")))
+    return found[0] if found else None
+
+
+def claude_in(cwd, since, live, taken):
+    """Newest claude session in `cwd` touched since `since` that nobody holds."""
+    d = HOME / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    for path in sorted(d.glob("*.jsonl"), key=mtime, reverse=True):
+        last, sid = mtime(path), path.stem
+        if last < since:
+            break
+        if sid in live or ("claude", sid) in taken or exit_reason(path) not in (None, "other"):
+            continue
+        entry, _, title = head(path)
+        if entry in (None, "cli") and title:
+            return sid, last, title
+    return None
+
+
+# -- codex -------------------------------------------------------------------
+
+INTERACTIVE = ("source NOT IN ('exec', 'mcp') AND source NOT LIKE '{%' "
+               "AND COALESCE(thread_source, '') != 'subagent' AND archived = 0")
+
+
+def codex_db(pattern):
+    found = glob.glob(str(HOME / ".codex" / pattern))
+    return max(found, key=lambda p: int(re.sub(r"\D", "", Path(p).stem) or 0)) if found else None
+
+
+def ro(path):
+    return sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=2)
+
+
+def codex_threads(where, params):
+    db = codex_db("state_*.sqlite")
+    if not db:
+        return []
+    try:
+        con = ro(db)
+        try:
+            return con.execute("SELECT id, cwd, title, updated_at, created_at FROM threads WHERE "
+                               + INTERACTIVE + " AND " + where + " ORDER BY updated_at DESC",
+                               params).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def codex(since, btime):
+    logs = codex_db("logs_*.sqlite")
+    if not logs:
+        return []
+    out = []
+    try:
+        con = ro(logs)
+    except sqlite3.Error:
+        return out
+    try:
+        for tid, cwd, title, _, created in codex_threads("updated_at >= ?", (since,)):
+            last, ended = con.execute(
+                "SELECT MAX(ts), MAX(CASE WHEN feedback_log_body LIKE '%Agent loop exited%' "
+                "OR feedback_log_body LIKE '%op.dispatch.shutdown%' THEN ts END) "
+                "FROM logs WHERE thread_id = ?", (tid,)).fetchone()
+            if last is None or last >= btime:
+                continue  # nothing to judge by, or touched this boot (the watcher's job)
+            if ended is not None and ended >= last - 120:
+                continue  # torn down: /quit, or the daemon reaping a closed window
+            out.append(session("codex", tid, cwd, last, "machine went down", title, created))
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    return out
+
+
+# -- omp / hermes ------------------------------------------------------------
+
+def omp_files(since, until):
+    for path in glob.glob(str(HOME / ".omp" / "agent" / "sessions" / "*" / "*.jsonl")):
+        last = mtime(path)
+        if since <= last < until and exit_reason(path) is None:
+            _, cwd, title = head(path, limit=40)
+            if title:
+                yield path, last, cwd, title
+
+
+def omp(since, btime):
+    return [session("omp", Path(path).stem.split("_", 1)[-1], cwd, last, "not closed", title)
+            for path, last, cwd, title in omp_files(since, btime)]
+
+
+def hermes_rows(where, params):
+    db = HOME / ".hermes" / "state.db"
+    if not db.exists():
+        return []
+    try:
+        con = ro(db)
+        try:
+            return con.execute(
+                "SELECT id, cwd, COALESCE(last_activity_at, started_at), COALESCE(title, ''), "
+                "started_at FROM sessions WHERE ended_at IS NULL AND id NOT LIKE 'cron_%' "
+                "AND COALESCE(message_count, 0) > 0 AND " + where
+                + " ORDER BY COALESCE(last_activity_at, started_at) DESC", params).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return []
+
+
+def hermes(since, btime):
+    return [session("hermes", sid, cwd, last, "not closed", title or "(untitled)", started)
+            for sid, cwd, last, title, started in hermes_rows(
+                "COALESCE(last_activity_at, started_at) >= ?", (since,)) if last < btime]
+
+
+# -- watcher records to sessions ---------------------------------------------
+
+def resolve(rec, live, taken):
+    """The session a dead agent process was running, looked up in its harness's store."""
+    h, cwd, since = rec["harness"], rec["cwd"], rec["started"] - 5
+    hit = None
+    if h == "claude":
+        path = rec.get("session") and claude_transcript(rec["session"])
+        if path:
+            hit = session(h, rec["session"], cwd, mtime(path), rec["how"], head(path)[2])
+        else:
+            found = claude_in(cwd, since, live, taken)
+            if found:
+                hit = session(h, found[0], cwd, found[1], rec["how"], found[2])
+    elif h == "codex":
+        for tid, _, title, updated, _ in codex_threads("cwd = ? AND updated_at >= ?",
+                                                       (cwd, since)):
+            if ("codex", tid) not in taken:
+                hit = session(h, tid, cwd, updated, rec["how"], title)
+                break
+    elif h == "omp":
+        for path, last, ocwd, title in sorted(omp_files(since, time.time() + 1),
+                                              key=lambda x: -x[1]):
+            sid = Path(path).stem.split("_", 1)[-1]
+            if ocwd == cwd and ("omp", sid) not in taken:
+                hit = session(h, sid, cwd, last, rec["how"], title)
+                break
+    elif h == "hermes":
+        for sid, _, last, title, _ in hermes_rows("cwd = ? AND started_at >= ?", (cwd, since)):
+            if ("hermes", sid) not in taken:
+                hit = session(h, sid, cwd, last, rec["how"], title or "(untitled)")
+                break
+    # No readable store: its own "continue" flag picks the newest session there.
+    s = hit or session(h, None, cwd, rec["last"], rec["how"], "")
+    s["last"] = max(s["last"], rec["last"])
+    s.update(started=rec["started"], typed=rec.get("typed"), argv=rec.get("argv"))
+    if not s["title"]:
+        s["title"] = s["typed"] or " ".join(rec.get("argv") or [h])
+    return s
+
+
+# -- collecting --------------------------------------------------------------
+
+def key(s):
+    return "%s:%s" % (s["harness"], s["id"] or "%s@%s" % (s["cwd"], int(s["started"] or 0)))
+
+
+def running_words():
+    """Every word on the command line of an agent running now. A session named
+    there (`claude --resume <id>`) is alive again, even before its harness
+    records that: a resumed claude writes its pid file late."""
+    words = set()
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            argv = proc_argv(int(p))
+            if harness_of(argv):
+                words.update(argv)
+                words.update(a.split("=", 1)[1] for a in argv if "=" in a)
+    return words
+
+
+def load_handled():
+    try:
+        return json.loads((STATE / "cgr-handled.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def mark_handled(items):
+    now = time.time()
+    handled = {k: v for k, v in load_handled().items() if v > now - KEEP_DAYS * 86400}
+    for s in items:
+        handled[key(s)] = now
+    private_dir(STATE)
+    tmp = STATE / "cgr-handled.json.tmp"
+    write_private(tmp, json.dumps(handled, indent=1))
+    os.replace(tmp, STATE / "cgr-handled.json")
+
+
+def collect(everything=False):
+    btime, boot_id = boot_start()
+    since = 0 if everything else previous_boot_start(btime) - 120
+    live, dead = claude_pids(btime)
+    items = {}
+    for s in claude(since, btime, live, dead) + codex(since, btime) + omp(since, btime) \
+            + hermes(since, btime):
+        items.setdefault((s["harness"], s["id"]), s)
+    taken = set()
+    for rec in sorted(watched(boot_id, since), key=lambda r: -r["started"]):
+        s = resolve(rec, live, taken)
+        k = (s["harness"], s["id"]) if s["id"] else (s["harness"], s["cwd"], rec["started"])
+        taken.add(k)
+        if k in items:
+            items[k].update({f: s[f] for f in ("typed", "argv", "started") if s[f]})
+        else:
+            items[k] = s
+    hist, amap = None, None
+    for s in items.values():
+        if not s["typed"] and s["started"]:
+            if hist is None:
+                hist, amap = history(), aliases()
+            s["typed"] = typed_for(s["harness"], s["started"], hist, amap)
+    handled = load_handled()
+    running = running_words()
+    shown, continued = [], set()
+    for s in sorted(items.values(), key=lambda s: -s["last"]):
+        if handled.get(key(s), 0) >= s["last"] or s["id"] in running:
+            continue
+        if s["id"] is None:
+            # Without an id, "continue the newest" can only reopen one session per directory.
+            if (s["harness"], s["cwd"]) in continued:
+                continue
+            continued.add((s["harness"], s["cwd"]))
+        shown.append(s)
+    return shown
+
+
+# -- the command a tab runs --------------------------------------------------
+
+def resume_args(s):
+    by_id, cont, _ = HARNESSES.get(s["harness"], (None, None, set()))
+    if s["id"] and by_id:
+        return [a.replace("{id}", s["id"]) for a in by_id]
+    return list(cont or [])
+
+
+def strip_args(args, strip):
+    """Drop old session-picking flags, and typed prompts, which must not be re-sent."""
+    out, drop_value = [], False
+    for a in args:
+        if drop_value:
+            drop_value = False
+            if not a.startswith("-"):
+                continue
+        if a.split("=", 1)[0] in strip:
+            drop_value = "=" not in a
+            continue
+        if any(c.isspace() for c in a):
+            continue
+        out.append(a)
+    return out
+
+
+def command(s):
+    """What you typed, minus old session flags, plus this harness's resume."""
+    h = s["harness"]
+    strip = HARNESSES.get(h, (None, None, set()))[2]
+    extra = resume_args(s)
+    tail_text = " " + shlex.join(extra) if extra else ""
+    typed = s.get("typed")
+    if typed:
+        segs = segments(typed)
+        prefix = "".join(x + " && " for x in segs[:-1] if not re.match(r"cd(\s|$)", x))
+        last = segs[-1]
+        words = None if re.search(r"[$`|<>]", last) else words_of(last)
+        if words:
+            i = head_word(words)
+            if os.path.basename(words[i]) != h:
+                exp = words_of(aliases().get(words[i], "")) or []
+                at = [j for j, w in enumerate(exp) if os.path.basename(w) == h]
+                if at and any(w.split("=", 1)[0] in strip for w in exp[at[-1] + 1:]):
+                    return prefix + last  # the alias picks its session itself (--continue)
+            return prefix + shlex.join(words[:i + 1] + strip_args(words[i + 1:], strip) + extra)
+        return prefix + last + tail_text
+    argv = s.get("argv") or [h]
+    hit = harness_of(argv)
+    at = hit[1] if hit else 0
+    return shlex.join([h] + strip_args(argv[at + 1:], strip) + extra)
+
+
+# -- showing -----------------------------------------------------------------
+
+def short_path(p):
+    home = str(HOME)
+    return "~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+
+
+def row(s):
+    when = time.strftime("%m-%d %H:%M", time.localtime(s["last"]))
+    return "%-8s  %-26s  %-11s  %-17s  %s" % (
+        s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"])
+
+
+def choose(items):
+    """Arrow-key multi-select, everything ticked. Returns the chosen items."""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    picked, cur = [True] * len(items), 0
+    width = shutil.get_terminal_size((120, 20)).columns
+    help_line = "  up/down move   space toggle   a all/none   enter reopen   q quit"
+
+    def draw(first):
+        out = [] if first else ["\r\x1b[%dA" % len(items)]
+        for i, s in enumerate(items):
+            line = ("%s [%s] %s" % (">" if i == cur else " ", "x" if picked[i] else " ",
+                                    row(s)))[:width - 1]
+            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if i == cur else line) + "\n")
+        out.append("\r\x1b[K" + help_line[:width - 1])
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?25l")
+        draw(True)
+        while True:
+            k = os.read(fd, 8)
+            while k == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
+                k += os.read(fd, 8)
+            if k in (b"\x1b[A", b"\x1bOA", b"k"):
+                cur = (cur - 1) % len(items)
+            elif k in (b"\x1b[B", b"\x1bOB", b"j"):
+                cur = (cur + 1) % len(items)
+            elif k == b" ":
+                picked[cur] = not picked[cur]
+            elif k == b"a":
+                picked = [not all(picked)] * len(items)
+            elif k in (b"\r", b"\n"):
+                return [s for s, p in zip(items, picked) if p]
+            elif k in (b"q", b"\x1b", b"\x03", b"\x04"):
+                return []
+            draw(False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h\n")
+        sys.stdout.flush()
+
+
+# -- reopening ---------------------------------------------------------------
+
+def run_argv(s):
+    """cd, run the command through your interactive shell (so aliases work),
+    then stay in a shell there. CGR_LAUNCH carries the typed line to the
+    watcher, so a reopened session keeps its original launch command."""
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    launch = "export CGR_LAUNCH=%s; " % shlex.quote(s["typed"]) if s.get("typed") else ""
+    inner = "cd %s && { %s%s; }; exec %s -l" % (shlex.quote(s["cwd"]), launch, command(s),
+                                               shlex.quote(shell))
+    return [shell, "-lic", inner]
+
+
+def tab_title(s):
+    return "%s %s" % (s["harness"], short_path(s["cwd"]))
+
+
+def wezterm_window(cli):
+    """The window to add tabs to. WEZTERM_PANE does not cross into WSL, so ask
+    the mux which pane has focus, and fall back to the only window there is."""
+    def ask(*args):
+        r = subprocess.run([cli, "cli", *args, "--format", "json"],
+                           capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout) if r.returncode == 0 else []
+    try:
+        panes = ask("list")
+        pane = os.environ.get("WEZTERM_PANE")
+        if pane is None:
+            clients = [c for c in ask("list-clients") if c.get("focused_pane_id") is not None]
+            clients.sort(key=lambda c: (c.get("idle_time") or {}).get("secs", 1 << 30))
+            pane = clients[0]["focused_pane_id"] if clients else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    for p in panes:
+        if str(p.get("pane_id")) == str(pane):
+            return p.get("window_id")
+    windows = {p.get("window_id") for p in panes}
+    return windows.pop() if len(windows) == 1 else None
+
+
+def open_wezterm(cli, items):
+    window = wezterm_window(cli)
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    domain = ["--domain-name", "WSL:" + distro] if distro and cli.endswith(".exe") else []
+    place = ["--window-id", str(window)] if window is not None else ["--new-window"]
+    for s in items:
+        r = subprocess.run([cli, "cli", "spawn", *domain, *place, "--", *run_argv(s)],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise RuntimeError("wezterm cli spawn: " + (r.stderr.strip() or "failed"))
+        subprocess.run([cli, "cli", "set-tab-title", "--pane-id", r.stdout.strip(),
+                        tab_title(s)], capture_output=True, timeout=10)
+        yield s
+
+
+def open_windows_terminal(items):
+    distro = os.environ.get("WSL_DISTRO_NAME", "")
+    for s in items:
+        # wt.exe splits its own command line on ';', so escape them for the shell.
+        argv = [a.replace(";", "\\;") for a in run_argv(s)]
+        r = subprocess.run(["wt.exe", "-w", "0", "new-tab", "--title", tab_title(s), "wsl.exe",
+                            *(["-d", distro] if distro else []), "--exec", *argv],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            raise RuntimeError("wt.exe new-tab: " + (r.stderr.strip() or "failed"))
+        yield s
+
+
+def open_tmux(items, inside):
+    for i, s in enumerate(items):
+        if inside or i or subprocess.run(["tmux", "has-session", "-t", "cgr"],
+                                         capture_output=True).returncode == 0:
+            target = [] if inside else ["-t", "cgr"]
+            argv = ["tmux", "new-window", *target, "-n", tab_title(s), "-c", s["cwd"]]
+        else:
+            argv = ["tmux", "new-session", "-d", "-s", "cgr", "-n", tab_title(s), "-c", s["cwd"]]
+        if subprocess.run(argv + run_argv(s)).returncode != 0:
+            raise RuntimeError("tmux could not open a window")
+        yield s
+
+
+def reopen(items):
+    """Open each item in a new tab of the terminal cgr was run from."""
+    wez = shutil.which("wezterm") or shutil.which("wezterm.exe")
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        how, opener = "tmux windows", open_tmux(items, inside=True)
+    elif os.environ.get("TERM_PROGRAM") == "WezTerm" and wez:
+        how, opener = "WezTerm tabs", open_wezterm(wez, items)
+    elif os.environ.get("WT_SESSION") and shutil.which("wt.exe"):
+        how, opener = "Windows Terminal tabs", open_windows_terminal(items)
+    elif shutil.which("tmux"):
+        how, opener = "tmux session 'cgr'", open_tmux(items, inside=False)
+    else:
+        how, opener = None, iter(())
+    done = []
+    try:
+        for s in opener:
+            done.append(s)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        print("cgr: %s" % e, file=sys.stderr)
+    if done:
+        mark_handled(done)
+        print("reopened %d as %s" % (len(done), how))
+    left = [s for s in items if s not in done]
+    if left:
+        print("run these yourself:" if how is None else "not reopened -- run these yourself:")
+        for s in left:
+            print("  cd %s && %s" % (shlex.quote(s["cwd"]), command(s)))
+    if done and how == "tmux session 'cgr'" and sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", "cgr"])
+    return 0 if not left else 1
+
+
+# -- main --------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="cgr", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--list", "-l", action="store_true",
+                    help="print what died and the command each would run")
+    ap.add_argument("--yes", "-y", action="store_true", help="reopen all without asking")
+    ap.add_argument("--dry-run", "-n", action="store_true", help="same as --list")
+    ap.add_argument("--all", "-a", action="store_true",
+                    help="include sessions that died before the previous boot")
+    ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
+    ap.add_argument("--notify", action="store_true", help="one line if anything died")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--watch", action="store_true", help="run the watcher (systemd does this)")
+    args = ap.parse_args(argv)
+
+    if args.watch:
+        return watch()
+    items = collect(everything=args.all)
+    for s in items:
+        s["command"] = command(s)
+
+    if args.json:
+        print(json.dumps(items, indent=1))
+        return 0
+    if args.notify:
+        if items:
+            names = ", ".join("%s %s" % (s["harness"], short_path(s["cwd"])) for s in items[:3])
+            more = " and %d more" % (len(items) - 3) if len(items) > 3 else ""
+            print("\033[33mcgr:\033[0m %d agent session%s died (%s%s) -- run \033[1mcgr\033[0m "
+                  "to reopen" % (len(items), "" if len(items) == 1 else "s", names, more))
+        return 0
+    if not watcher_running(current_boot()[1]):
+        print("cgr: the watcher is not running, so only claude windows that close are caught."
+              "\n     start it: systemctl --user enable --now cgr-watch\n")
+    if not items:
+        print("cgr: nothing died -- no agent session was cut off since the previous boot began"
+              + ("" if args.all else " (--all looks further back)"))
+        return 0
+    if args.forget:
+        mark_handled(items)
+        print("cgr: forgot %d session%s" % (len(items), "" if len(items) == 1 else "s"))
+        return 0
+
+    print("These agent sessions were cut off:\n")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if args.list or args.dry_run or args.yes or not interactive:
+        for s in items:
+            print("  " + row(s)[:shutil.get_terminal_size((120, 20)).columns - 3])
+            if args.list or args.dry_run or not interactive:
+                print("      cd %s && %s" % (shlex.quote(s["cwd"]), s["command"]))
+        if args.list or args.dry_run:
+            return 0
+        if not args.yes:
+            print("\nnot a terminal: run `cgr --yes` to reopen all, or the commands above")
+            return 0
+        chosen = items
+    else:
+        chosen = choose(items)
+        if not chosen:
+            print("nothing reopened")
+            return 0
+    return reopen(chosen)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

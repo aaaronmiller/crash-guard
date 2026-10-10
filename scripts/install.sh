@@ -52,9 +52,32 @@ if [ -n "$INSTALLED_VER" ] && [ "$(printf '%s\n' "$INSTALLED_VER" "$SRC_VER" | s
   echo "  (the install dir may be behind the installed binary)"
 fi
 
-# --- copy the tool + shell integration --------------------------------------
+# --- copy the tool + companions + shell integration --------------------------
+# Companions ship as symlinks so `crash-guard recover --compare` resolves
+# cg-forensic even though only crash-guard itself is copied. Before this,
+# install.sh shipped crash-guard alone, and the installed binary resolved
+# siblings from ~/.local/bin (abspath, no symlink resolution) where
+# cg-forensic never existed -- so --compare silently printed forensic 0.
 install -m 0755 "$SRC_DIR/bin/crash-guard" "$BIN_DIR/crash-guard"
+for tool in cgr cg-recover cg-forensic cg-snapshot cg-telemetry cg-harness-monitor cg-correlate cg-session-end; do
+  if [ -f "$SRC_DIR/bin/$tool" ]; then
+    ln -sf "$SRC_DIR/bin/$tool" "$BIN_DIR/$tool"
+  fi
+done
 install -m 0644 "$SRC_DIR/shell/crash-guard.sh" "$CFG_DIR/crash-guard.sh"
+
+# --- the cgr watcher, as a user service ---------------------------------------
+# It is what lets `cgr` tell a closed window from a deliberate exit for every
+# harness. Skipped quietly where there is no systemd user instance.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  mkdir -p "$HOME/.config/systemd/user"
+  install -m 0644 "$SRC_DIR/systemd/cgr-watch.service" "$HOME/.config/systemd/user/cgr-watch.service"
+  systemctl --user daemon-reload
+  systemctl --user enable --now cgr-watch.service
+  systemctl --user restart cgr-watch.service
+else
+  echo "warning: no systemd user instance; run 'cgr --watch' yourself to catch closed windows" >&2
+fi
 
 # --- write repo path marker for self-update ----------------------------------
 echo "$SRC_DIR" > "$CFG_DIR/.crash-guard-repo"
