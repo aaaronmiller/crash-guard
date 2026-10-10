@@ -493,7 +493,7 @@ def watch(interval=2.0):
     w.prune()
     write_private(watch_dir() / "watch.pid", "%d\n%s\n" % (os.getpid(), w.boot))
     # sessions.db once a day, before the harnesses prune their old sessions
-    # (claude keeps 30 days); first look ten minutes in, clear of the boot.
+    # (Claude Code's default is 30 days); first look ten minutes in, clear of the boot.
     check, child = time.time() + 600, None
     while True:
         try:

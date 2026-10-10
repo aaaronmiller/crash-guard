@@ -1051,7 +1051,9 @@ session ended, and upserts one row per session into
 the newest 40 sessions worth an audit (`--all` prints every one, `--json`
 every row). The watcher refreshes the database once a day in a low-priority
 child process (`refresh_index()`), so sessions are captured before their
-harness prunes them: claude keeps transcripts 30 days.
+harness prunes them. Claude Code's default is 30 days; this machine sets
+`cleanupPeriodDays` to 99999 (checked 2026-10-10), so the daily refresh is
+a safeguard here, not a necessity.
 
 First run, 2026-10-10: **1,455 sessions** from 11 harnesses, February to
 October 2026, in 29 s cold and 10.6 s warm. **383** were flagged for audit;

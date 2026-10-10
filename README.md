@@ -127,8 +127,8 @@ sessions you ran yourself (not SDK, `exec`, subagent or scheduled runs) that
 are cut off, or unknown and mid-turn, newest first, with the last prompt you
 gave each one.
 
-Rows are never deleted. When a harness prunes an old session (claude keeps 30
-days), its row stays with `in_store` = 0. The watcher refreshes the database
+Rows are never deleted. When a harness prunes an old session (Claude Code's
+default is 30 days; `cleanupPeriodDays` is 99999 on this machine), its row stays with `in_store` = 0. The watcher refreshes the database
 once a day. How each harness's store and end record are read, and why, is in
 `docs/design.md` section 17.
 
