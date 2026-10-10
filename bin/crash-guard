@@ -3470,8 +3470,7 @@ def cmd_restore(args):
                 # second, differently-spelled command is how `cgr` managed to
                 # be simultaneously correct and useless after a real crash:
                 # it knew the answer and made the user retype it elsewhere.
-                path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "cg-recover")
+                path = _sibling("cg-recover")
                 flags = ["--restore"]
                 if args.yes or args.batch:
                     flags.append("--yes")
@@ -4358,17 +4357,34 @@ def cmd_analytics(args):
     return 0
 
 
-def _detector(name, *flags):
-    """Run one of the sibling detectors and return its parsed JSON.
+def _sibling(name):
+    """Resolve a companion tool by realpath, then repo marker, then PATH.
 
-    They stay separate executables because they are separately testable and
-    each is useful alone, but `crash-guard` is the one command a user runs.
-    Shelling out rather than importing keeps that seam honest: the detectors
-    own their own CLIs and this only depends on their JSON, so neither can
-    break the other by refactoring internals.
+    abspath() does not resolve the ~/.local/bin symlink install.sh creates,
+    so sibling lookup from the install dir silently misses every companion
+    (cg-forensic returned None and --compare printed forensic 0). realpath()
+    follows the link back to bin/. The marker file covers copies that are
+    neither symlinks nor in-repo; PATH covers user-installed companions.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-    if not os.path.exists(path):
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, name)
+    if os.path.exists(path):
+        return path
+    try:
+        marker = CFG_DIR / ".crash-guard-repo"
+        if marker.exists():
+            path = os.path.join(marker.read_text().strip(), "bin", name)
+            if os.path.exists(path):
+                return path
+    except OSError:
+        pass
+    found = shutil.which(name)
+    return found
+
+
+def _detector(name, *flags):
+    path = _sibling(name)
+    if not path or not os.path.exists(path):
         return None
     try:
         out = subprocess.run([sys.executable, path, "--json", *flags],
@@ -4396,7 +4412,7 @@ def cmd_recover(args):
 
     if args.restore or (not args.compare and not args.json):
         # These are interactive/human-formatted; hand the terminal over.
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cg-recover")
+        path = _sibling("cg-recover")
         return subprocess.call([sys.executable, path, *flags])
 
     marker = _detector("cg-recover", *flags) or []
