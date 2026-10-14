@@ -52,7 +52,7 @@ how to re-verify every claim.
 cgr               # pick with the arrow keys, reopen each in a new tab
 cgr --list        # print what died and the exact command each would run; change nothing
 cgr --yes         # reopen all of them without asking
-cgr --all         # also sessions from before the previous boot
+cgr --all         # also sessions from before the last boot that had agents
 cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
 cgr --save        # before a planned restart: record what runs now
@@ -164,7 +164,9 @@ enough.
    | hermes | `ended_at` still NULL in `~/.hermes/state.db` |
 
 By default `cgr` only looks back to the start of the previous boot (read from
-`/var/log/wtmp`), so weeks-old sessions never show up. Headless runs
+`/var/log/wtmp`), so weeks-old sessions never show up. A boot the watcher saw
+end with no agent running is stepped over, so WSL booting itself again after
+a crash (its updater does) does not hide the boot your agents died in. Headless runs
 (`claude -p`, SDK runs, `codex exec`, subagents) are never listed. A session
 whose id is on the command line of an agent running now (you already resumed
 it) is not listed either.

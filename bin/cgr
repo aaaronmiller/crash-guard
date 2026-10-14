@@ -7,7 +7,8 @@
     cgr               pick with the arrow keys, reopen each one in a new tab
     cgr --list        print what died and the command each one would run
     cgr --yes         reopen all of them without asking
-    cgr --all         include sessions that died before the previous boot
+    cgr --all         include sessions that died before the last boot that had
+                      agents running
     cgr --forget      stop listing the sessions shown now
     cgr --save        before a planned restart: record every agent running now,
                       so the next `cgr` reopens them however they get closed
@@ -33,7 +34,9 @@ directory, the argv, and the command line you typed, matched by timestamp in
 that owned its terminal go with it? A shell still at its prompt means you
 exited; a dead shell means the window closed. The set of live agents is kept
 per boot, so after a crash the previous boot's set is exactly what was
-running. It treats every harness the same way.
+running. A boot that ended with none (WSL restarting itself after an
+update, then idling out) is stepped over to the one before it. It treats
+every harness the same way.
 
 The harnesses' own records cover crashes the watcher was not running for:
   claude  ~/.claude/sessions/<pid>.json is deleted on every exit Claude gets
@@ -167,6 +170,45 @@ def previous_boot_start(btime):
             starts.append(rec[9])
     earlier = [s for s in starts if s < btime - 60]
     return max(earlier) if earlier else btime - 86400
+
+
+def ended_with_agents(boot_id):
+    """The watcher's set held an agent when that boot ended, or `cgr --save` ran in it."""
+    try:
+        if json.loads(read_own(watch_dir() / ("live-%s.json" % boot_id))):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        return any(isinstance(s, dict) and s.get("boot") == boot_id
+                   for s in json.loads(read_own(saved_path())).get("sessions") or [])
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def crash_boot_start(btime, boot_id):
+    """When the boot that went down with your agents began.
+
+    Usually the boot before this one. But WSL can boot again and idle out
+    before you look: on 2026-10-13 its own update stopped the VM at 05:05 with
+    six agents running, started it at 05:06 to finish, and let it idle out at
+    05:12, so the boot before this one was five empty minutes. A boot the
+    watcher saw end with no agent running and nothing saved is stepped over to
+    the one before it; a boot it did not see is not.
+    """
+    empty = []
+    for f in watch_dir().glob("boot-*"):
+        if f.name[5:] != boot_id and not ended_with_agents(f.name[5:]):
+            try:
+                empty.append(int(read_own(f)))
+            except (OSError, ValueError):
+                pass
+    start = previous_boot_start(btime)
+    for _ in empty:
+        if not any(abs(start - began) < 300 for began in empty):  # wtmp stamps a boot late
+            break
+        start = previous_boot_start(start)
+    return start
 
 
 def proc_stat(pid):
@@ -911,10 +953,11 @@ def merge(items, s):
 
 
 def cut_off(everything=False):
-    """{key: session} for every session cut off since the previous boot began
-    (ever, with `everything`), before the reopened and running ones are dropped."""
+    """{key: session} for every session cut off since the boot that went down
+    with them began (ever, with `everything`), before the reopened and running
+    ones are dropped."""
     btime, boot_id = boot_start()
-    since = 0 if everything else previous_boot_start(btime) - 120
+    since = 0 if everything else crash_boot_start(btime, boot_id) - 120
     live, dead = claude_pids(btime)
     items = {}
     for s in claude(since, btime, live, dead) + codex(since, btime) + omp(since, btime) \
@@ -1920,7 +1963,7 @@ def main(argv=None):
     ap.add_argument("--yes", "-y", action="store_true", help="reopen all without asking")
     ap.add_argument("--dry-run", "-n", action="store_true", help="same as --list")
     ap.add_argument("--all", "-a", action="store_true",
-                    help="include sessions that died before the previous boot")
+                    help="include sessions that died before the last boot that had agents running")
     ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
     ap.add_argument("--save", action="store_true",
                     help="record every agent running now; the next cgr reopens them")
@@ -1965,7 +2008,7 @@ def main(argv=None):
         print("cgr: the watcher is not running, so only claude windows that close are caught."
               "\n     start it: systemctl --user enable --now cgr-watch\n")
     if not items:
-        print("cgr: nothing died -- no agent session was cut off since the previous boot began"
+        print("cgr: nothing died -- no agent session was cut off since the last boot with agents began"
               + ("" if args.all else " (--all looks further back)"))
         return 0
     if args.forget:

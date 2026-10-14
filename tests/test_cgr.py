@@ -347,6 +347,38 @@ class CgrTests(unittest.TestCase):
         self.assertEqual((s["how"], s["cwd"]), ("machine went down", "/k"))
         self.assertEqual(self.cg.command(s), "kilo -m fast --continue")
 
+    def watched_boot(self, name, began, agents=None, last=None):
+        d = self.cg.watch_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ("boot-%s" % name)).write_text("%d\n" % began)
+        if agents is not None:
+            recs = [{"pid": n + 1, "ticks": "1", "started": began + 100, "harness": "kilo",
+                     "argv": ["kilo"], "cwd": cwd, "leader": 2, "leader_ticks": "1",
+                     "boot": name, "session": None, "typed": "kilo"} for n, cwd in enumerate(agents)]
+            (d / ("live-%s.json" % name)).write_text(json.dumps(recs))
+            os.utime(d / ("live-%s.json" % name), (last or began + 200,) * 2)
+
+    def test_an_empty_boot_after_the_crash_does_not_hide_it(self):
+        # 2026-10-13: a WSL update stopped the VM at 05:05 with six agents
+        # running, booted it at 05:06 to finish, and let it idle out at 05:12.
+        # At 12:42 "the previous boot" was those five empty minutes, every
+        # session was older than it, and cgr said nothing died.
+        crashed = self.prev - 86400
+        self.write_wtmp([crashed - 86400, crashed, self.prev, self.btime + 90])
+        self.watched_boot("crashed", crashed, ["/k"])  # the set last changed early on
+        self.watched_boot("empty", self.prev)          # the watcher ran; no agent did
+        self.pidfile(999990, "idle", "/w", crashed + 60, 1)
+        self.transcript("idle", [prompt("hi"), REPLY], self.prev - 3000)  # quiet its last hour
+        found = self.found()
+        self.assertIn(("claude", "idle"), found)
+        self.assertEqual([s["cwd"] for s in found.values() if s["harness"] == "kilo"], ["/k"])
+
+    def test_a_boot_that_went_down_with_agents_ends_the_look_back(self):
+        older = self.prev - 86400
+        self.watched_boot("older", older, ["/old"])
+        self.watched_boot("crashed", self.prev, ["/new"], last=self.crash)
+        self.assertEqual([s["cwd"] for s in self.cg.collect()], ["/new"])
+
     def test_two_dead_agents_in_one_place_without_ids_reopen_once(self):
         d = self.cg.watch_dir()
         d.mkdir(parents=True)

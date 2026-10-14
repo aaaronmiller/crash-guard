@@ -537,6 +537,19 @@ Now:
    ended was started inside that boot, so this is the tightest bound that
    still catches them. It is also what keeps sessions from weeks ago out of
    the list, which the old fallback got wrong.
+   **Empty boots are stepped over** (`crash_boot_start()`). "The previous
+   boot" assumes one boot per crash, and on 2026-10-13 that failed: the WSL
+   3.0.3.0 MSI stopped the VM at 05:05 with six agents running, booted it at
+   05:06 to finish installing, and let it idle out at 05:12. At 12:42 the
+   previous boot was those five empty minutes, every source dropped the six
+   sessions as older than the window, and `cgr` said nothing died. Now a
+   boot the watcher saw (`watch/boot-<id>`) that ended with an empty live
+   set and no `cgr --save` record moves the window to the boot before it,
+   repeatedly; a boot the watcher did not see stops the walk, because
+   nothing says it was empty. Pinned by
+   `test_an_empty_boot_after_the_crash_does_not_hide_it` (written first,
+   failing with `{}`, as the real run did) and
+   `test_a_boot_that_went_down_with_agents_ends_the_look_back`.
 2. **Native sessions** from `claude()`, `codex()`, `omp()` and `hermes()`,
    keyed by (harness, id).
 3. **Watcher records** from `watched()`, newest first, each passed through
