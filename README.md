@@ -50,9 +50,10 @@ how to re-verify every claim.
 
 ```bash
 cgr               # pick with the arrow keys, reopen each in a new tab
-cgr --list        # print what died and the exact command each would run; change nothing
+cgr --list        # print what died and the exact command each would run; open no tabs
 cgr --yes         # reopen all of them without asking
-cgr --all         # also sessions from before the last boot that had agents
+cgr --all         # earlier events too; groups older than seven days are collapsed
+cgr --all --expand-old --list  # show every session and command in older groups
 cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
 cgr --save        # before a planned restart: record what runs now
@@ -72,7 +73,7 @@ These agent sessions were cut off:
       cd /home/cheta/code/pareto && codex resume 01a12388-3c73-7653-94b6-250a36969bba
 ```
 
-In the picker every session starts ticked: up/down to move, space to toggle,
+In the picker recent sessions start ticked: up/down to move, space to toggle,
 `a` for all or none, Enter to reopen, `q` to quit. Each chosen session opens
 in a new tab of the terminal you ran `cgr` from: a tmux window if you are in
 tmux, otherwise a WezTerm tab, otherwise a Windows Terminal tab, otherwise a
@@ -81,6 +82,19 @@ to run by hand.
 
 The first interactive shell of each boot prints one line if anything died
 (`cgr --notify`, from the shell integration).
+
+Recovery is grouped by boot shutdown or crash, with a separate group for
+windows closed during each boot. The header gives the boot start, end and
+end evidence. Missing shutdown records use the next boot's start and say
+that the end is inferred. Native records without a boot id are associated
+by their last activity; JSON exposes `group`, `event` and `event_association`.
+Activity predating available boot records is grouped by date.
+
+In the picker, Space on a header selects the whole group; Space on a session
+selects that session. Press `o` to expand or collapse the current group.
+Groups older than seven days start collapsed and unselected. `--expand-old`
+shows their sessions; `a` explicitly selects or clears all groups. `--json`
+always includes every collected item, even when text output is collapsed.
 
 ## Before a planned restart: `cgr --save`
 
@@ -106,7 +120,7 @@ cgr --history --all    # every session worth an audit
 sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
 ```
 
-It reads the stores of 11 harnesses (claude, codex, omp, pi, hermes, jcode,
+It has store readers for 12 harnesses (claude, codex, omp, pi, hermes, jcode,
 muse, gemini, qwen, opencode/kilo, openclaw) and keeps one row per session:
 id, folder, harness, start and last activity, size, model, git branch, first
 and last prompt, how it ended, and the line that reopens it. First run on this
@@ -188,7 +202,9 @@ is typed again. Each reopened tab runs
 `$SHELL -lic "cd DIR && { export CGR_LAUNCH=<typed>; <command>; }; exec $SHELL -l"`:
 your aliases and proxy functions are loaded, a shell stays open afterwards,
 and `CGR_LAUNCH` carries the original line forward so a session reopened twice
-does not drift.
+does not drift. If no typed line exists, the rebuilt command is exported
+instead, so the next launch cannot borrow an unrelated history entry. Initial
+`-i` or `--prompt-interactive` prompts are removed rather than replayed.
 
 ### Why this design
 
@@ -212,21 +228,42 @@ short:
 
 ## Supported harnesses
 
-All 15 are detected by the watcher. Exact-conversation reopening needs a
-session store that `cgr` reads; the others use the harness's own "continue the
-newest session in this directory" flag.
+The watcher recognizes 15 harness names. On 2026-10-13, 13 are installed;
+ante and omx are absent, so their CLI definitions have not been rechecked.
+The watcher also recognizes the installed pi and qwen npm entrypoints whose
+filenames are `cli.js` and `cli-entry.js`. It rejects one-shot Qwen positional
+queries unless interactive mode was requested.
+The history index has native readers for 12 names, including kilo, which
+currently has no local store. Agy is indexed from watcher evidence after its
+presence lock has been matched to a conversation.
 
-| harness | found by | reopens |
+| harness | recovery evidence | resume command |
 |---|---|---|
-| claude | watcher + own records (all cases) | exact session (`--resume <id>`) |
-| codex | watcher + own records (machine death) | exact session (`resume <id>`) |
-| omp | watcher + own records (machine death) | exact session (`--resume <id>`) |
-| hermes | watcher + own records (machine death) | exact session (`--resume <id>`) |
-| pi, opencode, kilo, agy, ante, qwen, omx | watcher | newest session in the directory (`--continue` or equivalent) |
-| gemini | watcher | `--resume latest` |
-| muse | watcher | `resume --last` |
-| openclaw | watcher | `resume` |
-| jcode | watcher | the typed line again (jcode has no continue flag) |
+| claude | watcher and native records | `--resume <id>` |
+| codex | watcher and native machine-death records | `resume <id>` |
+| omp | watcher and native exit records | `--resume <id>` |
+| hermes | watcher and native open-session records | `--resume <id>` |
+| agy | watcher, with a unique presence-lock match | `--conversation <id>` |
+| jcode | watcher and indexed crash status | `--resume <id>` |
+| muse | watcher and indexed exit evidence | `resume <id>` |
+| openclaw | watcher and indexed failed-session windows | `resume <id>`; the CLI matches the session id among recent sessions |
+| pi, opencode, kilo, gemini, qwen | watcher; native stores resolve ids | CLI-specific resume-by-id flags |
+| ante, omx | watcher if installed; no native store reader | original continue flags |
+
+A missing working directory leaves a selected session unhandled and prints
+the problem, so opening an empty tab cannot count as recovery.
+
+Recovery reads `sessions.db` for additional harnesses using interactive,
+cut-off rows still in their stores. Missing or day-old indexes refresh before
+recovery; fresh indexes are reused. The refresh derives verdicts from native
+stores and watcher evidence, so it cannot keep a stale verdict alive by
+reading it back as new evidence. Recent missing end markers alone do not
+prove a current-boot death.
+
+Zero cut-off rows for pi, gemini, qwen and opencode do not mean clean exits.
+Their current records have no process-exit signal. All 373 rows in those four
+stores are `unknown` on 2026-10-13; 100 stop mid-turn and remain candidates
+for `--history` audit. A watcher death can still make them recoverable.
 
 ## Install
 

@@ -2,6 +2,8 @@
 watcher, and reopens them with the command you typed -- one test per rule."""
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -379,6 +382,46 @@ class CgrTests(unittest.TestCase):
         self.watched_boot("crashed", self.prev, ["/new"], last=self.crash)
         self.assertEqual([s["cwd"] for s in self.cg.collect()], ["/new"])
 
+    def test_old_one_shot_records_cannot_stop_the_empty_boot_walk_or_be_restored(self):
+        earlier = self.prev - 86400
+        self.watched_boot("crashed", earlier, ["/real"])
+        self.watched_boot("empty", self.prev)
+        r = dict(self.cg.session("omp", None, "/catalog", self.prev + 200, "saved", "models"),
+                 boot="empty", argv=["omp", "models"], started=self.prev + 100)
+        (self.cg.watch_dir() / "live-empty.json").write_text(json.dumps([r]))
+        self.cg.saved_path().write_text(json.dumps({"sessions": [r]}))
+        self.assertFalse(self.cg.ended_with_agents("empty"))
+        self.assertEqual([s["cwd"] for s in self.cg.collect()], ["/real"])
+
+    def shutdown_at(self, when):
+        with self.cg.WTMP.open("ab") as fh:
+            fh.write(self.cg.UTMP.pack(1, 0, b"~", b"~~", b"shutdown", b"", 0, 0, 0,
+                                      int(when), 0, b"", b""))
+
+    def test_watched_live_set_is_dated_by_shutdown_not_its_last_change(self):
+        self.watched_boot("crashed", self.prev, ["/k"], last=self.prev + 200)
+        self.shutdown_at(self.crash)
+        rec, = self.cg.watched(self.boot_id, self.prev + 500)
+        self.assertEqual(rec["last"], self.crash)
+
+    def test_watched_boot_without_shutdown_is_dated_by_the_next_boot(self):
+        self.watched_boot("crashed", self.prev, ["/k"], last=self.prev + 200)
+        rec, = self.cg.watched(self.boot_id, self.prev)
+        self.assertEqual(rec["last"], self.btime)
+
+    def test_watcher_evidence_updates_native_last_for_the_handled_check(self):
+        self.pidfile(999990, "again", "/w", self.prev + 60, 1)
+        self.transcript("again", [prompt("hi"), REPLY], self.prev + 200)
+        self.cg.STATE.mkdir(exist_ok=True)
+        (self.cg.STATE / "cgr-handled.json").write_text(json.dumps({"claude:again": self.prev + 500}))
+        self.watched_boot("crashed", self.prev)
+        r = {"pid": 1, "ticks": "1", "started": self.prev + 100, "harness": "claude",
+             "argv": ["claude"], "cwd": "/w", "boot": "crashed", "session": "again"}
+        f = self.cg.watch_dir() / "live-crashed.json"
+        f.write_text(json.dumps([r])); os.utime(f, (self.prev + 200,) * 2)
+        self.shutdown_at(self.crash)
+        self.assertEqual(self.found()[("claude", "again")]["last"], self.crash)
+
     def test_two_dead_agents_in_one_place_without_ids_reopen_once(self):
         d = self.cg.watch_dir()
         d.mkdir(parents=True)
@@ -391,6 +434,92 @@ class CgrTests(unittest.TestCase):
             for p in (1, 2)))
         self.assertEqual(len(self.cg.collect()), 1)
 
+    def grouped_crashes(self):
+        earlier = self.prev - 86400
+        self.watched_boot("earlier", earlier, ["/earlier"])
+        self.watched_boot("recent", self.prev, ["/recent"])
+        r = {"harness": "kilo", "argv": ["kilo"], "cwd": "/window", "boot": self.boot_id,
+             "started": self.btime + 100, "died": self.btime + 200}
+        (self.cg.watch_dir() / "deaths.jsonl").write_text(json.dumps(r) + "\n")
+        return self.cg.collect(everything=True)
+
+    def test_two_crash_boots_and_a_window_close_form_three_ordered_groups(self):
+        items = self.grouped_crashes()
+        self.assertEqual(len({s["group"] for s in items}), 3)
+        self.assertEqual([s["cwd"] for s in items], ["/window", "/recent", "/earlier"])
+        self.assertEqual(items[1]["event"]["boot"], "recent")
+        self.assertEqual(items[2]["event"]["end"], self.prev)
+
+    def test_recovery_json_carries_the_event_group_without_changing_its_list_shape(self):
+        self.grouped_crashes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.cg.main(["--all", "--json"]), 0)
+        items = json.loads(output.getvalue())
+        self.assertEqual(len({s["group"] for s in items}), 3)
+        self.assertTrue(all("command" in s and "event" in s for s in items))
+
+    def test_old_groups_collapse_in_text_and_can_be_expanded(self):
+        self.watched_boot("old", self.prev - 10 * 86400, ["/old"])
+        items = self.cg.collect(everything=True)
+        # End is the next boot, also ten days old, rather than a live-file mtime.
+        self.write_wtmp([self.prev - 10 * 86400, self.prev - 9 * 86400,
+                         self.prev, self.btime + 90])
+        items = self.cg.collect(everything=True)
+        collapsed, expanded = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(collapsed):
+            self.cg.show_recovery(items)
+        with contextlib.redirect_stdout(expanded):
+            self.cg.show_recovery(items, expand_old=True)
+        self.assertIn("--expand-old", collapsed.getvalue())
+        self.assertNotIn("cd /old", collapsed.getvalue())
+        self.assertIn("cd /old", expanded.getvalue())
+
+    def test_picker_can_select_a_whole_group_without_selecting_other_events(self):
+        self.watched_boot("recent", self.prev, ["/one", "/two"])
+        self.watched_boot("earlier", self.prev - 86400, ["/other"])
+        items = self.cg.collect(everything=True)
+        self.assertEqual(set(self.picker_keys(items, (b"a", b" ", b"\r"))), {"/one", "/two"})
+
+    def test_picker_arrow_keys_move_to_another_event_header(self):
+        self.watched_boot("recent", self.prev, ["/one", "/two"])
+        self.watched_boot("earlier", self.prev - 86400, ["/other"])
+        items = self.cg.collect(everything=True)
+        keys = (b"a", b"\x1b[B", b"\x1b[B", b"\x1b[B", b" ", b"\r")
+        self.assertEqual(self.picker_keys(items, keys), ["/other"])
+
+    def picker_keys(self, items, keys):
+        data = self.home / "picker.json"; data.write_text(json.dumps(items))
+        script = self.home / "picker.py"
+        script.write_text("import json,sys\n" +
+                          "sys.path.insert(0, " + repr(str(ROOT / "tests")) + ")\n" +
+                          "from test_cgr import load_cgr\n" +
+                          "c=load_cgr()\nitems=json.load(open(sys.argv[1]))\n" +
+                          "picked=c.choose(items)\nprint('PICKED:'+json.dumps([s['cwd'] for s in picked]))\n")
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
+                                stdout=slave, stderr=slave)
+        os.close(slave)
+        try:
+            import select
+            output = b""; until = time.monotonic() + 5
+            while b"enter reopen" not in output and time.monotonic() < until:
+                if select.select([master], [], [], 0.1)[0]:output += os.read(master, 65536)
+            self.assertIn(b"enter reopen", output)
+            for key in keys:
+                os.write(master, key); time.sleep(0.05)
+            until = time.monotonic() + 5
+            while b"PICKED:" not in output and time.monotonic() < until:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:output += os.read(master, 65536)
+                    except OSError:break
+            self.assertEqual(proc.wait(timeout=2), 0)
+            picked = json.loads(output.split(b"PICKED:", 1)[1].splitlines()[0])
+            return picked
+        finally:
+            if proc.poll() is None:proc.kill(); proc.wait()
+            os.close(master)
+
     # -- harnesses and history -----------------------------------------------
 
     def test_harness_of_finds_scripts_and_skips_one_shots(self):
@@ -402,6 +531,104 @@ class CgrTests(unittest.TestCase):
         self.assertIsNone(h(["claude", "-p", "review"]))
         self.assertIsNone(h(["sh", "-c", "claude"]))
         self.assertIsNone(h(["vim", "claude.md"]))
+
+    def test_harness_of_recognizes_installed_generic_pi_and_qwen_entrypoints(self):
+        h = self.cg.harness_of
+        pi = "/x/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+        qwen = "/x/node_modules/@qwen-code/qwen-code/cli-entry.js"
+        self.assertEqual(h(["node", pi]), ("pi", 1))
+        self.assertEqual(h(["node", qwen]), ("qwen", 1))
+        self.assertIsNone(h(["node", pi, "list"]))
+        self.assertIsNone(h(["node", qwen, "sessions", "list"]))
+        self.assertIsNone(h(["node", "/x/unrelated/cli.js"]))
+
+    def test_harness_subcommands_and_one_shot_flags_are_specific_to_each_cli(self):
+        for argv in (["omp", "models"], ["codex", "review"], ["claude", "plugin", "list"],
+                     ["hermes", "--oneshot", "hi"], ["pi", "list"], ["gemini", "--list-sessions"],
+                     ["qwen", "sessions", "list"], ["agy", "models"], ["jcode", "version"],
+                     ["muse", "export", "x"], ["opencode", "models"], ["kilo", "stats"],
+                     ["openclaw", "sessions"], ["ante", "--help"], ["omx", "--version"]):
+            with self.subTest(argv=argv):
+                self.assertIsNone(self.cg.harness_of(argv))
+        for argv in (["codex", "-p", "work"], ["jcode", "-p", "provider"],
+                     ["claude", "models"], ["codex", "--model", "models"],
+                     ["jcode", "repl"], ["opencode", "attach", "http://local"],
+                     ["openclaw", "tui"]):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(self.cg.harness_of(argv))
+
+    def test_old_watcher_one_shots_are_not_recoverable(self):
+        d = self.cg.watch_dir(); d.mkdir(parents=True)
+        r = {"harness": "omp", "argv": ["omp", "models"], "cwd": "/w", "boot": self.boot_id,
+             "started": time.time() - 100, "died": time.time() - 50}
+        (d / "deaths.jsonl").write_text(json.dumps(r) + "\n")
+        self.assertEqual(self.cg.collect(), [])
+
+    def test_history_candidate_must_match_the_recorded_process_options(self):
+        d = self.cg.watch_dir(); d.mkdir(parents=True)
+        t = time.time() - 100
+        self.history([(t - 20, "codex --model unrelated")])
+        r = {"harness": "codex", "argv": ["codex", "resume", "real"], "cwd": "/w",
+             "boot": self.boot_id, "started": t, "died": t + 50, "typed": None}
+        (d / "deaths.jsonl").write_text(json.dumps(r) + "\n")
+        self.assertEqual(self.cg.command(self.cg.collect()[0]), "codex resume real")
+
+    def test_reopen_without_a_typed_line_exports_its_rebuilt_launch(self):
+        s = self.cg.session("codex", "real", "/w", 1, "", "")
+        self.assertIn("export CGR_LAUNCH=", self.cg.run_argv(s)[-1])
+
+    def agy_conversation(self, sid, when):
+        root = self.home / ".gemini" / "antigravity-cli"
+        (root / "presence").mkdir(parents=True, exist_ok=True)
+        (root / "conversations").mkdir(exist_ok=True)
+        lock = root / "presence" / (sid + ".lock")
+        lock.touch(); os.utime(lock, (when,) * 2)
+        db = root / "conversations" / (sid + ".db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE trajectory_meta (trajectory_id TEXT, cascade_id TEXT)")
+        con.execute("INSERT INTO trajectory_meta VALUES ('trajectory', ?)", (sid,))
+        con.commit(); con.close()
+
+    def test_agy_resolves_a_unique_presence_lock_near_process_start(self):
+        self.agy_conversation("dead", self.prev + 115)
+        self.agy_conversation("newer", self.btime + 100)
+        r = {"harness": "agy", "cwd": "/w", "started": self.prev + 100,
+             "last": self.crash, "how": "machine went down", "argv": ["agy"]}
+        self.assertEqual(self.cg.resolve(r, set(), set())["id"], "dead")
+
+    def test_agy_does_not_guess_between_simultaneous_presence_locks(self):
+        self.agy_conversation("a", self.prev + 110)
+        self.agy_conversation("b", self.prev + 120)
+        r = {"harness": "agy", "cwd": "/w", "started": self.prev + 100,
+             "last": self.crash, "how": "machine went down", "argv": ["agy"]}
+        self.assertIsNone(self.cg.resolve(r, set(), set())["id"])
+
+    def test_resolve_uses_short_resume_flags_and_ignores_future_transcripts(self):
+        self.assertEqual(self.cg.argv_id("claude", ["claude", "-r", "named"]), "named")
+        self.assertEqual(self.cg.argv_id("opencode", ["opencode", "-s", "named"]), "named")
+        for sid, when in (("old", self.crash - 20), ("future", self.btime + 10)):
+            jsonl(self.home / ".omp/agent/sessions/-w" / ("date_" + sid + ".jsonl"),
+                  [{"type": "session", "id": sid, "cwd": "/w"}, prompt("hi"), REPLY], when)
+        r = {"harness": "omp", "cwd": "/w", "started": self.prev + 100,
+             "last": self.crash, "how": "machine went down", "argv": ["omp"]}
+        self.assertEqual(self.cg.resolve(r, set(), set())["id"], "old")
+
+    def test_a_tab_title_failure_does_not_lose_a_successful_spawn(self):
+        s = self.cg.session("codex", "real", "/w", 1, "", "")
+        spawn = subprocess.CompletedProcess([], 0, stdout="42\n", stderr="")
+        with patch.object(self.cg, "wezterm_window", return_value=1), \
+             patch.object(self.cg.subprocess, "run", side_effect=[spawn, subprocess.TimeoutExpired([], 1)]):
+            self.assertEqual(list(self.cg.open_wezterm("wezterm", [s])), [s])
+
+    def test_missing_working_directory_is_not_spawned_or_marked_handled(self):
+        s = self.cg.session("jcode", "old", str(self.home / "gone"), self.crash, "cut off", "")
+        with patch.dict(os.environ, {"TERM_PROGRAM": "WezTerm", "TMUX": "", "WT_SESSION": ""}), \
+             patch.object(self.cg.shutil, "which", side_effect=lambda name: "/fake/wezterm" if name == "wezterm" else None), \
+             patch.object(self.cg, "open_wezterm", return_value=iter([s])) as opener, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.cg.reopen([s]), 1)
+            opener.assert_not_called()
+        self.assertEqual(self.cg.load_handled(), {})
 
     def test_history_unmetafies_and_joins_continued_lines(self):
         # U+2019 is E2 80 99; zsh metafies 0x99 (0x83..0x9f) as 0x83, 0x99 ^ 0x20.
@@ -429,6 +656,43 @@ class CgrTests(unittest.TestCase):
             self.cmd("claude", "new", "claude --dangerously-skip-permissions --resume old 'fix it'"),
             "claude --dangerously-skip-permissions --resume new")
 
+    def test_command_repairs_the_single_dash_resume_typo(self):
+        self.assertEqual(self.cmd("claude", "X", "claude -resume"), "claude --resume X")
+        self.assertEqual(self.cmd("claude", "X", "claude -resume old"), "claude --resume X")
+
+    def test_command_drops_one_word_prompts_on_every_reopen(self):
+        self.assertEqual(self.cmd("codex", "T", "codex continue"), "codex resume T")
+        self.assertEqual(self.cmd("codex", "T", argv=["codex", "continue", "resume", "T"]),
+                         "codex resume T")
+        self.assertEqual(self.cmd("claude", "X", "claude --fast continue"),
+                         "claude --fast --resume X")
+
+    def test_command_preserves_option_values_including_spaces(self):
+        self.assertEqual(self.cmd("claude", "X", "claude --model opus --name 'my work' continue"),
+                         "claude --model opus --name 'my work' --resume X")
+        self.assertEqual(self.cmd("codex", "T", "codex -m fast -c 'name=\"my work\"' continue"),
+                         "codex -m fast -c 'name=\"my work\"' resume T")
+        self.assertEqual(self.cmd("claude", "X", "claude --model=opus --add-dir /a /b --fast continue"),
+                         "claude --model=opus --add-dir /a /b --fast --resume X")
+
+    def test_command_drops_prompts_behind_an_alias_and_keeps_env_and_proxy_steps(self):
+        self.zshrc("alias cx='codex --yolo'\n")
+        self.assertEqual(self.cmd("codex", "T", "cd /w && _proxy_up && BASE=local cx -m fast continue"),
+                         "_proxy_up && BASE=local cx -m fast resume T")
+
+    def test_command_does_not_replay_flagged_initial_prompts(self):
+        for h, typed, expected in (
+                ("agy", "agy --model fast -i hello", "agy --model fast --conversation X"),
+                ("gemini", "gemini --prompt-interactive hello", "gemini --resume X"),
+                ("qwen", "qwen -i hello", "qwen --resume X"),
+                ("opencode", "opencode --prompt hello", "opencode --session X")):
+            with self.subTest(harness=h):
+                self.assertEqual(self.cmd(h, "X", typed), expected)
+
+    def test_qwen_positional_queries_are_one_shot_but_interactive_prompts_are_sessions(self):
+        self.assertIsNone(self.cg.harness_of(["qwen", "hello"]))
+        self.assertIsNotNone(self.cg.harness_of(["qwen", "-i", "hello"]))
+
     def test_command_keeps_launch_variables_and_proxy_steps_but_not_cd(self):
         self.assertEqual(
             self.cmd("claude", "id", "cd ~/x && _proxy_up && BASE=http://127.0.0.1:8082 claude -c"),
@@ -449,6 +713,95 @@ class CgrTests(unittest.TestCase):
     def test_command_with_shell_syntax_is_left_alone(self):
         self.assertEqual(self.cmd("claude", "id", 'claude --model "$M"'),
                          'claude --model "$M" --resume id')
+
+    # -- indexed recovery ----------------------------------------------------
+
+    def indexed_row(self, harness, sid, **kw):
+        r = self.cg.entry(harness, sid, cwd="/w", started=self.prev + 100)
+        r.update(last=self.crash, status="cut off", how="status Crashed", source="cli",
+                 interactive=1, in_store=1, first_seen=time.time(), last_seen=time.time())
+        r.update(kw)
+        return r
+
+    def test_indexed_jcode_and_muse_cut_off_sessions_reach_recovery(self):
+        self.cg.write_index([self.indexed_row("jcode", "j"), self.indexed_row("muse", "m")])
+        found = self.found(everything=True)
+        self.assertEqual(set(found), {("jcode", "j"), ("muse", "m")})
+        self.assertEqual(self.cg.command(found[("jcode", "j")]), "jcode --resume j")
+        self.assertEqual(self.cg.command(found[("muse", "m")]), "muse resume m")
+
+    def test_index_recovery_requires_interactive_cut_off_rows_still_in_store(self):
+        rows = [self.indexed_row("jcode", "good"),
+                self.indexed_row("jcode", "unknown", status="unknown", mid_turn=1),
+                self.indexed_row("jcode", "bot", interactive=0),
+                self.indexed_row("jcode", "gone", in_store=0),
+                self.indexed_row("jcode", "missing", path=str(self.home / "missing.json")),
+                self.indexed_row("muse", "@123"),
+                self.indexed_row("unrecognized", "bad")]
+        self.cg.write_index(rows)
+        self.assertEqual(set(self.found(everything=True)), {("jcode", "good")})
+
+    def test_index_recovery_merges_with_watcher_and_obeys_the_default_window(self):
+        self.cg.write_index([self.indexed_row("jcode", "same"),
+                             self.indexed_row("jcode", "old", last=self.prev - 500)])
+        self.watched_boot("crashed", self.prev)
+        r = {"harness": "jcode", "argv": ["jcode", "--resume", "same"], "cwd": "/w",
+             "boot": "crashed", "started": self.prev + 100}
+        (self.cg.watch_dir() / "live-crashed.json").write_text(json.dumps([r]))
+        found = self.found()
+        self.assertEqual(set(found), {("jcode", "same")})
+        self.assertEqual(found[("jcode", "same")]["last"], self.btime)
+
+    def test_current_boot_no_end_record_is_not_a_death_without_watcher_evidence(self):
+        self.cg.write_index([self.indexed_row("muse", "idle", how="no end record",
+                                             last=self.btime + 100)])
+        self.assertEqual(self.cg.collect(), [])
+
+    def jcode_store(self, sid, when):
+        p = self.home / ".jcode/sessions" / (sid + ".json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"id": sid, "working_dir": "/w", "created_at": self.prev + 100,
+                                 "last_active_at": when, "status": {"Crashed": {"message": "killed"}},
+                                 "messages": [{"role": "user", "content": "finish"}]}))
+        os.utime(p, (when,) * 2)
+
+    def test_stale_index_refreshes_once_without_feeding_itself(self):
+        self.cg.write_index([self.indexed_row("jcode", "stale")])
+        os.utime(self.cg.db_path(), (0, 0))
+        self.jcode_store("fresh", self.crash)
+        with patch.object(self.cg, "build_index", wraps=self.cg.build_index) as build:
+            self.assertIn(("jcode", "fresh"), self.found(everything=True))
+            self.assertEqual(build.call_count, 1)
+        self.assertGreater(self.cg.db_path().stat().st_mtime, time.time() - 60)
+
+    def test_a_fresh_index_is_reused_and_index_build_does_not_trust_old_index_evidence(self):
+        self.cg.write_index([self.indexed_row("jcode", "cached")])
+        with patch.object(self.cg, "build_index", side_effect=AssertionError("unexpected refresh")):
+            self.assertIn(("jcode", "cached"), self.found(everything=True))
+        rows, _ = self.cg.build_index()
+        self.assertNotIn("cached", {r["id"] for r in rows})
+
+    def test_watcher_resolves_an_unnamed_jcode_from_its_native_store(self):
+        self.jcode_store("actual", self.crash)
+        r = {"harness": "jcode", "argv": ["jcode"], "cwd": "/w",
+             "started": self.prev + 100, "last": self.crash, "how": "machine went down"}
+        self.assertEqual(self.cg.resolve(r, set(), set())["id"], "actual")
+
+    def test_openclaw_indexed_recovery_names_the_session_in_its_resume_query(self):
+        self.cg.write_index([self.indexed_row("openclaw", "uuid", how="status failed")])
+        found = self.found(everything=True)
+        self.assertEqual(self.cg.command(found[("openclaw", "uuid")]), "openclaw resume uuid")
+
+    def test_history_keeps_a_watcher_resolved_id_even_without_a_native_indexer(self):
+        self.agy_conversation("actual", self.prev + 115)
+        self.watched_boot("crashed", self.prev)
+        r = {"harness": "agy", "argv": ["agy"], "cwd": "/w",
+             "boot": "crashed", "started": self.prev + 100}
+        (self.cg.watch_dir() / "live-crashed.json").write_text(json.dumps([r]))
+        rows, _ = self.cg.build_index()
+        agy = [r for r in rows if r["harness"] == "agy"]
+        self.assertEqual([(r["id"], r["status"]) for r in agy], [("actual", "cut off")])
+        self.assertIn("--conversation actual", agy[0]["resume"])
 
     # -- handled -------------------------------------------------------------
 

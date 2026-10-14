@@ -82,7 +82,7 @@ KEEP_DAYS = 30
 # CLI's own --help on 2026-10-09.
 HARNESSES = {
     "claude": (["--resume", "{id}"], ["--continue"],
-               {"--resume", "-r", "--continue", "-c", "--session-id", "--fork-session"}),
+               {"--resume", "-resume", "-r", "--continue", "-c", "--session-id", "--fork-session"}),
     "codex": (["resume", "{id}"], ["resume", "--last"], {"resume", "--last"}),
     "omp": (["--resume", "{id}"], ["--continue"], {"--resume", "-r", "--continue", "-c"}),
     "pi": (["--session", "{id}"], ["--continue"],
@@ -97,8 +97,81 @@ HARNESSES = {
     "qwen": (["--resume", "{id}"], ["--continue"],
              {"--resume", "-r", "--continue", "-c", "--session-id"}),
     "muse": (["resume", "{id}"], ["resume", "--last"], {"resume", "--last"}),
-    "openclaw": (None, ["resume"], {"resume"}),
+    "openclaw": (["resume", "{id}"], ["resume"], {"resume"}),
     "omx": (["--resume", "{id}"], ["--continue"], {"--resume", "-r", "--continue", "-c"}),
+}
+
+# Initial prompts have already been sent. Remove the owning flag too, so a
+# resumed CLI cannot consume its new resume flag as the old prompt's value.
+PROMPT_FLAGS = {
+    "agy": {"-i", "--prompt-interactive", "--prompt", "--print", "-p"},
+    "gemini": {"-i", "--prompt-interactive", "--prompt", "-p"},
+    "qwen": {"-i", "--prompt-interactive", "--prompt", "-p"},
+    "opencode": {"--prompt"}, "kilo": {"--prompt"},
+}
+
+# Value-taking options from the installed CLIs' --help, checked 2026-10-13.
+# A bare word is a prompt unless an option owns it. Keeping every word after
+# every flag would retain prompts following booleans such as --yolo.
+VALUE_FLAGS = {
+    "claude": set("--add-dir --agent --agents --allowed-tools --allowedTools --append-system-prompt "
+                  "--autocompact --betas --cloud --debug --debug-file --disallowed-tools "
+                  "--disallowedTools --effort --environment --fallback-model --file --from-pr "
+                  "--input-format --json-schema --max-budget-usd --mcp-config --model --name "
+                  "--output-format --permission-mode --permission-prompts --plugin-dir --plugin-url "
+                  "--prompt-suggestions --remote-control --remote-control-session-name-prefix "
+                  "--setting-sources --settings --system-prompt --system-prompt-snapshot --teleport "
+                  "--tools --worktree -d -n -w".split()),
+    "codex": set("--add-dir --ask-for-approval --cd --config --disable --enable --image "
+                 "--local-provider --model --profile --remote --remote-auth-token-env --sandbox "
+                 "-C -a -c -i -m -p -s".split()),
+    "omp": set("--add-dir --alias --api-key --append-system-prompt --approval-mode --config --cwd "
+               "--export --extension --goal --hook --max-time --mode --model --models --plan "
+               "--plan-yolo-into --plugin-dir --prewalk-into --profile --provider --service-tier "
+               "--session-dir --skills --slow --smol --system-prompt --system-prompt-template "
+               "--thinking --tools -e".split()),
+    "jcode": set("--cwd --disabled-tools --mcp-tools --mcp-tools-token-threshold --model --provider "
+                 "--provider-profile --remote-working-dir --socket --ssh --ssh-binary "
+                 "--ssh-server-socket --tool-profile --tools -C -m -p".split()),
+    "hermes": set("--usage-file --model --provider --reasoning --toolsets --in --skills -m -t -s".split()),
+    "opencode": set("--log-level --port --hostname --mdns-domain --cors --model --agent "
+                    "--replay-limit -m".split()),
+    "kilo": set("--log-level --port --hostname --mdns-domain --cors --model --agent "
+                "--replay-limit --worktree -m".split()),
+    "gemini": set("--model --worktree --approval-mode --policy --admin-policy "
+                  "--allowed-mcp-server-names --allowed-tools --extensions --include-directories "
+                  "--output-format -m -w -e -o".split()),
+    "qwen": set("--model --advisor --fallback-model --system-prompt --append-system-prompt "
+                "--output-style --sandbox --sandbox-image --approval-mode --channel "
+                "--allowed-mcp-server-names --mcp-config --allowed-tools --extensions "
+                "--include-directories --add-dir --openai-logging-dir --openai-api-key "
+                "--openai-base-url --input-format --output-format --json-fd --json-file "
+                "--json-schema --input-file --worktree --max-session-turns --max-wall-time "
+                "--max-tool-calls --max-subagent-depth --core-tools --exclude-tools "
+                "--disabled-slash-commands --auth-type --telemetry-target --telemetry-otlp-endpoint "
+                "--telemetry-otlp-protocol --telemetry-outfile -m -s -e -o".split()),
+    "muse": set("--agents --provider --preset --model --contributor-mode --config --reasoning-effort "
+                "--base-url --image --workspace --worktree --worktree-base --worktree-existing "
+                "--approval-mode --permission-profile --approval-judge --echo-delay-ms "
+                "--sandbox-network -c -w".split()),
+    "agy": set("--add-dir --agent --effort --input-format --json-schema --log-file --mode "
+               "--model --new-project --output-format --print-timeout --project".split()),
+    "pi": set("--provider --model --api-key --system-prompt --append-system-prompt --mode "
+              "--session-dir --name --models --tools --exclude-tools --thinking --extension "
+              "--skill --prompt-template --theme --use-theme --tui-mode -n -t -xt -e".split()),
+    "openclaw": set("--container --log-level --profile --session --session-id --url --token "
+                    "--password --message --timeout-ms --history-limit".split()),
+}
+MULTI_VALUE_FLAGS = {
+    "claude": set("--add-dir --allowed-tools --allowedTools --betas --disallowed-tools "
+                  "--disallowedTools --file --mcp-config --tools".split()),
+    "codex": {"--image", "-i"},
+    "opencode": {"--cors"},
+    "kilo": {"--cors"},
+    "gemini": set("--policy --admin-policy --allowed-mcp-server-names --allowed-tools "
+                  "--extensions --include-directories -e".split()),
+    "qwen": set("--fallback-model --allowed-mcp-server-names --allowed-tools --extensions "
+                "--include-directories --add-dir --core-tools --exclude-tools -e".split()),
 }
 
 INTERPRETERS = re.compile(r"(node|nodejs|bun|deno|python[0-9.]*|sh|bash|dash)$")
@@ -106,7 +179,58 @@ INTERPRETERS = re.compile(r"(node|nodejs|bun|deno|python[0-9.]*|sh|bash|dash)$")
 NOT_A_SESSION = {"exec", "e", "run", "serve", "server", "app-server", "mcp", "mcp-server", "login",
                  "logout", "update", "upgrade", "install", "uninstall", "doctor", "auth",
                  "config", "completion", "gateway", "daemon", "dashboard", "cron", "web"}
-ONE_SHOT_FLAGS = {"-p", "--print", "--version", "--help", "-h"}
+
+# These are commands, not arbitrary prompt words. The distinction is per CLI:
+# `omp models` is a catalog, while `claude models` is an interactive prompt.
+NON_SESSION_COMMANDS = {
+    "claude": set("auth auto-mode doctor gateway import install logs mcp plugin plugins purge "
+                  "respawn rm setup-token stop kill ultrareview update upgrade".split()),
+    "codex": set("exec e review login logout mcp plugin app-server remote-control completion "
+                 "update doctor sandbox debug apply a queue archive delete migrate-rollouts "
+                 "unarchive cloud exec-server features help".split()),
+    "omp": set("acp agents auth-broker auth-gateway bench browser-relay cleanse clip collab commit "
+               "completions compress config dry-balance find gallery gc git grep grievances "
+               "if-bench images install login models play plugin predict ps read render say "
+               "search setup share shell skill ssh stats stream tiny-models token toks ttsr "
+               "update usage worktree help".split()),
+    "pi": set("install remove uninstall update list config auth mcp help".split()),
+    "hermes": NOT_A_SESSION | {"models", "status", "help", "setup", "skills", "tools"},
+    "opencode": set("completion acp mcp run debug providers auth agent upgrade uninstall serve "
+                    "web models stats export import github session plugin plug db help".split()),
+    "kilo": set("completion acp mcp run debug auth providers agent upgrade uninstall serve web "
+                "models stats export import github pr session plugin plug db console cloud "
+                "roll-call profile remote daemon config worktree help".split()),
+    "agy": set("agent agents changelog help install mcp mic-serve models plugin plugins "
+               "remote-control update".split()),
+    "jcode": set("serve acp server run login account update version usage telemetry debug auth "
+                 "provider memory session ambient cloud pair permissions transcript dictate "
+                 "setup-hotkey setup-launcher browser model provider-test-coverage provider-doctor "
+                 "auth-test restart menubar api-bridge help".split()),
+    "gemini": set("mcp extensions extension skills skill hooks hook gemma help".split()),
+    "qwen": set("agents auth batch board channel extensions hooks mcp review sandbox serve "
+                "sessions update help".split()),
+    "muse": set("exec config export trace model-profile skills voice plugins sandbox schema serve "
+                "session-message mcp auth login logout init help".split()),
+    "openclaw": set("acp agent agents approvals audit automations backup browser capability channels "
+                    "clawbot completion config configure connect cron daemon dashboard database "
+                    "devices directory dns docs doctor exec-approvals exec-policy file-transfer "
+                    "fleet gateway health help hooks infer logs mcp memory message migrate models "
+                    "node nodes onboard pairing path plugins promos proxy qr reset sandbox secrets "
+                    "security sessions skills status system telemetry transcripts uninstall update "
+                    "users webhooks wiki workboard worker worktrees".split()),
+}
+HEADLESS_FLAGS = {
+    "claude": {"--print", "-p", "--bg", "--background", "--cloud", "--environment"},
+    "codex": set(),
+    "jcode": {"--print"},
+    "hermes": {"--oneshot", "-z"},
+    "gemini": {"--prompt", "-p", "--list-extensions", "-l", "--list-sessions", "--delete-session",
+               "--acp", "--experimental-acp"},
+    "qwen": {"--prompt", "-p", "--list-extensions", "-l", "--acp"},
+    "agy": {"--print", "-p", "--prompt"},
+    "pi": {"--print", "-p", "--export", "--list-models"},
+    "omp": {"--print", "-p", "--export", "--list-models"},
+}
 
 
 # -- boots and processes -----------------------------------------------------
@@ -172,15 +296,61 @@ def previous_boot_start(btime):
     return max(earlier) if earlier else btime - 86400
 
 
+def boot_periods():
+    """Boot intervals with actual shutdowns, or an end inferred from the next boot.
+
+    Watcher markers supply stable kernel start times and ids; wtmp supplies
+    historical starts and shutdowns. Only the shutdown inside an interval
+    belongs to that boot. `last` can misleadingly pair a crash with a later
+    boot's shutdown when used without this interval check.
+    """
+    btime, boot_id = boot_start()
+    starts, shutdowns = set(), set()
+    try:
+        data = WTMP.read_bytes()
+    except OSError:
+        data = b""
+    for off in range(0, len(data) - UTMP.size + 1, UTMP.size):
+        rec = UTMP.unpack_from(data, off)
+        if rec[0] == BOOT_TIME:
+            starts.add(rec[9])
+        elif rec[0] == 1 and rec[4].rstrip(b"\0") == b"shutdown":
+            shutdowns.add(rec[9])
+    markers = {boot_id: btime}
+    for f in watch_dir().glob("boot-*"):
+        try:
+            markers[f.name[5:]] = int(read_own(f))
+        except (OSError, ValueError):
+            continue
+    ids = {}
+    for bid, began in sorted(markers.items(), key=lambda kv: kv[1]):
+        close = [t for t in starts if abs(t - began) < 300 and t not in ids]
+        matched = min(close, key=lambda t: abs(t - began)) if close else None
+        if matched is not None:
+            starts.discard(matched)
+        starts.add(began)
+        ids[began] = bid
+    times = sorted(starts)
+    out = []
+    for i, began in enumerate(times):
+        next_start = times[i + 1] if i + 1 < len(times) else None
+        ends = [t for t in shutdowns if began <= t and (next_start is None or t < next_start)]
+        ended = min(ends) if ends else next_start
+        out.append({"boot": ids.get(began) or "wtmp-%d" % began, "start": began,
+                    "end": ended, "end_kind": "normal shutdown" if ends else
+                    "crash (end inferred from next boot)" if next_start else "running"})
+    return out
+
+
 def ended_with_agents(boot_id):
     """The watcher's set held an agent when that boot ended, or `cgr --save` ran in it."""
     try:
-        if json.loads(read_own(watch_dir() / ("live-%s.json" % boot_id))):
+        if any(session_record(r) for r in json.loads(read_own(watch_dir() / ("live-%s.json" % boot_id)))):
             return True
     except (OSError, ValueError):
         pass
     try:
-        return any(isinstance(s, dict) and s.get("boot") == boot_id
+        return any(session_record(s) and s.get("boot") == boot_id
                    for s in json.loads(read_own(saved_path())).get("sessions") or [])
     except (OSError, ValueError, AttributeError):
         return False
@@ -274,12 +444,42 @@ def harness_of(argv):
         return None
     name = re.sub(r"\.(c?js|mjs|py)$", "", os.path.basename(argv[i]))
     if name not in HARNESSES:
+        # npm entrypoints can be cli.js or cli-entry.js. Only recognized
+        # package paths identify those; an arbitrary cli.js is not an agent.
+        path = Path(argv[i]).as_posix()
+        if "/@earendil-works/pi-coding-agent/" in path and name == "cli":
+            name = "pi"
+        elif "/@qwen-code/qwen-code/" in path and name == "cli-entry":
+            name = "qwen"
+    if name not in HARNESSES:
         return None
     rest = argv[i + 1:]
-    first = next((a for a in rest if not a.startswith("-")), None)
-    if first in NOT_A_SESSION or ONE_SHOT_FLAGS.intersection(rest):
+    flags = {a.split("=", 1)[0] for a in rest if a.startswith("-")}
+    if flags & ({"--version", "-v", "-V", "--help", "-h"} |
+                HEADLESS_FLAGS.get(name, {"-p", "--print"})):
         return None
+    first, owned, many = None, False, False
+    values = VALUE_FLAGS.get(name, set()) | HARNESSES[name][2] | PROMPT_FLAGS.get(name, set())
+    for a in rest:
+        if a.startswith("-"):
+            flag = a.split("=", 1)[0]
+            owned = "=" not in a and flag in values
+            many = owned and flag in MULTI_VALUE_FLAGS.get(name, set())
+        elif owned:
+            owned = many
+        else:
+            first = a
+            break
+    if first in NON_SESSION_COMMANDS.get(name, NOT_A_SESSION):
+        return None
+    if name == "qwen" and first is not None and not flags & {"-i", "--prompt-interactive"}:
+        return None  # its positional query is one-shot; -i explicitly stays interactive
     return name, i
+
+
+def session_record(rec):
+    """Recheck old watcher and save records under today's CLI classification."""
+    return isinstance(rec, dict) and (not rec.get("argv") or harness_of(rec["argv"]) is not None)
 
 
 # -- what you typed ------------------------------------------------------------
@@ -360,7 +560,7 @@ def harness_in(line, amap):
     return found[-1] if found else None
 
 
-def typed_for(harness, started, hist, amap):
+def typed_for(harness, started, hist, amap, argv=None):
     """The command line typed to start `harness` at `started`, from zsh history.
 
     zsh writes the entry when the command starts, so it sits a moment before
@@ -369,8 +569,30 @@ def typed_for(harness, started, hist, amap):
     best = None
     for t, line in hist:
         if started - 300 <= t <= started + 5 and harness_in(line, amap) == harness:
+            if argv and not launch_matches(harness, line, argv, amap):
+                continue
             best = line  # oldest first, so the last match is the closest
     return best
+
+
+def launch_matches(harness, line, argv, amap):
+    """History may supply options only when they match the actual process.
+
+    An inherited CGR_LAUNCH bypasses history. For a missing launch line, do
+    not borrow the model or proxy options of an unrelated earlier invocation.
+    """
+    words = words_of(segments(line)[-1]) or []
+    if not words:
+        return False
+    at = head_word(words)
+    expanded = (words_of(amap.get(words[at], "")) or [words[at]]) + words[at + 1:]
+    places = [i for i, w in enumerate(expanded) if os.path.basename(w) == harness]
+    hit = harness_of(argv)
+    if not places or not hit:
+        return False
+    strip = HARNESSES[harness][2] | PROMPT_FLAGS.get(harness, set())
+    return strip_args(expanded[places[-1] + 1:], strip, harness) == \
+        strip_args(argv[hit[1] + 1:], strip, harness)
 
 
 def launch_env(pid):
@@ -483,7 +705,7 @@ class Watcher:
                "argv": argv, "cwd": cwd, "leader": st[1], "leader_ticks": proc_ticks(st[1]),
                "boot": self.boot, "session": None,
                "typed": old.get("typed") or launch_env(pid)
-               or typed_for(hit[0], started, history(), aliases())}
+               or typed_for(hit[0], started, history(), aliases(), argv)}
         self.refresh(rec)
         return rec
 
@@ -559,18 +781,25 @@ def watcher_running(boot_id):
     return boot == boot_id and "--watch" in proc_argv(int(pid))
 
 
-def watched(boot_id, since):
+def watched(boot_id, since, boot_since=None):
     """Agents the watcher saw die: alive at the end of an earlier boot, or
     gone together with their shell."""
     out = []
+    periods = {p["boot"]: p for p in boot_periods()}
     for f in watch_dir().glob("live-*.json"):
-        if f.stem[5:] == boot_id or mtime(f) < since:
+        bid = f.stem[5:]
+        period = periods.get(bid)
+        ended = (period or {}).get("end") or mtime(f)
+        if bid == boot_id or ended < since or (period and boot_since is not None
+                                               and period["start"] < boot_since):
             continue
         try:
             recs = json.loads(read_own(f))
         except (OSError, ValueError):
             continue
-        out += [dict(r, how="machine went down", last=mtime(f)) for r in recs]
+        out += [dict(r, boot=bid, how="machine went down", last=ended,
+                     boot_end=(period or {}).get("end")) for r in recs
+                if session_record(r)]
     try:
         lines = read_own(watch_dir() / "deaths.jsonl").splitlines()
     except OSError:
@@ -580,7 +809,7 @@ def watched(boot_id, since):
             r = json.loads(line)
         except ValueError:
             continue
-        if r.get("died", 0) >= since:
+        if session_record(r) and r.get("died", 0) >= since:
             out.append(dict(r, how="window closed", last=r["died"]))
     return out
 
@@ -720,13 +949,15 @@ def claude_transcript(sid):
     return found[0] if found else None
 
 
-def claude_in(cwd, since, live, taken):
+def claude_in(cwd, since, live, taken, until=None):
     """Newest claude session in `cwd` touched since `since` that nobody holds."""
     d = HOME / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
     for path in sorted(d.glob("*.jsonl"), key=mtime, reverse=True):
         last, sid = mtime(path), path.stem
         if last < since:
             break
+        if until is not None and last > until:
+            continue
         reason = exit_reason(path)
         if sid in live or ("claude", sid) in taken or not (reason is None or reason in CUT_EXITS):
             continue
@@ -847,12 +1078,47 @@ def argv_id(h, argv):
     if not by_id or not hit:
         return None
     rest = argv[hit[1] + 1:]
+    id_flags = {by_id[0]} | {
+        "claude": {"-r", "--session-id"}, "omp": {"-r"}, "hermes": {"-r"},
+        "opencode": {"-s"}, "kilo": {"-s"}, "gemini": {"-r"},
+        "qwen": {"-r", "--session-id"}, "pi": {"--session-id"},
+        "openclaw": {"--session"},
+    }.get(h, set())
     for i, a in enumerate(rest):
-        if a == by_id[0] and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+        if a in id_flags and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
             return rest[i + 1]
-        if a.startswith(by_id[0] + "=") and by_id[0].startswith("-"):
+        if "=" in a and a.split("=", 1)[0] in id_flags and a.startswith("-"):
             return a.split("=", 1)[1] or None
     return None
+
+
+def agy_id(rec):
+    """A unique conversation presence lock created near this process's launch.
+
+    Locks contain no pid. A start-time match is useful only when unique and
+    backed by that conversation's cascade_id in SQLite. Never choose the
+    newest database, which may belong to a conversation started after death.
+    """
+    root = HOME / ".gemini" / "antigravity-cli"
+    found = []
+    for lock in (root / "presence").glob("*.lock"):
+        stamp = mtime(lock)
+        if abs(stamp - rec["started"]) > 60 or stamp > rec["last"]:
+            continue
+        db = root / "conversations" / (lock.stem + ".db")
+        if not db.is_file():
+            continue
+        try:
+            con = ro(db)
+            try:
+                if con.execute("SELECT 1 FROM trajectory_meta WHERE cascade_id = ? LIMIT 1",
+                               (lock.stem,)).fetchone():
+                    found.append(lock.stem)
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+    return found[0] if len(found) == 1 else None
 
 
 def resolve(rec, live, taken):
@@ -872,31 +1138,51 @@ def resolve(rec, live, taken):
         if path:
             hit = session(h, rec["session"], cwd, mtime(path), rec["how"], head(path)[2])
         else:
-            found = claude_in(cwd, since, live, taken)
+            found = claude_in(cwd, since, live, taken, rec["last"] + 5)
             if found:
                 hit = session(h, found[0], cwd, found[1], rec["how"], found[2])
     elif h == "codex":
-        for tid, _, title, updated, _ in codex_threads("cwd = ? AND updated_at >= ?",
-                                                       (cwd, since)):
+        for tid, _, title, updated, _ in codex_threads("cwd = ? AND updated_at >= ? AND updated_at <= ?",
+                                                       (cwd, since, rec["last"] + 5)):
             if ("codex", tid) not in taken:
                 hit = session(h, tid, cwd, updated, rec["how"], title)
                 break
     elif h == "omp":
-        for path, last, ocwd, title, _ in sorted(omp_files(since, time.time() + 1),
+        for path, last, ocwd, title, _ in sorted(omp_files(since, rec["last"] + 5),
                                                  key=lambda x: -x[1]):
             sid = Path(path).stem.split("_", 1)[-1]
             if ocwd == cwd and ("omp", sid) not in taken:
                 hit = session(h, sid, cwd, last, rec["how"], title)
                 break
     elif h == "hermes":
-        for sid, _, last, title, _ in hermes_rows("cwd = ? AND started_at >= ?", (cwd, since)):
+        for sid, _, last, title, _ in hermes_rows("cwd = ? AND started_at >= ? AND started_at <= ?",
+                                                (cwd, since, rec["last"] + 5)):
             if ("hermes", sid) not in taken:
                 hit = session(h, sid, cwd, last, rec["how"], title or "(untitled)")
                 break
+    elif h == "agy":
+        sid = agy_id(rec)
+        if sid and (h, sid) not in taken:
+            hit = session(h, sid, cwd, rec["last"], rec["how"], "")
+    elif h in STORE_INDEXERS:
+        try:
+            rows = sorted(STORE_INDEXERS[h](), key=lambda r: -(r["last"] or 0))
+            for r in rows:
+                if r["harness"] != h or r.get("source") in AUTOMATED:
+                    continue
+                if r.get("cwd") and r["cwd"] != cwd:
+                    continue
+                if not since <= (r["last"] or 0) <= rec["last"] + 5 or (h, r["id"]) in taken:
+                    continue
+                hit = session(h, r["id"], cwd, r["last"], rec["how"], r["title"])
+                break
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
+            print("cgr: resolving %s: %s" % (h, e), file=sys.stderr)
     # No readable store: its own "continue" flag picks the newest session there.
     s = hit or session(h, None, cwd, rec["last"], rec["how"], "")
     s["last"] = max(s["last"], rec["last"])
     s.update(started=rec["started"], typed=rec.get("typed"), argv=rec.get("argv"))
+    s.update({f: rec[f] for f in ("boot", "boot_end", "died") if rec.get(f) is not None})
     if not s["title"]:
         s["title"] = s["typed"] or " ".join(rec.get("argv") or [h])
     return s
@@ -948,11 +1234,13 @@ def merge(items, s):
     k = item_key(s)
     if k in items:
         items[k].update({f: s[f] for f in ("typed", "argv", "started") if s.get(f)})
+        if s["last"] >= items[k]["last"]:
+            items[k].update({f: s[f] for f in ("last", "how", "boot", "boot_end", "died") if f in s})
     else:
         items[k] = s
 
 
-def cut_off(everything=False):
+def cut_off(everything=False, use_index=True):
     """{key: session} for every session cut off since the boot that went down
     with them began (ever, with `everything`), before the reopened and running
     ones are dropped."""
@@ -963,8 +1251,12 @@ def cut_off(everything=False):
     for s in claude(since, btime, live, dead) + codex(since, btime) + omp(since, btime) \
             + hermes(since, btime):
         items.setdefault((s["harness"], s["id"]), s)
+    if use_index:
+        for s in indexed_cut_off(since, btime):
+            merge(items, s)
     taken = set()
-    for rec in sorted(watched(boot_id, since), key=lambda r: -r["started"]):
+    for rec in sorted(watched(boot_id, since, boot_since=None if everything else since),
+                      key=lambda r: -r["started"]):
         s = resolve(rec, live, taken)
         taken.add(item_key(s))
         merge(items, s)
@@ -972,10 +1264,10 @@ def cut_off(everything=False):
         merge(items, s)
     hist, amap = None, None
     for s in items.values():
-        if not s["typed"] and s["started"]:
+        if not s["typed"] and s["started"] and s.get("source") != "sessions.db":
             if hist is None:
                 hist, amap = history(), aliases()
-            s["typed"] = typed_for(s["harness"], s["started"], hist, amap)
+            s["typed"] = typed_for(s["harness"], s["started"], hist, amap, s.get("argv"))
     return items
 
 
@@ -993,7 +1285,53 @@ def collect(everything=False):
                 continue
             continued.add((s["harness"], s["cwd"]))
         shown.append(s)
-    return shown
+    return group_sessions(shown)
+
+
+def group_sessions(items):
+    """Attach event keys and order groups by their end, newest sessions within each.
+
+    A watcher boot id identifies the event. Native-only sessions are assigned
+    by last activity inside a boot interval, explicitly labeled as inferred.
+    Window closes form a separate group for the boot in which they happened.
+    """
+    periods = boot_periods()
+    by_boot = {p["boot"]: p for p in periods}
+    groups = {}
+    for s in items:
+        period = by_boot.get(s.get("boot"))
+        association = "watcher boot" if period else "last activity"
+        if period is None:
+            period = next((p for p in reversed(periods) if p["start"] <= s["last"]
+                           and (p["end"] is None or s["last"] <= p["end"])), None)
+        kind = {"window closed": "window closed", "killed": "killed"}.get(s["how"], "machine went down")
+        if s["how"] == "saved" and (period is None or period["end"] is None):
+            kind = "saved"
+        if period:
+            event = dict(period, kind=kind)
+            if kind in ("window closed", "killed", "saved"):
+                event["boot_end"] = event["end"]
+                event["end"] = s["last"]
+            gid = "%s:%s" % (kind.replace(" ", "-"), period["boot"])
+        else:
+            day = time.strftime("%Y-%m-%d", time.localtime(s["last"]))
+            gid = "activity:%s" % day
+            event = {"boot": None, "start": s["last"], "end": s["last"],
+                     "kind": "unmatched activity", "end_kind": "no boot interval"}
+            association = "usage date only"
+        s["group"], s["event_association"] = gid, association
+        if gid not in groups:
+            groups[gid] = {"event": event, "items": []}
+        group = groups[gid]
+        if kind in ("window closed", "killed", "saved") or not period:
+            group["event"]["end"] = max(group["event"]["end"], s["last"])
+        group["items"].append(s)
+    out = []
+    for gid, group in sorted(groups.items(), key=lambda kv: (-(kv[1]["event"]["end"] or 0), kv[0])):
+        for s in sorted(group["items"], key=lambda s: (-s["last"], s["harness"], s["id"] or s["cwd"])):
+            s["event"] = dict(group["event"])
+            out.append(s)
+    return out
 
 
 # -- a planned restart (cgr --save) ------------------------------------------
@@ -1042,7 +1380,7 @@ def saved(since):
     boot = current_boot()[1]
     out = []
     for s in data.get("sessions") or []:
-        if not isinstance(s, dict) or s.get("last", 0) < since:
+        if not session_record(s) or s.get("last", 0) < since:
             continue
         if s.get("boot") == boot and alive(s.get("pid"), s.get("ticks")):
             continue
@@ -1571,6 +1909,65 @@ def index_openclaw():
 
 INDEXERS = (index_claude, index_codex, index_omp, index_pi, index_hermes, index_jcode,
             index_muse, index_gemini, index_qwen, index_opencode, index_openclaw)
+STORE_INDEXERS = {"jcode": index_jcode, "muse": index_muse, "pi": index_pi,
+                  "gemini": index_gemini, "qwen": index_qwen, "opencode": index_opencode,
+                  "kilo": index_opencode, "openclaw": index_openclaw}
+NATIVE_RECOVERY = {"claude", "codex", "omp", "hermes"}
+
+
+def ensure_index():
+    """Refresh absent or day-old indexes. Rebuild from stores, never cached verdicts."""
+    path = db_path()
+    if path.exists() and path.stat().st_uid != ME:
+        return False
+    stale = not path.exists() or mtime(path) < time.time() - 86400
+    if not stale:
+        try:
+            con = ro(path)
+            try:
+                stale = not set(COLUMNS).issubset({c[1] for c in con.execute("PRAGMA table_info(sessions)")})
+            finally:
+                con.close()
+        except sqlite3.Error:
+            stale = True
+    if stale:
+        write_index(*build_index())
+    return True
+
+
+def indexed_cut_off(since, btime):
+    """Additional harnesses with explicit cut-off, interactive, available rows.
+
+    A current-boot missing end marker could be an idle living process. As
+    with native omp records, it needs a watcher death before being recoverable.
+    """
+    out = []
+    try:
+        if not ensure_index():
+            return out
+        con = ro(db_path())
+        try:
+            con.row_factory = sqlite3.Row
+            rows = [dict(r) for r in con.execute(
+                "SELECT * FROM sessions WHERE interactive = 1 AND status = 'cut off' "
+                "AND in_store = 1 AND last >= ?", (since,))]
+        finally:
+            con.close()
+        for r in rows:
+            h, sid = r["harness"], r["id"]
+            if h not in HARNESSES or h in NATIVE_RECOVERY or not sid or sid.startswith("@"):
+                continue
+            if r.get("source") in AUTOMATED or (r.get("path") and not Path(r["path"]).is_file()):
+                continue
+            how = r["how"] or "indexed cut off"
+            if r["last"] >= btime and (how in ("no end record", "not closed") or how.startswith("left ")):
+                continue
+            s = session(h, sid, r["cwd"], r["last"], how, r["title"], r["started"])
+            s.update(typed=r["typed"], source="sessions.db", path=r.get("path"))
+            out.append(s)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError) as e:
+        print("cgr: recovery index: %s" % e, file=sys.stderr)
+    return out
 
 
 def build_index():
@@ -1594,10 +1991,14 @@ def build_index():
     running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
     named = running_words()
     # What `cgr --save` recorded is not evidence of anything going wrong.
-    evidence = {k: s for k, s in cut_off(everything=True).items() if s["how"] != "saved"}
+    evidence = {k: s for k, s in cut_off(everything=True, use_index=False).items() if s["how"] != "saved"}
     for s in evidence.values():
-        if not s["id"]:  # no store says which session it was; keep what the watcher saw
-            r = entry(s["harness"], "@%d" % int(s["started"] or s["last"]), cwd=s["cwd"],
+        sid = s["id"] or "@%d" % int(s["started"] or s["last"])
+        if (s["harness"], sid) not in rows:  # watcher evidence can also resolve an exact id
+            path = s.get("path")
+            if s["harness"] == "agy" and s["id"]:
+                path = HOME / ".gemini/antigravity-cli/conversations" / (s["id"] + ".db")
+            r = entry(s["harness"], sid, path, cwd=s["cwd"],
                       source="cli", started=s["started"], title=s["title"])
             r["last"] = s["last"]
             rows[(r["harness"], r["id"])] = dict(r, verdict=None, evidence=s)
@@ -1722,9 +2123,11 @@ def resume_args(s):
     return list(cont or [])
 
 
-def strip_args(args, strip):
+def strip_args(args, strip, harness=None):
     """Drop old session-picking flags, and typed prompts, which must not be re-sent."""
-    out, drop_value = [], False
+    out, drop_value, value, many = [], False, False, False
+    values = VALUE_FLAGS.get(harness, {"--model", "-m"})
+    multi = MULTI_VALUE_FLAGS.get(harness, set())
     for a in args:
         if drop_value:
             drop_value = False
@@ -1732,17 +2135,27 @@ def strip_args(args, strip):
                 continue
         if a.split("=", 1)[0] in strip:
             drop_value = "=" not in a
+            value = many = False
             continue
-        if any(c.isspace() for c in a):
+        if a == "--":
+            break  # the rest is a prompt, even if it starts with a dash
+        if a.startswith("-"):
+            out.append(a)
+            flag = a.split("=", 1)[0]
+            value = "=" not in a and flag in values
+            many = value and flag in multi
             continue
-        out.append(a)
+        if value:
+            out.append(a)
+            value = many
     return out
 
 
 def command(s):
     """What you typed, minus old session flags, plus this harness's resume."""
     h = s["harness"]
-    strip = HARNESSES.get(h, (None, None, set()))[2]
+    session_flags = HARNESSES.get(h, (None, None, set()))[2]
+    strip = session_flags | PROMPT_FLAGS.get(h, set())
     extra = resume_args(s)
     tail_text = " " + shlex.join(extra) if extra else ""
     typed = s.get("typed")
@@ -1756,14 +2169,14 @@ def command(s):
             if os.path.basename(words[i]) != h:
                 exp = words_of(aliases().get(words[i], "")) or []
                 at = [j for j, w in enumerate(exp) if os.path.basename(w) == h]
-                if at and any(w.split("=", 1)[0] in strip for w in exp[at[-1] + 1:]):
+                if at and any(w.split("=", 1)[0] in session_flags for w in exp[at[-1] + 1:]):
                     return prefix + last  # the alias picks its session itself (--continue)
-            return prefix + shlex.join(words[:i + 1] + strip_args(words[i + 1:], strip) + extra)
+            return prefix + shlex.join(words[:i + 1] + strip_args(words[i + 1:], strip, h) + extra)
         return prefix + last + tail_text
     argv = s.get("argv") or [h]
     hit = harness_of(argv)
     at = hit[1] if hit else 0
-    return shlex.join([h] + strip_args(argv[at + 1:], strip) + extra)
+    return shlex.join([h] + strip_args(argv[at + 1:], strip, h) + extra)
 
 
 # -- showing -----------------------------------------------------------------
@@ -1794,21 +2207,81 @@ def runnable(s):
     return clean("cd %s && %s" % (shlex.quote(s["cwd"]), command(s)))
 
 
-def choose(items):
-    """Arrow-key multi-select, everything ticked. Returns the chosen items."""
+def event_groups(items):
+    groups = {}
+    for i, s in enumerate(items):
+        groups.setdefault(s["group"], []).append(i)
+    return list(groups.values())
+
+
+def old_group(s):
+    return (s["event"].get("end") or s["last"]) < time.time() - 7 * 86400
+
+
+def event_title(s):
+    ev = s["event"]
+    stamp = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "still running"
+    if ev["kind"] in ("window closed", "killed", "saved"):
+        return clean("%s at %s; boot began %s" % (ev["kind"], stamp(ev["end"]), stamp(ev["start"])))
+    if ev["kind"] == "unmatched activity":
+        return clean("Activity on %s; no boot association" % stamp(ev["end"])[:10])
+    return clean("Boot %s to %s; %s" % (stamp(ev["start"]), stamp(ev["end"]), ev["end_kind"]))
+
+
+def show_recovery(items, expand_old=False, commands=True):
+    for indexes in event_groups(items):
+        s = items[indexes[0]]
+        collapsed = old_group(s) and not expand_old
+        print("%s (%d sessions)%s" % (event_title(s), len(indexes),
+              " [collapsed; --expand-old shows sessions]" if collapsed else ""))
+        if not collapsed:
+            for i in indexes:
+                print("  " + row(items[i])[:shutil.get_terminal_size((120, 20)).columns - 3])
+                if commands:
+                    print("      " + runnable(items[i]))
+        print()
+
+
+def choose(items, expand_old=False):
+    """Space on a header selects its whole group. Old groups start collapsed and unticked."""
     import termios
     import tty
     fd = sys.stdin.fileno()
-    picked, cur = [True] * len(items), 0
+    picked, cur = [not old_group(s) for s in items], 0
+    groups = event_groups(items)
+    expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = "  up/down move   space toggle   a all/none   enter reopen   q quit"
+    help_line = "  up/down move   space group/session   o expand/collapse   a all/none   enter reopen   q quit"
+    drawn = 0
+
+    def entries():
+        rows = []
+        for indexes in groups:
+            rows.append((indexes, True))
+            if items[indexes[0]]["group"] in expanded:
+                rows.extend(([i], False) for i in indexes)
+        return rows
 
     def draw(first):
-        out = [] if first else ["\r\x1b[%dA" % len(items)]
-        for i, s in enumerate(items):
-            line = ("%s [%s] %s" % (">" if i == cur else " ", "x" if picked[i] else " ",
-                                    row(s)))[:width - 1]
-            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if i == cur else line) + "\n")
+        nonlocal drawn
+        rows = entries()
+        height = shutil.get_terminal_size((120, 24)).lines
+        count = max(1, height - 3)
+        start = max(0, min(cur - count // 2, len(rows) - count))
+        visible = rows[start:start + count]
+        out = [] if first else ["\r\x1b[%dA" % drawn]
+        for pos, (indexes, header) in enumerate(visible, start):
+            state = "x" if all(picked[i] for i in indexes) else "+" if any(picked[i] for i in indexes) else " "
+            s = items[indexes[0]]
+            label = (event_title(s) + " (%d sessions)%s" % (len(indexes),
+                     " [collapsed]" if s["group"] not in expanded else "")) if header else "  " + row(s)
+            line = ("%s [%s] %s" % (">" if pos == cur else " ", state, label))[:width - 1]
+            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if pos == cur else line) + "\n")
+        # Clear leftover rows after collapsing a group, then return to the help line.
+        if drawn > len(visible):
+            out.extend("\r\x1b[K\n" for _ in range(drawn - len(visible)))
+            out.append("\r\x1b[%dA" % (drawn - len(visible)))
+        drawn = len(visible)
         out.append("\r\x1b[K" + help_line[:width - 1])
         sys.stdout.write("".join(out))
         sys.stdout.flush()
@@ -1819,20 +2292,34 @@ def choose(items):
         sys.stdout.write("\x1b[?25l")
         draw(True)
         while True:
-            k = os.read(fd, 8)
-            while k == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
-                k += os.read(fd, 8)
+            k = os.read(fd, 1)
+            while k in (b"\x1b", b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.05)[0]:
+                k += os.read(fd, 1)
+                if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
+                    break
+            rows = entries()
             if k in (b"\x1b[A", b"\x1bOA", b"k"):
-                cur = (cur - 1) % len(items)
+                cur = (cur - 1) % len(rows)
             elif k in (b"\x1b[B", b"\x1bOB", b"j"):
-                cur = (cur + 1) % len(items)
+                cur = (cur + 1) % len(rows)
             elif k == b" ":
-                picked[cur] = not picked[cur]
+                indexes = rows[cur][0]
+                value = not all(picked[i] for i in indexes)
+                for i in indexes:
+                    picked[i] = value
+            elif k == b"o":
+                gid = items[rows[cur][0][0]]["group"]
+                if gid in expanded:
+                    expanded.remove(gid)
+                else:
+                    expanded.add(gid)
+                cur = next(i for i, (ix, header) in enumerate(entries())
+                           if header and items[ix[0]]["group"] == gid)
             elif k == b"a":
                 picked = [not all(picked)] * len(items)
             elif k in (b"\r", b"\n"):
                 return [s for s, p in zip(items, picked) if p]
-            elif k in (b"q", b"\x1b", b"\x03", b"\x04"):
+            elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
                 return []
             draw(False)
     finally:
@@ -1848,7 +2335,7 @@ def run_argv(s):
     then stay in a shell there. CGR_LAUNCH carries the typed line to the
     watcher, so a reopened session keeps its original launch command."""
     shell = os.environ.get("SHELL") or "/bin/zsh"
-    launch = "export CGR_LAUNCH=%s; " % shlex.quote(s["typed"]) if s.get("typed") else ""
+    launch = "export CGR_LAUNCH=%s; " % shlex.quote(s.get("typed") or command(s))
     inner = "cd %s && { %s%s; }; exec %s -l" % (shlex.quote(s["cwd"]), launch, command(s),
                                                shlex.quote(shell))
     return [shell, "-lic", inner]
@@ -1891,8 +2378,11 @@ def open_wezterm(cli, items):
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             raise RuntimeError("wezterm cli spawn: " + (r.stderr.strip() or "failed"))
-        subprocess.run([cli, "cli", "set-tab-title", "--pane-id", r.stdout.strip(),
-                        tab_title(s)], capture_output=True, timeout=10)
+        try:
+            subprocess.run([cli, "cli", "set-tab-title", "--pane-id", r.stdout.strip(),
+                            tab_title(s)], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            print("cgr: tab opened; could not set its title: %s" % e, file=sys.stderr)
         yield s
 
 
@@ -1924,8 +2414,17 @@ def open_tmux(items, inside):
 
 def reopen(items):
     """Open each item in a new tab of the terminal cgr was run from."""
+    requested = items
+    items = []
+    for s in requested:
+        if Path(s["cwd"]).is_dir():
+            items.append(s)
+        else:
+            print("cgr: working directory is unavailable: %s" % clean(s["cwd"]), file=sys.stderr)
     wez = shutil.which("wezterm") or shutil.which("wezterm.exe")
-    if os.environ.get("TMUX") and shutil.which("tmux"):
+    if not items:
+        how, opener = None, iter(())
+    elif os.environ.get("TMUX") and shutil.which("tmux"):
         how, opener = "tmux windows", open_tmux(items, inside=True)
     elif os.environ.get("TERM_PROGRAM") == "WezTerm" and wez:
         how, opener = "WezTerm tabs", open_wezterm(wez, items)
@@ -1944,7 +2443,7 @@ def reopen(items):
     if done:
         mark_handled(done)
         print("reopened %d as %s" % (len(done), how))
-    left = [s for s in items if s not in done]
+    left = [s for s in requested if s not in done]
     if left:
         print("run these yourself:" if how is None else "not reopened -- run these yourself:")
         for s in left:
@@ -1964,6 +2463,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", "-n", action="store_true", help="same as --list")
     ap.add_argument("--all", "-a", action="store_true",
                     help="include sessions that died before the last boot that had agents running")
+    ap.add_argument("--expand-old", action="store_true",
+                    help="show sessions in groups older than seven days (--all includes the groups)")
     ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
     ap.add_argument("--save", action="store_true",
                     help="record every agent running now; the next cgr reopens them")
@@ -2019,10 +2520,8 @@ def main(argv=None):
     print("These agent sessions were cut off:\n")
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if args.list or args.dry_run or args.yes or not interactive:
-        for s in items:
-            print("  " + row(s)[:shutil.get_terminal_size((120, 20)).columns - 3])
-            if args.list or args.dry_run or not interactive:
-                print("      " + runnable(s))
+        show_recovery(items, expand_old=args.expand_old,
+                      commands=args.list or args.dry_run or not interactive)
         if args.list or args.dry_run:
             return 0
         if not args.yes:
@@ -2030,7 +2529,7 @@ def main(argv=None):
             return 0
         chosen = items
     else:
-        chosen = choose(items)
+        chosen = choose(items, expand_old=args.expand_old)
         if not chosen:
             print("nothing reopened")
             return 0

@@ -39,6 +39,7 @@ Contents:
 15. Relationship to the rest of crash-guard
 16. A planned restart: `cgr --save`
 17. Every session in one database: `cgr --history`
+18. Recovery corrections, 2026-10-13
 
 ## 1. What the user asked for
 
@@ -621,6 +622,16 @@ store reader is added (section 13).
 **Why prompts are dropped.** A prompt typed on the launch line was already
 sent once. Re-sending it into a resumed conversation would repeat the
 instruction.
+
+**Updated 2026-10-13 (T1).** `strip_args()` uses per-harness value-taking
+options from the installed CLI help. It preserves option values, including
+quoted spaces and multiple values where the CLI supports them, and drops
+positional prompts of any length. Treating every word after a flag as a value
+was rejected: a boolean such as `--yolo` does not own the following prompt.
+Claude's single-dash `-resume` typo is removed too. Both the typed line and
+the argv fallback use this rule, so repeated reopens cannot accumulate
+`codex continue resume ...`. Environment prefixes, proxy steps and aliases
+keep their existing behavior. Shell expressions remain an explicit limit.
 
 ## 9. Reopening
 
@@ -1212,3 +1223,141 @@ size, where the session is a file), `model`, `branch`, `path`, `typed`,
 8. **Formats move.** Each reader depends on a private store layout. A reader
    that fails prints `cgr: <harness>: <error>` and the rest still run; re-run
    audit check 8 after a harness upgrade.
+
+
+## 18. Recovery corrections, 2026-10-13
+
+T1 and T2 follow the handoff based on `496b4df`. Tests were added before
+behavior changes. The baseline was 78 tests; T1 passes 82, and T2 passes 93
+plus 31 subtests. No agent tabs were opened, and no commit or push was made.
+
+| defect | impact and evidence | fix and regression |
+|---|---|---|
+| Single-word prompts and `-resume` survive reconstruction | `codex continue resume T` and `claude -resume --resume X` repeat on later reopens | Per-harness option values; four `test_command_*` regressions in T1 |
+| Global subcommands and `-p` filter | `omp models` was offered as a dead session; Codex profiles and jcode providers were excluded as headless | CLI-specific command and flag sets; `test_harness_subcommands_and_one_shot_flags_are_specific_to_each_cli` and `test_old_watcher_one_shots_are_not_recoverable` |
+| Live-file mtime dates the set's last change | An idle agy appeared to die hours before shutdown, and a handled time could hide a later death | `boot_periods()` pairs wtmp shutdowns inside each interval, else uses the next boot; watcher evidence updates native event time; the three boot-date and merge regressions |
+| agy has no resolved id | `--continue` could select a conversation created after the crash | A unique presence lock within 60 seconds of launch, verified against `trajectory_meta.cascade_id`; two agy resolution tests |
+| Missing typed lines borrow unrelated history | A cgr reopen without an inherited line could borrow an earlier launch's model | `launch_matches()` compares options against process argv; generated tabs always carry `CGR_LAUNCH`, using the reconstructed command when history is absent; two history/environment tests |
+| Short resume flags ignored; store lookup runs beyond death | The newest transcript could be from a later session | `argv_id()` accepts CLI-specific short forms; unresolved native lookups stop at death plus five seconds; `test_resolve_uses_short_resume_flags_and_ignores_future_transcripts` |
+| WezTerm title timeout after successful spawn | The opened session was not marked handled and could be opened twice | Title failure is reported without losing the spawn; `test_a_tab_title_failure_does_not_lose_a_successful_spawn` uses mocks, never launches |
+
+CLI help was read for all 13 installed harnesses. ante and omx are absent;
+their prior definitions remain unverified. Interactive attach/resume forms
+remain eligible. One-shot records already on disk are filtered on read, so
+correcting the watcher does not require deleting its historical evidence.
+
+The agy process began at 2026-10-12 18:41:16. Its only matching lock is
+`4f946590-7669-46a1-8344-b2c15a7d44a5.lock`, dated 18:41:32. The matching
+conversation database has that cascade id; later locks are excluded. This is
+an inferred launch association supported by a unique timestamp match, not a
+pid-to-id field: the lock is empty. Ambiguous matches retain no id.
+
+The six real watcher records now all carry the wtmp shutdown time
+2026-10-13 05:05:30. The journal's power-off request at 05:05:24 precedes
+that accounting record by six seconds. A crash without a shutdown record
+has an inferred end, labeled as such. Default recovery still excludes boots
+before the selected crash boot; changing event dates must not widen that
+window.
+
+
+### 18.1 Event grouping (T3, 2026-10-13)
+
+`collect()` attaches a stable `group` key and `event` metadata, preserving
+the JSON array interface. Watcher boot ids are authoritative associations;
+native-only sessions use the interval containing their last activity and
+say `event_association: last activity`. Window closes form their own group
+within each boot. Sessions outside known intervals use daily activity
+groups without inventing a crash. Groups sort by end time, newest first;
+sessions within a group sort by their event time.
+
+`--all` includes older groups. Text and the picker collapse groups older than
+seven days; `--expand-old` or the picker's `o` key expands them. Old groups
+start unselected to avoid reopening a historical archive merely by pressing
+Enter. Space on a header toggles the whole group; individual rows can still
+be selected. `a` selects or clears all groups explicitly. JSON remains
+complete. `--yes --all` retains its explicit all-session behavior.
+
+Five regressions cover two crash boots plus a window close, JSON shape and
+keys, collapse/expand behavior, bulk group selection, and arrow-key movement
+between headers. Picker tests use a pty and return a selection without
+calling any opener. Full suite: 98 passed and 31 subtests passed.
+
+
+### 18.2 Indexed recovery and harness coverage (T4, 2026-10-13)
+
+`indexed_cut_off()` adds harnesses outside the four native recovery readers
+from `sessions.db`: interactive, cut-off rows with `in_store = 1`, a real
+session id and an available recorded path when one exists. Unknown, automated,
+synthetic-id and missing-store rows stay out. Default recovery applies the
+same look-back floor; the existing (harness, id) key merges watcher evidence
+with the row. A current-boot missing end marker requires watcher evidence,
+because it can be an idle live session rather than a death.
+
+`ensure_index()` refreshes missing, day-old or older-schema databases.
+`build_index()` calls `cut_off(use_index=False)`, so verdicts always come
+from primary stores and watcher evidence. A fresh index is reused. Additional
+native readers also resolve unnamed watcher processes by directory and
+activity between their launch and death. Indexed rows do not borrow launch
+flags from history using their original session creation time. A watcher
+resolved id is retained in history even if that harness has no native indexer,
+as for agy; its old synthetic row is retained as unavailable history.
+
+OpenClaw's installed `resume` command searches recent session ids as well as
+keys, labels and names. The exact id is now passed, instead of opening a
+picker for an unspecified recent session. Its installed implementation is
+`tui-session-picker-DNnzU8Pp.mjs`, `buildSessionChoices()` and
+`resolveResumeSession()`. This still depends on Gateway discovery exposing
+the historical window; reopening each old OpenClaw conversation was not
+performed. No CLI or provider configuration was changed.
+
+Nine T4 tests cover indexed jcode/muse recovery, row eligibility, default
+windows and watcher merging, live-current-boot protection, a single stale
+refresh without recursion, fresh-index reuse, native jcode id resolution,
+OpenClaw's named query and agy's resolved id in history. Full suite: 107
+passed and 31 subtests passed. A live `--history --json` refresh exited zero
+with no stderr. `--all --json` lists 147 sessions in 69 groups across agy,
+claude, codex, hermes, jcode, muse, omp and openclaw; ordinary recovery still
+lists exactly the six from the handoff.
+
+The zero-cut-off explanation is a capability limit, not evidence of clean
+shutdown: pi 126, gemini 43, qwen 50 and opencode 154 are all `unknown`, and
+none has an exit record. Their mid-turn counts are respectively 29, 5, 28
+and 38. `exit_verdict()` can read an explicit marker when present, but
+`WRITES_EXIT` contains only claude, omp and muse, so missing markers in
+those four stores cannot be promoted to cut-off evidence. The watcher can
+supply positive death evidence for any of them.
+
+
+### 18.3 Final verification corrections and recovery gate (T5, 2026-10-13)
+
+The final review added five regressions to the T2 audit:
+
+- Installed pi and qwen entrypoints have generic filenames, so program-name
+  detection missed them. Only their recognized package paths now identify
+  `cli.js` and `cli-entry.js`; unrelated scripts stay excluded.
+- Initial prompts owned by `-i`, `--prompt-interactive` and `--prompt` must
+  lose their flag too. Otherwise the new resume flag can become the old
+  prompt's value, or the prompt can be replayed.
+- Qwen's positional query is one-shot unless interactive mode is requested,
+  according to the installed CLI help. Such a process is excluded.
+- One-shot records in old live and saved files must not stop the empty-boot
+  walk. The same classification applies to boot selection and save recovery.
+- Two historical jcode directories and one hermes directory no longer exist.
+  `reopen()` reports an unavailable directory without spawning or marking
+  the session handled. The regression mocks every opener and launches no tab.
+
+The final suite is 112 tests and 35 subtests, all passing both in the working
+checkout and in a clean tracked snapshot of `496b4df` with the five-file diff
+applied. `git diff --check` passes. The watcher was restarted at 18:31 PDT
+and read back active, running, with `ExecMainStatus=0`.
+
+The read-only six-session gate passed: exact harness/id set, well-formed
+commands, two Claude transcripts, Codex's thread and rollout, two OMP logs,
+agy's cascade id, six existing folders, and a reachable WezTerm CLI with a
+resolved window. All six belong to the 2026-10-13 05:05:30 shutdown group.
+No tabs were opened. Conversation loading remains the operator's check:
+run `cgr`, select all six, and confirm each tab shows the intended conversation.
+
+The detailed result and file-level diff are in the crash-guard dossier's
+`handoff-2026-10-13-codex-result` page. Source edits remain uncommitted and
+unpushed; HEAD and origin/main stay at `496b4df`.
