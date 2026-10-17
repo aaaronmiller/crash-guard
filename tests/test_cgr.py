@@ -488,6 +488,43 @@ class CgrTests(unittest.TestCase):
         keys = (b"a", b"\x1b[B", b"\x1b[B", b"\x1b[B", b" ", b"\r")
         self.assertEqual(self.picker_keys(items, keys), ["/other"])
 
+    def test_group_label_carries_stamp_and_count(self):
+        items = self.grouped_crashes()
+        label = self.cg.group_label(items[0], 2)
+        self.assertIn("2 sessions", label)
+        self.assertRegex(label, r"20\d\d-\d\d-\d\d \d\d:\d\d")
+
+    def test_select_groups_filters_by_display_number(self):
+        items = self.grouped_crashes()
+        one = self.cg.select_groups(items, ["1"])
+        self.assertEqual(len(one), 1)
+        self.assertEqual({s["group"] for s in one}, {items[0]["group"]})
+        two = self.cg.select_groups(items, ["2,3"])
+        self.assertEqual(len(two), 2)
+
+    def test_preview_line_shows_id_and_prompt(self):
+        s = {"id": "abc123", "messages": 42, "model": "opus",
+             "last_prompt": "fix the thing", "mid_turn": 1}
+        line = self.cg.preview_line(s)
+        self.assertIn("abc123", line)
+        self.assertIn("42 msgs", line)
+        self.assertIn("fix the thing", line)
+
+    def test_brief_prints_one_line_per_group(self):
+        items = self.grouped_crashes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.cg.main(["--all", "--brief"]), 0)
+        self.assertEqual(len(output.getvalue().strip().splitlines()), 3)
+
+    def test_list_group_flag_restricts_output(self):
+        self.grouped_crashes()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.cg.main(["--all", "--list", "--group", "2"]), 0)
+        self.assertEqual(output.getvalue().count(", 1 session]"), 1)
+
+
     def picker_keys(self, items, keys):
         data = self.home / "picker.json"; data.write_text(json.dumps(items))
         script = self.home / "picker.py"

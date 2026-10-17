@@ -101,12 +101,14 @@ alias cgh='crash-guard history'
 
 # Once-per-boot notice on an interactive shell when sessions died. The marker
 # is keyed to the boot_id, so every later shell this boot skips python entirely.
+# Shows the colored saved→crash→current group menu (--brief); run `cgr` to pick,
+# `cgr --yes` for all, `cgr --yes --group N` for one group.
 if [ -n "${PS1:-}" ] || case "$-" in *i*) true;; *) false;; esac; then
   _cg_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   _cg_marker="${XDG_DATA_HOME:-$HOME/.local/share}/crash-guard/.notified-${_cg_boot}"
   if [ -n "${_cg_boot}" ] && [ ! -e "${_cg_marker}" ]; then
     mkdir -p "${_cg_marker%/*}" 2>/dev/null && : >| "${_cg_marker}"
-    command cgr --notify 2>/dev/null
+    command cgr --brief 2>/dev/null
   fi
   unset _cg_boot _cg_marker
 fi

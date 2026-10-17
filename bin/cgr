@@ -5,18 +5,13 @@
 """cgr -- reopen the agent sessions that died with your terminal or your machine.
 
     cgr               pick with the arrow keys, reopen each one in a new tab
+                      (green=saved group, yellow=window closed, red=crash)
     cgr --list        print what died and the command each one would run
-    cgr --yes         reopen all of them without asking
-    cgr --all         include sessions that died before the last boot that had
-                      agents running
-    cgr --forget      stop listing the sessions shown now
-    cgr --save        before a planned restart: record every agent running now,
-                      so the next `cgr` reopens them however they get closed
-    cgr --history     every session of every harness into one database
-                      (sessions.db), and list the ones cut off or left mid-task
-    cgr --notify      one line if anything died (the login hook calls this)
-    cgr --json
-    cgr --watch       the watcher; systemd runs it as cgr-watch.service
+    cgr --list --preview  also show id, message counts, model, last prompt
+    cgr --list --group 1  show only group 1 (numbered in display order)
+    cgr --yes         reopen all shown without asking (summary first)
+    cgr --yes --group 1 reopen only group 1 (selective restore)
+    cgr --brief       one colored header line per group (dates + counts)
 
 A session is listed when it was running and nobody exited it: the machine went
 down under it, or its window closed. It reopens in a new tab, in its own
@@ -65,6 +60,21 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+NO_COLOR = os.environ.get("NO_COLOR")
+USE_COLOR = sys.stdout.isatty() and not NO_COLOR and os.environ.get("TERM") != "dumb"
+
+
+def color(code):
+    return "\033[%sm" % code if USE_COLOR else ""
+
+
+def _c(text, *codes):
+    """Wrap text in color codes when the terminal supports them."""
+    if not USE_COLOR or not codes:
+        return text
+    return "".join(color(c) for c in codes) + text + color("0")
+
 
 HOME = Path.home()
 STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "crash-guard"
@@ -2202,6 +2212,52 @@ def row(s):
         s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"]))
 
 
+def how_color(s):
+    """Group color by provenance: green=saved, red=crash, yellow=current."""
+    if s.get("how") == "saved":
+        return "32"
+    if s.get("event", {}).get("kind") in ("window closed", "killed"):
+        return "33"
+    return "31"
+
+
+def row_colored(s):
+    """Recovery row with harness in green and how in its group color."""
+    when = time.strftime("%m-%d %H:%M", time.localtime(s["last"]))
+    base = clean("%-8s  %-26s  %-11s  %-17s  %s" % (
+        s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"]))
+    if not USE_COLOR:
+        return base
+    harness = clean(str(s["harness"]))
+    how = clean(str(s["how"]))
+    start = base.find(how)
+    head = base[len(harness):start] if start > 0 else base[len(harness):]
+    return (color("1;32") + harness + color("0") + head
+            + color("1;" + how_color(s)) + how + color("0")
+            + base[start + len(how):])
+
+
+def preview_line(s):
+    """Content preview: id, messages/bytes, model, last prompt."""
+    bits = []
+    if s.get("id"):
+        bits.append("id %s" % clean(str(s["id"]))[:13])
+    if s.get("messages"):
+        bits.append("%d msgs" % s["messages"])
+    if s.get("bytes"):
+        bits.append("%.0fKB" % (s["bytes"] / 1024))
+    if s.get("model"):
+        bits.append(clean(str(s["model"]))[:28])
+    if s.get("mid_turn"):
+        bits.append("mid-turn")
+    last = clean(str(s.get("last_prompt") or ""))[:90]
+    if not bits and not last:
+        return ""
+    head = _c(" | ", "2") + _c("  ".join(bits), "36") if bits else ""
+    tail = _c(" | " + last, "2") if last else ""
+    return head + tail
+
+
 def runnable(s):
     """The line to paste to reopen a session by hand, as printed."""
     return clean("cd %s && %s" % (shlex.quote(s["cwd"]), command(s)))
@@ -2228,30 +2284,44 @@ def event_title(s):
     return clean("Boot %s to %s; %s" % (stamp(ev["start"]), stamp(ev["end"]), ev["end_kind"]))
 
 
-def show_recovery(items, expand_old=False, commands=True):
+def group_label(s, n):
+    """Colored group header: title + date/time + session count, provenance color."""
+    title = event_title(s)
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["event"].get("end") or s["last"]))
+    label = "%s  [%s, %d session%s]" % (title, stamp, n, "" if n == 1 else "s")
+    return _c(label, "1;" + how_color(s))
+
+
+def show_recovery(items, expand_old=False, commands=True, preview=False):
+    width = shutil.get_terminal_size((120, 20)).columns
     for indexes in event_groups(items):
         s = items[indexes[0]]
         collapsed = old_group(s) and not expand_old
-        print("%s (%d sessions)%s" % (event_title(s), len(indexes),
-              " [collapsed; --expand-old shows sessions]" if collapsed else ""))
+        tail = " [collapsed; --expand-old shows sessions]" if collapsed else ""
+        print("%s%s" % (group_label(s, len(indexes)), _c(tail, "2") if tail else ""))
         if not collapsed:
             for i in indexes:
-                print("  " + row(items[i])[:shutil.get_terminal_size((120, 20)).columns - 3])
+                print("  " + row_colored(items[i])[:width + 30])
+                if preview:
+                    pv = preview_line(items[i])
+                    if pv:
+                        print("    " + pv[:width - 3])
                 if commands:
                     print("      " + runnable(items[i]))
         print()
 
 
-def choose(items, expand_old=False):
+def choose(items, expand_old=False, preview=False):
     """Space on a header selects its whole group. Old groups start collapsed and unticked."""
     import termios
     import tty
     fd = sys.stdin.fileno()
     picked, cur = [not old_group(s) for s in items], 0
+    show_preview = preview
     groups = event_groups(items)
     expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = "  up/down move   space group/session   o expand/collapse   a all/none   enter reopen   q quit"
+    help_line = "  up/down move   space group/session   o expand/collapse   a all/none   p preview   enter reopen   q quit"
     drawn = 0
 
     def entries():
@@ -2273,8 +2343,14 @@ def choose(items, expand_old=False):
         for pos, (indexes, header) in enumerate(visible, start):
             state = "x" if all(picked[i] for i in indexes) else "+" if any(picked[i] for i in indexes) else " "
             s = items[indexes[0]]
-            label = (event_title(s) + " (%d sessions)%s" % (len(indexes),
-                     " [collapsed]" if s["group"] not in expanded else "")) if header else "  " + row(s)
+            if header:
+                label = group_label(s, len(indexes)) + (_c(" [collapsed]", "2") if s["group"] not in expanded else "")
+            else:
+                label = "  " + row_colored(s)
+                if show_preview:
+                    pv = preview_line(s)
+                    if pv:
+                        label += "\n      " + pv
             line = ("%s [%s] %s" % (">" if pos == cur else " ", state, label))[:width - 1]
             out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if pos == cur else line) + "\n")
         # Clear leftover rows after collapsing a group, then return to the help line.
@@ -2317,6 +2393,8 @@ def choose(items, expand_old=False):
                            if header and items[ix[0]]["group"] == gid)
             elif k == b"a":
                 picked = [not all(picked)] * len(items)
+            elif k == b"p":
+                show_preview = not show_preview
             elif k in (b"\r", b"\n"):
                 return [s for s, p in zip(items, picked) if p]
             elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
@@ -2455,6 +2533,25 @@ def reopen(items):
 
 # -- main --------------------------------------------------------------------
 
+def select_groups(items, specs):
+    """Filter items to the numbered groups `--list` shows. Numbers are 1-based
+    in display order; bad numbers are ignored."""
+    groups = event_groups(items)
+    want = set()
+    for spec in specs or []:
+        for part in str(spec).split(","):
+            part = part.strip()
+            if part.isdigit():
+                want.add(int(part) - 1)
+    if not want:
+        return items
+    keep = set()
+    for gi, indexes in enumerate(groups):
+        if gi in want:
+            keep.update(indexes)
+    return [s for i, s in enumerate(items) if i in keep]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cgr", description=__doc__.split("\n\n")[0])
     ap.add_argument("--list", "-l", action="store_true",
@@ -2465,6 +2562,12 @@ def main(argv=None):
                     help="include sessions that died before the last boot that had agents running")
     ap.add_argument("--expand-old", action="store_true",
                     help="show sessions in groups older than seven days (--all includes the groups)")
+    ap.add_argument("--preview", "-p", action="store_true",
+                    help="show a content-preview line under each session (id, msgs, model, last prompt)")
+    ap.add_argument("--group", "-g", action="append", default=None, metavar="N",
+                    help="restrict --list/--yes to group number(s) shown by --list (1-based, repeatable)")
+    ap.add_argument("--brief", action="store_true",
+                    help="print one colored group-header line per group (no sessions), for startup display")
     ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
     ap.add_argument("--save", action="store_true",
                     help="record every agent running now; the next cgr reopens them")
@@ -2505,6 +2608,16 @@ def main(argv=None):
             print("\033[33mcgr:\033[0m %d agent session%s died (%s%s) -- run \033[1mcgr\033[0m "
                   "to reopen" % (len(items), "" if len(items) == 1 else "s", names, more))
         return 0
+    if args.group:
+        items = select_groups(items, args.group)
+        if not items:
+            print("cgr: no sessions in group(s) %s" % ", ".join(args.group))
+            return 0
+
+    if args.brief:
+        for indexes in event_groups(items):
+            print(group_label(items[indexes[0]], len(indexes)))
+        return 0
     if not watcher_running(current_boot()[1]):
         print("cgr: the watcher is not running, so only claude windows that close are caught."
               "\n     start it: systemctl --user enable --now cgr-watch\n")
@@ -2520,16 +2633,19 @@ def main(argv=None):
     print("These agent sessions were cut off:\n")
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if args.list or args.dry_run or args.yes or not interactive:
-        show_recovery(items, expand_old=args.expand_old,
+        show_recovery(items, expand_old=args.expand_old, preview=args.preview,
                       commands=args.list or args.dry_run or not interactive)
         if args.list or args.dry_run:
             return 0
         if not args.yes:
             print("\nnot a terminal: run `cgr --yes` to reopen all, or the commands above")
             return 0
+        print(_c("Reopening %d session%s:" % (len(items), "" if len(items) == 1 else "s"), "1;32"))
+        for indexes in event_groups(items):
+            print("  " + group_label(items[indexes[0]], len(indexes)))
         chosen = items
     else:
-        chosen = choose(items, expand_old=args.expand_old)
+        chosen = choose(items, expand_old=args.expand_old, preview=args.preview)
         if not chosen:
             print("nothing reopened")
             return 0
