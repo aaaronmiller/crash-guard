@@ -980,7 +980,7 @@ run).
 | `bin/crash-guard` (`restore`, `cg_run` ledger, `ledger` bridge) | unchanged and still works for the ledger and for `cg_run` launches; no longer the answer to "what died" |
 | `bin/cg-recover`, `bin/cg-forensic` | superseded for recovery (A2); kept for reference and `crash-guard recover --compare` |
 | `bin/cg-snapshot` | superseded by the watcher (A3); not running since 2026-09-02; its 74 MB store is the graded 2026-08-20 corpus |
-| `shell/crash-guard.sh` | defines `cg_run`, `cgs`, `cgh`, `cgr-batch` (`cgr --yes`), and the once-per-boot `cgr --notify` line; no per-command hook |
+| `shell/crash-guard.sh` | defines `cg_run`, `cgs`, `cgh`, `cgr-batch` (`cgr --yes`), and the once-per-boot `cgr --brief` line; no per-command hook |
 
 The project's dated decisions, the evidence behind them, and the task state
 live in the Living Documents dossier:
@@ -1361,3 +1361,31 @@ run `cgr`, select all six, and confirm each tab shows the intended conversation.
 The detailed result and file-level diff are in the crash-guard dossier's
 `handoff-2026-10-13-codex-result` page. Source edits remain uncommitted and
 unpushed; HEAD and origin/main stay at `496b4df`.
+
+### 18.4 Date-grouped history browser and saved-row dedupe (T6, 2026-10-17)
+
+`cgr --history` without a tty flag now browses one line per date with its
+session count, colored like the picker (green saved, yellow window, red
+crash). Space opens a date into its sessions, each with its reopen command;
+space ticks sessions, `a` ticks the open date, Enter reopens the ticked set
+through `reopen_history()`, which maps index rows back to session dicts and
+reuses the tab opener, `mark_handled()` and unavailable-directory reporting.
+`--list` prints the same date groups without opening tabs; `--all` shows
+every date instead of capping at the newest 40. JSON shape is unchanged.
+Native-harness `@`-prefixed rows stay out of the pick list: they name no
+session and cannot be reopened by id.
+
+Two recovery defects found live on 2026-10-17 (four saved omp windows each
+listed twice, as `saved` plus an id-less `window closed` twin):
+
+- Live omp writes the signal nested (`{"customType": "session_exit",
+  "data": {"reason": "sighup"}}`); `exit_reason()` read only the flat
+  `reason`, so the saved transcript was invisible to native detection and to
+  watcher `resolve()`. It now reads both, matching `tail_scan()`.
+- `merge()` lets a `saved` row absorb the watcher's id-less row for its
+  window (same harness, cwd, start within five minutes), rekeyed under the
+  real id. Without the absorb step the two keys never meet and both list.
+
+Three regressions: nested-sighup detection and resolution, the saved-absorbs-
+watcher merge, and date grouping plus `reopen_history()` command building.
+Full suite: 120 passed and 35 subtests passed.

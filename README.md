@@ -57,7 +57,7 @@ cgr --all --expand-old --list  # show every session and command in older groups
 cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
 cgr --save        # before a planned restart: record what runs now
-cgr --history     # every session of every harness into sessions.db; list the unfinished
+cgr --history     # browse every unfinished session grouped by date; space opens, space picks
 ```
 
 Example, after the 2026-10-09 WSL crash that this tool was rebuilt for. The
@@ -80,8 +80,8 @@ tmux, otherwise a WezTerm tab, otherwise a Windows Terminal tab, otherwise a
 tmux session called `cgr`. If a tab cannot be opened, `cgr` prints the command
 to run by hand.
 
-The first interactive shell of each boot prints one line if anything died
-(`cgr --notify`, from the shell integration).
+The first interactive shell of each boot prints one colored line per group
+(`cgr --brief`, from the shell integration).
 
 Recovery is grouped by boot shutdown or crash, with a separate group for
 windows closed during each boot. The header gives the boot start, end and
@@ -115,16 +115,22 @@ newest session in their directory.
 ## Every session, in one database: `cgr --history`
 
 ```bash
-cgr --history          # refresh the database, print a summary and the newest 40 to audit
-cgr --history --all    # every session worth an audit
+cgr --history          # grouped by date with counts; space opens a date, space picks, enter reopens
+cgr --history --list   # print the same groups and sessions; open no tabs
+cgr --history --all    # every date, not just the newest 40 sessions
 sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
 ```
 
+One line per date with its session count (green saved, yellow window, red
+crash, like the picker). Space on a date expands it into its sessions, each
+with its reopen command; space on a session ticks it, `a` ticks the whole
+date, Enter reopens the ticked set in new tabs.
+
 It has store readers for 12 harnesses (claude, codex, omp, pi, hermes, jcode,
-muse, gemini, qwen, opencode/kilo, openclaw) and keeps one row per session:
-id, folder, harness, start and last activity, size, model, git branch, first
-and last prompt, how it ended, and the line that reopens it. First run on this
-machine: 1,455 sessions, 383 to audit.
+ muse, gemini, qwen, opencode/kilo, openclaw) and keeps one row per session:
+ id, folder, harness, start and last activity, size, model, git branch, first
+ and last prompt, how it ended, and the line that reopens it. First run on this
+ machine: 1,455 sessions, 383 to audit.
 
 Each session gets one **status**, with its evidence in the `how` column:
 

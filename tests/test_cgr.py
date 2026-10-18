@@ -931,6 +931,56 @@ class CgrTests(unittest.TestCase):
         self.assertEqual(found[("omp", "hup")]["how"], "window closed")
         self.assertNotIn(("omp", "bye"), found)
 
+    def test_omp_nested_signal_reason_is_cut_off_and_resolvable(self):
+        # Live omp writes the signal nested (`data.reason`, seen 2026-10-17:
+        # every saved window ended `{"customType": "session_exit", "data":
+        # {"reason": "sighup"}}`); a flat-only read dropped the transcript and
+        # left the watcher's id-less row doubled beside the saved one.
+        nested = {"type": "custom", "customType": "session_exit",
+                  "data": {"reason": "sighup", "kind": "signal"}}
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        self.omp_session("nested", [say, nested], self.crash)
+        found = self.found()
+        self.assertEqual(found[("omp", "nested")]["how"], "window closed")
+        r = {"harness": "omp", "cwd": "/m", "started": self.prev + 100,
+             "last": self.crash, "how": "window closed", "argv": ["omp"]}
+        self.assertEqual(self.cg.resolve(r, set(), set())["id"], "nested")
+
+    def test_saved_record_absorbs_the_watchers_id_less_row(self):
+        # The watcher's id-less row and the saved record are the same window
+        # (2026-10-17: four saved omp windows each showed twice, as `saved`
+        # plus a `window closed` twin with no id).
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        nested = {"type": "custom", "customType": "session_exit",
+                  "data": {"reason": "sighup"}}
+        self.omp_session("kept", [say, nested], self.crash)
+        started = self.prev + 100
+        watcher_row = dict(self.cg.session("omp", None, "/m", self.crash, "window closed", ""),
+                           started=started, typed="omp", argv=["omp"])
+        saved_row = dict(self.cg.session("omp", "kept", "/m", self.crash, "saved", "kept"),
+                         started=started)
+        items = {self.cg.item_key(watcher_row): watcher_row}
+        self.cg.merge(items, saved_row)
+        self.assertEqual(list(items), [("omp", "kept")])
+
+    def test_history_groups_by_date_and_reopens_picks(self):
+        t = self.crash
+        rows = []
+        for sid, when in (("today-a", t), ("today-b", t - 100), ("yesterday", t - 86400)):
+            r = self.indexed_row("jcode", sid, last=when)
+            rows.append(r)
+        self.cg.write_index(rows)
+        groups = self.cg.history_groups([dict(zip(self.cg.COLUMNS, t_))
+                                         for t_ in self.cg.write_index(rows, set())])
+        self.assertEqual([len(g) for _, g in groups], [2, 1])
+        picked = [r for day, grows in groups for r in grows if r["id"] == "today-a"]
+        with patch.object(self.cg, "reopen", return_value=0) as reopen:
+            self.assertEqual(self.cg.reopen_history(picked), 0)
+            self.assertEqual(reopen.call_args[0][0][0]["id"], "today-a")
+            self.assertIn("--resume", self.cg.command(reopen.call_args[0][0][0]))
+
     def test_a_session_named_on_the_command_line_is_the_one_reopened(self):
         # `codex resume <id>` ran that thread, whichever thread in its directory
         # was touched last (2026-10-10: its own subagents were).

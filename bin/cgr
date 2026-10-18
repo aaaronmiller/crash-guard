@@ -11,7 +11,9 @@
     cgr --list --group 1  show only group 1 (numbered in display order)
     cgr --yes         reopen all shown without asking (summary first)
     cgr --yes --group 1 reopen only group 1 (selective restore)
-    cgr --brief       one colored header line per group (dates + counts)
+    cgr --brief       one colored group-header line per group (dates + counts)
+    cgr --history     browse every unfinished session grouped by date;
+                      space opens a date, space picks sessions, enter reopens
 
 A session is listed when it was running and nobody exited it: the machine went
 down under it, or its window closed. It reopens in a new tab, in its own
@@ -850,10 +852,14 @@ CUT_EXITS = {"other": "window closed", "sighup": "window closed", "sigterm": "ki
 
 
 def exit_reason(path):
-    """The reason on a session_exit that follows the last message, else None."""
+    """The reason on a session_exit that follows the last message, else None.
+
+    omp nests the signal under `data` (`{"data": {"reason": "sighup"}}`);
+    claude's hook writes it flat. A nested reason is the same evidence."""
     for rec in tail(path):
         if rec.get("customType") == "session_exit":
-            return rec.get("reason") or "unknown"
+            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+            return rec.get("reason") or data.get("reason") or "unknown"
         if rec.get("type") in ("user", "assistant", "message"):
             return None
     return None
@@ -1241,6 +1247,21 @@ def item_key(s):
 
 
 def merge(items, s):
+    """A `cgr --save` record absorbs the watcher's id-less row for its window,
+    which `resolve` cannot match by id: same harness, same window, both dying
+    in the same minute. Its id and title survive the watcher update."""
+    if s.get("how") == "saved" and s.get("id"):
+        for k, cur in list(items.items()):
+            if (cur.get("id") is None and cur.get("harness") == s["harness"]
+                    and cur.get("cwd") == s["cwd"] and cur.get("started")
+                    and s.get("started") and abs(cur["started"] - s["started"]) < 300):
+                cur.update({f: s[f] for f in ("typed", "argv", "started", "id", "title") if s.get(f)})
+                cur.update({f: s[f] for f in ("last", "how", "boot", "boot_end", "died") if f in s})
+                cur.update({f: s[f] for f in ("messages", "bytes", "model", "mid_turn",
+                                              "last_prompt") if s.get(f)})
+                if item_key(cur) != k:
+                    items[item_key(cur)] = items.pop(k)
+                return
     k = item_key(s)
     if k in items:
         items[k].update({f: s[f] for f in ("typed", "argv", "started") if s.get(f)})
@@ -2001,17 +2022,19 @@ def build_index():
     running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
     named = running_words()
     # What `cgr --save` recorded is not evidence of anything going wrong.
-    evidence = {k: s for k, s in cut_off(everything=True, use_index=False).items() if s["how"] != "saved"}
+    evidence = {k: s for k, s in cut_off(everything=True, use_index=False).items()
+                if s["how"] != "saved" and (s.get("id") or s["harness"] in STORE_INDEXERS)}
     for s in evidence.values():
         sid = s["id"] or "@%d" % int(s["started"] or s["last"])
-        if (s["harness"], sid) not in rows:  # watcher evidence can also resolve an exact id
-            path = s.get("path")
-            if s["harness"] == "agy" and s["id"]:
-                path = HOME / ".gemini/antigravity-cli/conversations" / (s["id"] + ".db")
-            r = entry(s["harness"], sid, path, cwd=s["cwd"],
-                      source="cli", started=s["started"], title=s["title"])
-            r["last"] = s["last"]
-            rows[(r["harness"], r["id"])] = dict(r, verdict=None, evidence=s)
+        if (s["harness"], sid) in rows:
+            continue  # watcher evidence can also resolve an exact id
+        path = s.get("path")
+        if s["harness"] == "agy" and s["id"]:
+            path = HOME / ".gemini/antigravity-cli/conversations" / (s["id"] + ".db")
+        r = entry(s["harness"], sid, path, cwd=s["cwd"],
+                  source="cli", started=s["started"], title=s["title"])
+        r["last"] = s["last"]
+        rows[(r["harness"], r["id"])] = dict(r, verdict=None, evidence=s)
     handled = load_handled()
     now = time.time()
     for k, r in rows.items():
@@ -2036,7 +2059,6 @@ def build_index():
         r["interactive"] = 0 if r["source"] in AUTOMATED else 1
         r["last_seen"] = r["first_seen"] = now
     return [rows[k] for k in sorted(rows, key=lambda k: -(rows[k]["last"] or 0))], failed
-
 
 def write_index(rows, failed=()):
     """Upsert into sessions.db. A row outlives its transcript: once a harness
@@ -2096,7 +2118,7 @@ def history_row(r):
         r["last_prompt"] or r["title"] or ""))
 
 
-def show_history(everything=False, as_json=False):
+def show_history(everything=False, as_json=False, list_only=False):
     rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
     if as_json:
         print(json.dumps(rows, indent=1))
@@ -2113,18 +2135,139 @@ def show_history(everything=False, as_json=False):
     print("  %-9s" % "harness" + "".join("%9s" % c for c in cols))
     for h in sorted(by, key=lambda h: -by[h]["sessions"]):
         print("  %-9s" % h + "".join("%9d" % by[h][c] for c in cols))
-    bad = [r for r in rows if flagged(r)]
-    limit = len(bad) if everything else 40
-    width = shutil.get_terminal_size((160, 20)).columns
-    print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (
-        len(bad), "" if len(bad) <= limit else " (the %d newest; --all shows every one)" % limit))
-    for r in bad[:limit]:
-        print("  " + history_row(r)[:width - 3])
-    print("\naudit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
-    return 0
+    bad = [r for r in rows if flagged(r) and not (r["harness"] in NATIVE_RECOVERY and r["id"].startswith("@"))]
+    shown = bad if everything else bad[:40]
+    groups = history_groups(shown)
+    if list_only or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        limit_note = "" if everything else " (the %d newest; --all shows every one)" % len(shown)
+        print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (len(bad), limit_note))
+        for day, grows in groups:
+            print(history_group_label(day, grows))
+            for r in grows:
+                print("  " + history_row(r)[:shutil.get_terminal_size((160, 20)).columns - 3])
+            print()
+        print("audit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
+        return 0
+    chosen = choose_history(shown, groups)
+    if not chosen:
+        print("nothing reopened")
+        return 0
+    return reopen_history(chosen)
 
 
 # -- the command a tab runs --------------------------------------------------
+
+def history_groups(rows):
+    """Date groups, newest first: (date label, rows newest-first)."""
+    groups = {}
+    for r in sorted(rows, key=lambda r: -(r["last"] or 0)):
+        day = time.strftime("%Y-%m-%d", time.localtime(r["last"] or 0))
+        groups.setdefault(day, []).append(r)
+    return list(groups.items())
+
+
+def history_group_label(day, rows):
+    """Date + count, colored like the picker: green saved, yellow window, red crash."""
+    stamp = time.strftime("%a %Y-%m-%d", time.localtime(rows[0]["last"] or 0)) if rows else day
+    kinds = {r.get("how") for r in rows}
+    code = "32" if kinds == {"saved"} else "33" if kinds <= {"saved", "window closed", "killed"} else "31"
+    label = "%s  [%s, %d session%s]" % (stamp, day, len(rows), "" if len(rows) == 1 else "s")
+    return _c(label, "1;" + code)
+
+
+def choose_history(rows, groups):
+    """A date group per line with its count; space expands one group into its
+    sessions, and inside an open group space picks sessions to reopen."""
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    picked, cur = set(), 0
+    open_day = None
+    width = shutil.get_terminal_size((120, 20)).columns
+    help_line = ("  up/down move   space open group / pick session   "
+                 "a all/none in group   enter reopen   q quit")
+
+    def entries():
+        rows_out = []
+        for day, grows in groups:
+            rows_out.append((day, None))
+            if day == open_day:
+                rows_out.extend((day, r) for r in grows)
+        return rows_out
+
+    def draw(first):
+        nonlocal drawn
+        ents = entries()
+        height = shutil.get_terminal_size((120, 24)).lines
+        count = max(1, height - 3)
+        start = max(0, min(cur - count // 2, len(ents) - count))
+        visible = ents[start:start + count]
+        out = [] if first else ["\r\x1b[%dA" % drawn]
+        for pos, (day, r) in enumerate(visible, start):
+            if r is None:
+                grows = dict(groups)[day]
+                n = len(picked & {(x["harness"], x["id"]) for x in grows})
+                tick = "x" if n == len(grows) and grows else "+" if n else " "
+                marker = "-" if day == open_day else "+"
+                label = "%s [%s] %s" % (marker, tick, history_group_label(day, grows))
+            else:
+                key = (r["harness"], r["id"])
+                label = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
+                label += history_row(r)
+                if r.get("resume"):
+                    label += "\n        " + _c(r["resume"][:width - 10], "2")
+            line = ("%s %s" % (">" if pos == cur else " ", label))[:width - 1]
+            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if pos == cur else line) + "\n")
+        if drawn > len(visible):
+            out.extend("\r\x1b[K\n" for _ in range(drawn - len(visible)))
+            out.append("\r\x1b[%dA" % (drawn - len(visible)))
+        drawn = len(visible)
+        out.append("\r\x1b[K" + help_line[:width - 1])
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    drawn = 0
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?25l")
+        draw(True)
+        while True:
+            k = os.read(fd, 1)
+            while k in (b"\x1b", b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.05)[0]:
+                k += os.read(fd, 1)
+                if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
+                    break
+            ents = entries()
+            if k in (b"\x1b[A", b"\x1bOA", b"k"):
+                cur = (cur - 1) % len(ents)
+            elif k in (b"\x1b[B", b"\x1bOB", b"j"):
+                cur = (cur + 1) % len(ents)
+            elif k == b" ":
+                day, r = ents[cur]
+                if r is None:
+                    # Space opens a closed date; on the open date it closes it again.
+                    open_day = None if day == open_day else day
+                    if day == open_day:
+                        cur = next(i for i, e in enumerate(entries()) if e[0] == day and e[1] is not None)
+                    else:
+                        cur = next(i for i, e in enumerate(entries()) if e == (day, None))
+                else:
+                    key = (r["harness"], r["id"])
+                    picked.discard(key) if key in picked else picked.add(key)
+            elif k == b"a":
+                grows = dict(groups)[ents[cur][0]]
+                keys = {(x["harness"], x["id"]) for x in grows}
+                picked -= keys if keys <= picked else picked | keys
+            elif k in (b"\r", b"\n"):
+                return [r for r in rows if (r["harness"], r["id"]) in picked]
+            elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
+                return []
+            draw(False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\x1b[?25h\n")
+        sys.stdout.flush()
 
 def resume_args(s):
     by_id, cont, _ = HARNESSES.get(s["harness"], (None, None, set()))
@@ -2531,6 +2674,17 @@ def reopen(items):
     return 0 if not left else 1
 
 
+def reopen_history(rows):
+    """Reopen `cgr --history` picks, which name the session but not the window."""
+    items = []
+    for r in rows:
+        s = session(r["harness"], r["id"], r.get("cwd"), r.get("last"),
+                    r.get("how") or "cut off", r.get("title") or "")
+        s.update(typed=r.get("typed"), path=r.get("path"), source="sessions.db")
+        items.append(s)
+    return reopen(items)
+
+
 # -- main --------------------------------------------------------------------
 
 def select_groups(items, specs):
@@ -2572,8 +2726,8 @@ def main(argv=None):
     ap.add_argument("--save", action="store_true",
                     help="record every agent running now; the next cgr reopens them")
     ap.add_argument("--history", action="store_true",
-                    help="index every session of every harness into sessions.db and list "
-                         "the ones cut off or left mid-turn (--all lists every one)")
+                    help="browse every unfinished session grouped by date; --list prints "
+                         "the groups, --all shows every date")
     ap.add_argument("--notify", action="store_true", help="one line if anything died")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--watch", action="store_true", help="run the watcher (systemd does this)")
@@ -2582,7 +2736,11 @@ def main(argv=None):
     if args.watch:
         return watch()
     if args.history:
-        return show_history(everything=args.all, as_json=args.json)
+        if args.yes:
+            print("cgr: --yes reopens only this boot's cut-off sessions; pick from --history instead")
+            return 1
+        return show_history(everything=args.all, as_json=args.json,
+                            list_only=args.list or args.dry_run)
     if args.save:
         items = save()
         if not items:
