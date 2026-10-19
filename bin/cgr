@@ -2054,8 +2054,10 @@ def build_index():
     running = {("claude", sid) for sid in live}
     running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
     named = running_words()
-    # A `cgr --save` record is cut-off evidence once its process is gone (the
-    # planned restart), unless the harness wrote a deliberate exit record.
+    # A `cgr --save` record is cut-off evidence once its process is gone: you
+    # named this exact session for reopening, so it stays `saved` (green)
+    # even when the harness also wrote a deliberate exit record. Exiting
+    # after a save is still the planned restart the save was for.
     evidence = {k: s for k, s in cut_off(everything=True, use_index=False).items()
                 if s.get("id") or s["harness"] in STORE_INDEXERS}
     for s in evidence.values():
@@ -2075,7 +2077,9 @@ def build_index():
         ev = r.pop("evidence", None) or evidence.get(k)
         if k in running or r["id"] in named:
             r["status"], r["how"] = "running", "process alive"
-        elif ev and not (ev["how"] == "saved" and r["verdict"] and r["verdict"][0] == "closed"):
+        elif ev and ev["how"] == "saved":
+            r["status"], r["how"] = "cut off", "saved"
+        elif ev:
             r["status"], r["how"] = "cut off", ev["how"]
         elif r["verdict"]:
             r["status"], r["how"] = r["verdict"]
@@ -2124,9 +2128,10 @@ def write_index(rows, failed=()):
                 sets.append("%s = excluded.%s" % (c, c))
         read = sorted({r["harness"] for r in rows} - set(failed))
         with con:
-            # cgr no longer mints `@` rows for harnesses that resume by id; older ones left some.
-            con.execute("DELETE FROM sessions WHERE id LIKE '@%%' AND harness IN (%s)"
-                        % ",".join("?" * len(NATIVE_RECOVERY)), sorted(NATIVE_RECOVERY))
+            # Id-less rows name no session: unreopenable by id, unresolvable
+            # by the pickers (both refuse them). Older cgr versions minted
+            # them as evidence placeholders; delete them on every write.
+            con.execute("DELETE FROM sessions WHERE id LIKE '@%%'")
             if read:
                 con.execute("UPDATE sessions SET in_store = 0 WHERE harness IN (%s)"
                             % ",".join("?" * len(read)), read)
@@ -2235,9 +2240,6 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
             note = " (showing %d of %d, whole dates; --all shows every one)" % (len(shown_rows), total)
         print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (total, note))
         print_history_groups(shown, not (expand_old or selected), preview)
-        if len(flagged_rows) > len(bad):
-            print("%d more have no session id, so cannot be reopened by id from here "
-                  "(`cgr` reopens this boot's)\n" % (len(flagged_rows) - len(bad)))
         print("audit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
         return 0
     chosen = choose_history(shown_rows, shown, preview=preview)

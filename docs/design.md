@@ -1406,10 +1406,11 @@ date with a count; select, then pick sessions "like the first screen") found
   `merge()` pins `how="saved"` whichever row arrives last (and keeps the later
   `last`), and `group_sessions()` keeps `saved` on a closed boot period, so the
   row is green in `--list`, `--brief`, the picker and history.
-- **History keeps saved evidence** (`build_index()` no longer drops it), so
-  `sessions.db` holds `how="saved"`. A harness's deliberate exit record still
-  outranks it. This corrects the 17.3 rule 2 wording and the handoff claim
-  "8 rows, correct hows" (ids merged; the hows had been demoted).
+- **History keeps saved evidence**, so `sessions.db` holds `how="saved"`.
+  A `saved` row stays saved even when the harness also wrote a deliberate
+  exit record: exiting after a save is the planned restart the save was
+  for. This corrects the 17.3 rule 2 wording ("not evidence of anything"
+  is now wrong: saves merge into watcher rows and outrank clean exits).
 - **Date labels.** Color follows the date's dominant kind (a tie takes the
   worse) and a mixed date prints its counts, instead of one crash painting a
   mostly-saved date red.
@@ -1423,23 +1424,24 @@ date with a count; select, then pick sessions "like the first screen") found
 - **Preview parity.** `--preview` adds the id/messages/model/last-prompt line
   under each session in the list and the picker. The picker also stopped
   cutting an entry's second line (the reopen command) off at the terminal
-  width, and counts screen lines, not entries.
 - **`reopen_history()`** carries `started`, `messages`, `bytes`, `model`,
   `mid_turn` and `last_prompt`, and a new `argv` column (JSON) rebuilds the
   launch flags when `typed` is unknown. An id-less row is refused with a
   message instead of reopened with `--continue`; the history view hides
   those for every harness and counts them. `write_index()` purges stale
-  native `@` rows left by older databases.
-- **`merge()` absorb** takes the nearest start among candidates (still under
-  300 s), and refuses a pair whose `pid`/`ticks` or typed lines are both known
-  and differ. Resolved watcher rows now carry `pid` and `ticks` (added JSON
-  keys; none removed).
-- **`resolve()` for omp** ranks transcripts by how near their header start is
-  to the process start, so two bare windows in one directory pair correctly
-  whichever resolves first (touched-last remains the fallback).
-- **`session_exit_reason(rec)`** is the one place the exit rule lives, read by
-  `exit_reason()` and `tail_scan()`, including a string-shaped `data`.
+  `@` rows of every harness left by older databases.
 
-Remaining limit: id-less watcher rows of store harnesses are still minted
-into `sessions.db` (they back `--json` and the recovery list), only hidden
-from the history picks.
+### 18.6 Flagged-item fixes (T8, 2026-10-19)
+
+Two items the T7 session left open:
+
+- **`saved` outranks a clean exit.** A `cgr --save` record is an explicit
+  instruction to reopen that exact session, so once its process is gone the
+  row stays `saved` (green) even when the harness also wrote a deliberate
+  exit record — exiting each agent first is the normal shape of a planned
+  restart. `build_index()` applies `saved` before the harness verdict.
+- **No id-less rows anywhere.** `write_index()` deletes every `@` row on
+  each write, any harness. They named no session, neither picker can reopen
+  them by id, and both pickers already refuse them; keeping them only fed
+  `--json` with unreopenable rows. The history view filter and the picker
+  refusal stay as defense in depth for rows already in memory.

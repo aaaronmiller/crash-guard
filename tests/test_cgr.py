@@ -1050,7 +1050,9 @@ class CgrTests(unittest.TestCase):
         with patch.object(self.cg, "USE_COLOR", True):
             self.assertIn("1;32m", self.cg.history_group_label("2026-10-17", [r]))
 
-    def test_history_saved_evidence_does_not_override_a_clean_exit_record(self):
+    def test_history_saved_evidence_outranks_a_later_clean_exit_record(self):
+        # You named this exact session for reopening; exiting after a save is
+        # the planned restart the save was for, so it stays saved (green).
         say = {"type": "message", "message": {"role": "user", "content": [
             {"type": "text", "text": "go"}]}}
         self.omp_session("bye", [say, exit_marker("dispose")], self.crash)
@@ -1059,7 +1061,7 @@ class CgrTests(unittest.TestCase):
         self.cg.private_dir(self.cg.STATE)
         self.cg.saved_path().write_text(json.dumps({"saved": self.prev + 150, "sessions": [row]}))
         r = self.history_rows()[("omp", "bye")]
-        self.assertEqual(r["status"], "closed")
+        self.assertEqual((r["status"], r["how"]), ("cut off", "saved"))
 
     def test_history_group_label_colors_by_the_dominant_kind_and_counts_the_rest(self):
         # One old crash must not turn a nine-saved date red, nor hide itself.
@@ -1266,17 +1268,19 @@ class CgrTests(unittest.TestCase):
                 proc.wait()
             os.close(master)
 
-    def test_history_hides_id_less_rows_of_every_harness_from_picks(self):
-        # `@` rows have no id, so `--continue` would reopen the newest session
-        # in the directory, not necessarily the one that died.
+    def test_history_hides_id_less_rows_of_every_harness(self):
+        # `@` rows have no id, so no picker can reopen them; they are not
+        # written at all (write_index purges them), hence absent everywhere.
         rows = self.dated_rows({0: 1}) + [
             self.indexed_row("kilo", "@100", last=self.noon(0)),
             self.indexed_row("agy", "@200", last=self.noon(0))]
-        _, out = self.history_cli(rows, "--list")
+        self.cg.write_index(rows)
+        _, out = self.history_cli([r for r in rows if not r["id"].startswith("@")], "--list")
         self.assertIn(", 1 session", out)
         self.assertNotIn("kilo", out.split("cut off or left")[-1])
-        rc, js = self.history_cli(rows, "--json")
-        self.assertEqual(len(json.loads(js)), 3)       # the data is still all there
+        con = sqlite3.connect(str(self.cg.db_path()))
+        self.addCleanup(con.close)
+        self.assertEqual([r[0] for r in con.execute("SELECT id FROM sessions WHERE id LIKE '@%'")], [])
 
     def test_reopen_history_skips_an_id_less_row(self):
         row = dict(self.indexed_row("kilo", "@100"), typed="kilo")
@@ -1287,16 +1291,17 @@ class CgrTests(unittest.TestCase):
         self.assertEqual(reopen.call_args[0][0], [])
         self.assertIn("@100", err.getvalue())
 
-    def test_write_index_purges_stale_native_id_less_rows(self):
-        # Older cgr minted `@` rows for claude/codex/omp/hermes; they linger in old DBs.
-        stale = [self.indexed_row(h, "@100") for h in ("claude", "omp")]
-        keep = [self.indexed_row("kilo", "@100"), self.indexed_row("omp", "real")]
+    def test_write_index_purges_all_stale_id_less_rows(self):
+        # Older cgr minted `@` rows as evidence placeholders; no picker can
+        # reopen them by id, so every write deletes them, any harness.
+        stale = [self.indexed_row(h, "@100") for h in ("claude", "omp", "kilo", "codex")]
+        keep = [self.indexed_row("omp", "real")]
         self.cg.write_index(stale)
         self.cg.write_index(keep)
         con = sqlite3.connect(str(self.cg.db_path()))
         self.addCleanup(con.close)
         self.assertEqual(sorted(con.execute("SELECT harness, id FROM sessions")),
-                         [("kilo", "@100"), ("omp", "real")])
+                         [("omp", "real")])
 
     def test_reopen_history_keeps_what_the_row_knows(self):
         row = dict(self.indexed_row("omp", "abc", messages=7, model="m", mid_turn=1,
