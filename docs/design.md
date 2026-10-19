@@ -1072,8 +1072,9 @@ Added 2026-10-10 for goal G10.
 `cgr --history` reads every session store on the machine, decides how each
 session ended, and upserts one row per session into
 `~/.local/state/crash-guard/sessions.db`. It prints a table per harness and
-the newest 40 sessions worth an audit (`--all` prints every one, `--json`
-every row). The watcher refreshes the database once a day in a low-priority
+the sessions worth an audit grouped by date, newest first (the newest
+dates holding 40 sessions, each date whole; `--all` prints every date,
+`--json` every row; 18.4 and 18.5 describe the browser and its selectors). The watcher refreshes the database once a day in a low-priority
 child process (`refresh_index()`), so sessions are captured before their
 harness prunes them. Claude Code's default is 30 days; this machine sets
 `cleanupPeriodDays` to 99999 (checked 2026-10-10), so the daily refresh is
@@ -1125,8 +1126,10 @@ Each row gets one status. The first rule that applies wins:
 2. **cut off**: the crash path found it (`cut_off(everything=True)`): a
    watcher death or live-set record, a stale Claude pid file, and so on. Its
    `how` is the crash path's: `machine went down`, `window closed`, `killed`,
-   `not closed`. Sessions only saved with `--save` are not evidence of
-   anything.
+   `not closed`, and `saved`. A `--save` record whose process is gone is
+   evidence (the planned restart): it keeps `how` = `saved`, through
+   `merge()` and into this table, unless the harness wrote a deliberate exit
+   record (rule 3 then wins). It still does not mint rows without an id.
 3. **the harness's own end record**: closed (`exit record: dispose`,
    `status Closed`, `end record: cli_close`) or cut off (`CUT_EXITS`, jcode
    `Crashed`, hermes `HERMES_CUT`, muse `exit_reason` other than `clean`,
@@ -1172,8 +1175,9 @@ read is reported and its rows are not marked gone. Columns added by a later
 ### 17.5 Using it
 
 ```bash
-cgr --history                      # refresh, summary, newest 40 to audit
-cgr --history --all                # every flagged session
+cgr --history                      # refresh, summary, flagged sessions by date (newest ~40)
+cgr --history --all                # every flagged date
+cgr --history --list --group 2     # one date by its printed number; --day YYYY-MM-DD by name
 sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
 sqlite3 -box ~/.local/state/crash-guard/sessions.db \
   "SELECT harness, id, cwd, datetime(last,'unixepoch','localtime'), how, last_prompt
@@ -1185,7 +1189,7 @@ Columns: `harness`, `id`, `cwd`, `source`, `interactive`, `started`, `last`
 `title`, `last_prompt` (both cut to 400 characters), `messages` (where the
 harness counts them: hermes, opencode, jcode, gemini), `bytes` (transcript
 size, where the session is a file), `model`, `branch`, `path`, `typed`,
-`resume` (the line that reopens it), `reopened`, `in_store`, `first_seen`,
+`argv` (the process argv as JSON, when the watcher saw it), `resume` (the line that reopens it), `reopened`, `in_store`, `first_seen`,
 `last_seen`. The `audit` view adds `last_active` in local time.
 
 ### 17.6 Why this design
@@ -1372,8 +1376,8 @@ through `reopen_history()`, which maps index rows back to session dicts and
 reuses the tab opener, `mark_handled()` and unavailable-directory reporting.
 `--list` prints the same date groups without opening tabs; `--all` shows
 every date instead of capping at the newest 40. JSON shape is unchanged.
-Native-harness `@`-prefixed rows stay out of the pick list: they name no
-session and cannot be reopened by id.
+`@`-prefixed rows stay out of the pick list (18.5 widens this to every
+harness): they name no session and cannot be reopened by id.
 
 Two recovery defects found live on 2026-10-17 (four saved omp windows each
 listed twice, as `saved` plus an id-less `window closed` twin):
@@ -1389,3 +1393,53 @@ listed twice, as `saved` plus an id-less `window closed` twin):
 Three regressions: nested-sighup detection and resolution, the saved-absorbs-
 watcher merge, and date grouping plus `reopen_history()` command building.
 Full suite: 120 passed and 35 subtests passed.
+
+### 18.5 Requested-versus-shipped audit fixes (T7, 2026-10-18)
+
+An audit of 184be92 against the three requests (show all sessions; group by
+date with a count; select, then pick sessions "like the first screen") found
+`--save` green dead on real data. Fixes, each pinned by a test written first:
+
+- **`saved` survives the restart.** The watcher row for a saved window resolved
+  to the same id and won the merge (the saved row's `last` is the earlier save
+  time), and `group_sessions()` only kept `kind="saved"` for an open boot. Now
+  `merge()` pins `how="saved"` whichever row arrives last (and keeps the later
+  `last`), and `group_sessions()` keeps `saved` on a closed boot period, so the
+  row is green in `--list`, `--brief`, the picker and history.
+- **History keeps saved evidence** (`build_index()` no longer drops it), so
+  `sessions.db` holds `how="saved"`. A harness's deliberate exit record still
+  outranks it. This corrects the 17.3 rule 2 wording and the handoff claim
+  "8 rows, correct hows" (ids merged; the hows had been demoted).
+- **Date labels.** Color follows the date's dominant kind (a tie takes the
+  worse) and a mixed date prints its counts, instead of one crash painting a
+  mostly-saved date red.
+- **No partial dates.** The 40-row cap now ends on a date boundary and the
+  header says `showing N of M`.
+- **Selection without a terminal.** `--group N` (dates as printed) and `--day
+  YYYY-MM-DD` filter `--history`; `--history --yes` reopens a selected date
+  and is still refused with none. A selected or `--expand-old` date prints
+  expanded; dates older than seven days otherwise print collapsed, as in the
+  recovery list.
+- **Preview parity.** `--preview` adds the id/messages/model/last-prompt line
+  under each session in the list and the picker. The picker also stopped
+  cutting an entry's second line (the reopen command) off at the terminal
+  width, and counts screen lines, not entries.
+- **`reopen_history()`** carries `started`, `messages`, `bytes`, `model`,
+  `mid_turn` and `last_prompt`, and a new `argv` column (JSON) rebuilds the
+  launch flags when `typed` is unknown. An id-less row is refused with a
+  message instead of reopened with `--continue`; the history view hides
+  those for every harness and counts them. `write_index()` purges stale
+  native `@` rows left by older databases.
+- **`merge()` absorb** takes the nearest start among candidates (still under
+  300 s), and refuses a pair whose `pid`/`ticks` or typed lines are both known
+  and differ. Resolved watcher rows now carry `pid` and `ticks` (added JSON
+  keys; none removed).
+- **`resolve()` for omp** ranks transcripts by how near their header start is
+  to the process start, so two bare windows in one directory pair correctly
+  whichever resolves first (touched-last remains the fallback).
+- **`session_exit_reason(rec)`** is the one place the exit rule lives, read by
+  `exit_reason()` and `tail_scan()`, including a string-shaped `data`.
+
+Remaining limit: id-less watcher rows of store harnesses are still minted
+into `sessions.db` (they back `--json` and the recovery list), only hidden
+from the history picks.

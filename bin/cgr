@@ -14,6 +14,7 @@
     cgr --brief       one colored group-header line per group (dates + counts)
     cgr --history     browse every unfinished session grouped by date;
                       space opens a date, space picks sessions, enter reopens
+    cgr --history --list --group 2 | --day YYYY-MM-DD   one date, no terminal
 
 A session is listed when it was running and nobody exited it: the machine went
 down under it, or its window closed. It reopens in a new tab, in its own
@@ -851,15 +852,21 @@ def tail(path, size=262144):
 CUT_EXITS = {"other": "window closed", "sighup": "window closed", "sigterm": "killed"}
 
 
-def exit_reason(path):
-    """The reason on a session_exit that follows the last message, else None.
+def session_exit_reason(rec):
+    """The reason a session_exit record names. omp nests the signal under
+    `data` (`{"data": {"reason": "sighup"}}`), claude's hook writes it flat,
+    and a harness may flatten `data` to the reason string itself."""
+    data = rec.get("data")
+    if isinstance(data, dict):
+        data = data.get("reason")
+    return rec.get("reason") or (data if isinstance(data, str) and data else None) or "unknown"
 
-    omp nests the signal under `data` (`{"data": {"reason": "sighup"}}`);
-    claude's hook writes it flat. A nested reason is the same evidence."""
+
+def exit_reason(path):
+    """The reason on a session_exit that follows the last message, else None."""
     for rec in tail(path):
         if rec.get("customType") == "session_exit":
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-            return rec.get("reason") or data.get("reason") or "unknown"
+            return session_exit_reason(rec)
         if rec.get("type") in ("user", "assistant", "message"):
             return None
     return None
@@ -1164,8 +1171,14 @@ def resolve(rec, live, taken):
                 hit = session(h, tid, cwd, updated, rec["how"], title)
                 break
     elif h == "omp":
-        for path, last, ocwd, title, _ in sorted(omp_files(since, rec["last"] + 5),
-                                                 key=lambda x: -x[1]):
+        def rank(x):
+            # The transcript opened nearest this process's start is its own,
+            # whichever dead window is resolved first; touched-last is the fallback.
+            began = epoch(head_meta(x[0]).get("started"))
+            if began is not None and since <= began <= rec["last"] + 5:
+                return 0, abs(began - rec["started"]), -x[1]
+            return 1, 0, -x[1]
+        for path, last, ocwd, title, _ in sorted(omp_files(since, rec["last"] + 5), key=rank):
             sid = Path(path).stem.split("_", 1)[-1]
             if ocwd == cwd and ("omp", sid) not in taken:
                 hit = session(h, sid, cwd, last, rec["how"], title)
@@ -1198,6 +1211,7 @@ def resolve(rec, live, taken):
     s = hit or session(h, None, cwd, rec["last"], rec["how"], "")
     s["last"] = max(s["last"], rec["last"])
     s.update(started=rec["started"], typed=rec.get("typed"), argv=rec.get("argv"))
+    s.update({f: rec[f] for f in ("pid", "ticks") if rec.get(f) is not None})
     s.update({f: rec[f] for f in ("boot", "boot_end", "died") if rec.get(f) is not None})
     if not s["title"]:
         s["title"] = s["typed"] or " ".join(rec.get("argv") or [h])
@@ -1246,27 +1260,46 @@ def item_key(s):
     return (s["harness"], s["id"]) if s["id"] else (s["harness"], s["cwd"], s["started"])
 
 
+def same_window(a, b):
+    """False when two rows are known to be different processes or launches: the
+    pid and start ticks the watcher and `cgr --save` both record, or the
+    command lines you typed. A side that lacks one cannot rule the pair out."""
+    for f in (("pid", "ticks"), ("typed",)):
+        if all(a.get(x) is not None for x in f) and all(b.get(x) is not None for x in f) \
+                and [a[x] for x in f] != [b[x] for x in f]:
+            return False
+    return True
+
+
 def merge(items, s):
     """A `cgr --save` record absorbs the watcher's id-less row for its window,
     which `resolve` cannot match by id: same harness, same window, both dying
     in the same minute. Its id and title survive the watcher update."""
     if s.get("how") == "saved" and s.get("id"):
-        for k, cur in list(items.items()):
+        best = None
+        for k, cur in items.items():
+            gap = abs(cur["started"] - s["started"]) if cur.get("started") and s.get("started") else None
             if (cur.get("id") is None and cur.get("harness") == s["harness"]
-                    and cur.get("cwd") == s["cwd"] and cur.get("started")
-                    and s.get("started") and abs(cur["started"] - s["started"]) < 300):
-                cur.update({f: s[f] for f in ("typed", "argv", "started", "id", "title") if s.get(f)})
-                cur.update({f: s[f] for f in ("last", "how", "boot", "boot_end", "died") if f in s})
-                cur.update({f: s[f] for f in ("messages", "bytes", "model", "mid_turn",
-                                              "last_prompt") if s.get(f)})
-                if item_key(cur) != k:
-                    items[item_key(cur)] = items.pop(k)
-                return
+                    and cur.get("cwd") == s["cwd"] and gap is not None and gap < 300
+                    and same_window(cur, s) and (best is None or gap < best[0])):
+                best = gap, k
+        if best:
+            cur = items[best[1]]
+            cur.update({f: s[f] for f in ("typed", "argv", "started", "id", "title") if s.get(f)})
+            cur.update({f: s[f] for f in ("last", "how", "boot", "boot_end", "died") if f in s})
+            cur.update({f: s[f] for f in ("messages", "bytes", "model", "mid_turn",
+                                          "last_prompt") if s.get(f)})
+            if item_key(cur) != best[1]:
+                items[item_key(cur)] = items.pop(best[1])
+            return
     k = item_key(s)
     if k in items:
+        was_saved = items[k].get("how") == "saved"
         items[k].update({f: s[f] for f in ("typed", "argv", "started") if s.get(f)})
         if s["last"] >= items[k]["last"]:
             items[k].update({f: s[f] for f in ("last", "how", "boot", "boot_end", "died") if f in s})
+        if s.get("how") == "saved" or was_saved:
+            items[k]["how"] = "saved"  # the planned restart outlives the watcher's verdict
     else:
         items[k] = s
 
@@ -1336,7 +1369,7 @@ def group_sessions(items):
             period = next((p for p in reversed(periods) if p["start"] <= s["last"]
                            and (p["end"] is None or s["last"] <= p["end"])), None)
         kind = {"window closed": "window closed", "killed": "killed"}.get(s["how"], "machine went down")
-        if s["how"] == "saved" and (period is None or period["end"] is None):
+        if s["how"] == "saved":
             kind = "saved"
         if period:
             event = dict(period, kind=kind)
@@ -1442,6 +1475,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     branch      TEXT,
     path        TEXT,     -- the transcript or database it was read from
     typed       TEXT,     -- the command line that started it, when the watcher saw it
+    argv        TEXT,     -- the process argv as JSON, when the watcher saw it and typed is unknown
     resume      TEXT,     -- the line that reopens it
     reopened    REAL,     -- when cgr last reopened or forgot it
     in_store    INTEGER,  -- 0: its harness has since deleted it; this row is all that is left
@@ -1461,7 +1495,7 @@ ORDER BY last DESC;
 """
 COLUMNS = ("harness", "id", "cwd", "source", "interactive", "started", "last", "status", "how", "exit_record",
            "mid_turn", "title", "last_prompt", "messages", "bytes", "model", "branch", "path",
-           "typed", "resume", "reopened", "in_store", "first_seen", "last_seen")
+           "typed", "argv", "resume", "reopened", "in_store", "first_seen", "last_seen")
 SNIP = 400                      # characters of a prompt kept
 TOOL_BLOCKS = {"tool_use", "toolCall", "functionCall"}
 RESULT_BLOCKS = {"tool_result", "functionResponse"}
@@ -1595,8 +1629,7 @@ def tail_scan(path, step_of=message_step):
     end, steps, model, talked = None, [], None, False
     for rec in tail(path):
         if rec.get("customType") == "session_exit" and not talked and end is None:
-            data = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-            end = rec.get("reason") or data.get("reason") or "unknown"
+            end = session_exit_reason(rec)
         if rec.get("type") == "last-prompt" and isinstance(rec.get("lastPrompt"), str):
             steps.append(("last-prompt", " ".join(rec["lastPrompt"].split())))
         st, mdl = step_of(rec)
@@ -2021,9 +2054,10 @@ def build_index():
     running = {("claude", sid) for sid in live}
     running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
     named = running_words()
-    # What `cgr --save` recorded is not evidence of anything going wrong.
+    # A `cgr --save` record is cut-off evidence once its process is gone (the
+    # planned restart), unless the harness wrote a deliberate exit record.
     evidence = {k: s for k, s in cut_off(everything=True, use_index=False).items()
-                if s["how"] != "saved" and (s.get("id") or s["harness"] in STORE_INDEXERS)}
+                if s.get("id") or s["harness"] in STORE_INDEXERS}
     for s in evidence.values():
         sid = s["id"] or "@%d" % int(s["started"] or s["last"])
         if (s["harness"], sid) in rows:
@@ -2041,7 +2075,7 @@ def build_index():
         ev = r.pop("evidence", None) or evidence.get(k)
         if k in running or r["id"] in named:
             r["status"], r["how"] = "running", "process alive"
-        elif ev:
+        elif ev and not (ev["how"] == "saved" and r["verdict"] and r["verdict"][0] == "closed"):
             r["status"], r["how"] = "cut off", ev["how"]
         elif r["verdict"]:
             r["status"], r["how"] = r["verdict"]
@@ -2053,6 +2087,7 @@ def build_index():
                          r["cwd"], r["last"] or now, r["how"], r["title"]),
                  typed=(ev or {}).get("typed"), argv=(ev or {}).get("argv"))
         r["typed"] = s["typed"]
+        r["argv"] = json.dumps(s["argv"]) if s["argv"] else None
         r["resume"] = runnable(s)
         r["reopened"] = handled.get(key(s))
         r["in_store"] = 0 if r["id"].startswith("@") else 1
@@ -2083,12 +2118,15 @@ def write_index(rows, failed=()):
             if c in sticky:
                 sets.append("%s = CASE WHEN excluded.status = 'unknown' AND sessions.status = "
                             "'cut off' THEN sessions.%s ELSE excluded.%s END" % (c, c, c))
-            elif c in ("typed", "reopened"):
+            elif c in ("typed", "argv", "reopened"):
                 sets.append("%s = COALESCE(excluded.%s, sessions.%s)" % (c, c, c))
             else:
                 sets.append("%s = excluded.%s" % (c, c))
         read = sorted({r["harness"] for r in rows} - set(failed))
         with con:
+            # cgr no longer mints `@` rows for harnesses that resume by id; older ones left some.
+            con.execute("DELETE FROM sessions WHERE id LIKE '@%%' AND harness IN (%s)"
+                        % ",".join("?" * len(NATIVE_RECOVERY)), sorted(NATIVE_RECOVERY))
             if read:
                 con.execute("UPDATE sessions SET in_store = 0 WHERE harness IN (%s)"
                             % ",".join("?" * len(read)), read)
@@ -2118,7 +2156,40 @@ def history_row(r):
         r["last_prompt"] or r["title"] or ""))
 
 
-def show_history(everything=False, as_json=False, list_only=False):
+HISTORY_CAP = 40                # sessions shown before --all; a date is never cut in two
+
+
+def cap_dates(groups, cap=HISTORY_CAP):
+    """The newest date groups holding at least `cap` sessions, each whole."""
+    out, n = [], 0
+    for day, rows in groups:
+        if n >= cap:
+            break
+        out.append((day, rows))
+        n += len(rows)
+    return out
+
+
+def old_history_group(rows):
+    return (rows[0]["last"] or 0) < time.time() - 7 * 86400
+
+
+def print_history_groups(groups, collapse, preview):
+    width = shutil.get_terminal_size((160, 20)).columns
+    for day, grows in groups:
+        folded = collapse and old_history_group(grows)
+        tail = _c(" [collapsed; --expand-old shows sessions]", "2") if folded else ""
+        print(history_group_label(day, grows) + tail)
+        if not folded:
+            for r in grows:
+                print("  " + history_row(r)[:width - 3])
+                if preview and preview_line(r):
+                    print("    " + preview_line(r)[:width - 3])
+        print()
+
+
+def show_history(everything=False, as_json=False, list_only=False, groups=None, days=None,
+                 yes=False, expand_old=False, preview=False):
     rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
     if as_json:
         print(json.dumps(rows, indent=1))
@@ -2135,20 +2206,41 @@ def show_history(everything=False, as_json=False, list_only=False):
     print("  %-9s" % "harness" + "".join("%9s" % c for c in cols))
     for h in sorted(by, key=lambda h: -by[h]["sessions"]):
         print("  %-9s" % h + "".join("%9d" % by[h][c] for c in cols))
-    bad = [r for r in rows if flagged(r) and not (r["harness"] in NATIVE_RECOVERY and r["id"].startswith("@"))]
-    shown = bad if everything else bad[:40]
-    groups = history_groups(shown)
-    if list_only or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        limit_note = "" if everything else " (the %d newest; --all shows every one)" % len(shown)
-        print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (len(bad), limit_note))
-        for day, grows in groups:
-            print(history_group_label(day, grows))
-            for r in grows:
-                print("  " + history_row(r)[:shutil.get_terminal_size((160, 20)).columns - 3])
-            print()
+    flagged_rows = [r for r in rows if flagged(r)]
+    # A row without an id could only be reopened with "continue the newest",
+    # which is not necessarily the session that died.
+    bad = [r for r in flagged_rows if not r["id"].startswith("@")]
+    every = history_groups(bad)
+    selected = bool(days or groups)
+    if days:
+        every = [g for g in every if g[0] in days]
+    shown = every if everything or days else cap_dates(every)
+    if groups:
+        want = {int(n) - 1 for spec in groups for n in str(spec).split(",") if n.strip().isdigit()}
+        shown = [g for i, g in enumerate(shown) if i in want]
+    if selected and not shown:
+        print("\ncgr: no sessions in %s" % ("day(s) %s" % ", ".join(days) if days and not groups
+                                           else "group(s) %s" % ", ".join(groups)))
+        return 0
+    shown_rows = [r for _, g in shown for r in g]
+    total = sum(len(g) for _, g in every)
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if yes:
+        print("\nReopening %d session%s from %d date%s" % (
+            len(shown_rows), "" if len(shown_rows) == 1 else "s", len(shown), "" if len(shown) == 1 else "s"))
+        return reopen_history(shown_rows)
+    if list_only or not interactive:
+        note = ""
+        if not selected and not everything and len(shown_rows) < total:
+            note = " (showing %d of %d, whole dates; --all shows every one)" % (len(shown_rows), total)
+        print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (total, note))
+        print_history_groups(shown, not (expand_old or selected), preview)
+        if len(flagged_rows) > len(bad):
+            print("%d more have no session id, so cannot be reopened by id from here "
+                  "(`cgr` reopens this boot's)\n" % (len(flagged_rows) - len(bad)))
         print("audit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
         return 0
-    chosen = choose_history(shown, groups)
+    chosen = choose_history(shown_rows, shown, preview=preview)
     if not chosen:
         print("nothing reopened")
         return 0
@@ -2166,16 +2258,33 @@ def history_groups(rows):
     return list(groups.items())
 
 
+def history_kind(r):
+    how = r.get("how")
+    return "saved" if how == "saved" else "window" if how in ("window closed", "killed") else "crash"
+
+
 def history_group_label(day, rows):
-    """Date + count, colored like the picker: green saved, yellow window, red crash."""
+    """Date + count, colored like the picker by the date's dominant kind (a tie
+    takes the worse): green saved, yellow window, red crash. A mixed date also
+    spells out its counts, so one old crash neither paints a saved date red nor
+    hides inside it."""
     stamp = time.strftime("%a %Y-%m-%d", time.localtime(rows[0]["last"] or 0)) if rows else day
-    kinds = {r.get("how") for r in rows}
-    code = "32" if kinds == {"saved"} else "33" if kinds <= {"saved", "window closed", "killed"} else "31"
-    label = "%s  [%s, %d session%s]" % (stamp, day, len(rows), "" if len(rows) == 1 else "s")
+    counts = {}
+    for r in rows:
+        counts[history_kind(r)] = counts.get(history_kind(r), 0) + 1
+    code = "32"
+    for kind, c in (("window", "33"), ("crash", "31")):  # later wins a tie
+        if counts.get(kind, 0) and counts[kind] >= max(counts.values()):
+            code = c
+    detail = ""
+    if len(counts) > 1:
+        detail = ": " + ", ".join("%d %s" % (counts[k], k) for k in ("saved", "window", "crash")
+                                  if k in counts)
+    label = "%s  [%s, %d session%s%s]" % (stamp, day, len(rows), "" if len(rows) == 1 else "s", detail)
     return _c(label, "1;" + code)
 
 
-def choose_history(rows, groups):
+def choose_history(rows, groups, preview=False):
     """A date group per line with its count; space expands one group into its
     sessions, and inside an open group space picks sessions to reopen."""
     import termios
@@ -2195,37 +2304,51 @@ def choose_history(rows, groups):
                 rows_out.extend((day, r) for r in grows)
         return rows_out
 
+    def lines_of(day, r):
+        """The screen lines of one entry; only the first is the highlighted one."""
+        if r is None:
+            grows = dict(groups)[day]
+            n = len(picked & {(x["harness"], x["id"]) for x in grows})
+            tick = "x" if n == len(grows) and grows else "+" if n else " "
+            marker = "-" if day == open_day else "+"
+            return ["%s [%s] %s" % (marker, tick, history_group_label(day, grows))]
+        key = (r["harness"], r["id"])
+        head = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
+        out = [head + history_row(r)]
+        if preview and preview_line(r):
+            out.append("        " + preview_line(r))
+        if r.get("resume"):
+            out.append("        " + _c(r["resume"], "2"))
+        return out
+
     def draw(first):
-        nonlocal drawn
+        nonlocal drawn, top
         ents = entries()
         height = shutil.get_terminal_size((120, 24)).lines
-        count = max(1, height - 3)
-        start = max(0, min(cur - count // 2, len(ents) - count))
-        visible = ents[start:start + count]
+        budget = max(2, height - 2)
+        shown = [lines_of(day, r) for day, r in ents]
+        top = min(top, cur)
+        while top < cur and sum(len(x) for x in shown[top:cur + 1]) > budget:
+            top += 1
+        screen, used = [], 0
+        for pos in range(top, len(ents)):
+            if used + len(shown[pos]) > budget and screen:
+                break
+            for n, text in enumerate(shown[pos][:max(1, budget - used)]):
+                line = ("%s %s" % (">" if pos == cur and n == 0 else " ", text))[:width - 1]
+                screen.append("\x1b[7m%s\x1b[0m" % line if pos == cur and n == 0 else line)
+            used = len(screen)
         out = [] if first else ["\r\x1b[%dA" % drawn]
-        for pos, (day, r) in enumerate(visible, start):
-            if r is None:
-                grows = dict(groups)[day]
-                n = len(picked & {(x["harness"], x["id"]) for x in grows})
-                tick = "x" if n == len(grows) and grows else "+" if n else " "
-                marker = "-" if day == open_day else "+"
-                label = "%s [%s] %s" % (marker, tick, history_group_label(day, grows))
-            else:
-                key = (r["harness"], r["id"])
-                label = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
-                label += history_row(r)
-                if r.get("resume"):
-                    label += "\n        " + _c(r["resume"][:width - 10], "2")
-            line = ("%s %s" % (">" if pos == cur else " ", label))[:width - 1]
-            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if pos == cur else line) + "\n")
-        if drawn > len(visible):
-            out.extend("\r\x1b[K\n" for _ in range(drawn - len(visible)))
-            out.append("\r\x1b[%dA" % (drawn - len(visible)))
-        drawn = len(visible)
+        out.extend("\r\x1b[K" + line + "\n" for line in screen)
+        if drawn > len(screen):
+            out.extend("\r\x1b[K\n" for _ in range(drawn - len(screen)))
+            out.append("\r\x1b[%dA" % (drawn - len(screen)))
+        drawn = len(screen)
         out.append("\r\x1b[K" + help_line[:width - 1])
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
+    top = 0
     drawn = 0
     old = termios.tcgetattr(fd)
     try:
@@ -2678,9 +2801,21 @@ def reopen_history(rows):
     """Reopen `cgr --history` picks, which name the session but not the window."""
     items = []
     for r in rows:
+        if str(r["id"]).startswith("@"):
+            print("cgr: %s %s has no session id; reopen it with `cgr` or by hand"
+                  % (r["harness"], clean(r["id"])), file=sys.stderr)
+            continue
         s = session(r["harness"], r["id"], r.get("cwd"), r.get("last"),
-                    r.get("how") or "cut off", r.get("title") or "")
+                    r.get("how") or "cut off", r.get("title") or "", r.get("started"))
         s.update(typed=r.get("typed"), path=r.get("path"), source="sessions.db")
+        s.update({f: r[f] for f in ("messages", "bytes", "model", "mid_turn", "last_prompt")
+                  if r.get(f)})
+        try:
+            argv = json.loads(r["argv"]) if r.get("argv") else None
+        except ValueError:
+            argv = None
+        if isinstance(argv, list):
+            s["argv"] = argv
         items.append(s)
     return reopen(items)
 
@@ -2720,6 +2855,8 @@ def main(argv=None):
                     help="show a content-preview line under each session (id, msgs, model, last prompt)")
     ap.add_argument("--group", "-g", action="append", default=None, metavar="N",
                     help="restrict --list/--yes to group number(s) shown by --list (1-based, repeatable)")
+    ap.add_argument("--day", action="append", default=None, metavar="YYYY-MM-DD",
+                    help="with --history: only this date (repeatable); expands it, and --yes reopens it")
     ap.add_argument("--brief", action="store_true",
                     help="print one colored group-header line per group (no sessions), for startup display")
     ap.add_argument("--forget", action="store_true", help="stop listing the sessions shown now")
@@ -2736,11 +2873,14 @@ def main(argv=None):
     if args.watch:
         return watch()
     if args.history:
-        if args.yes:
-            print("cgr: --yes reopens only this boot's cut-off sessions; pick from --history instead")
+        if args.yes and not (args.group or args.day):
+            print("cgr: --yes with --history needs --group N or --day YYYY-MM-DD; "
+                  "without one, pick from --history instead")
             return 1
         return show_history(everything=args.all, as_json=args.json,
-                            list_only=args.list or args.dry_run)
+                            list_only=args.list or args.dry_run, groups=args.group,
+                            days=args.day, yes=args.yes, expand_old=args.expand_old,
+                            preview=args.preview)
     if args.save:
         items = save()
         if not items:

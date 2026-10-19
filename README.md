@@ -117,14 +117,28 @@ newest session in their directory.
 ```bash
 cgr --history          # grouped by date with counts; space opens a date, space picks, enter reopens
 cgr --history --list   # print the same groups and sessions; open no tabs
-cgr --history --all    # every date, not just the newest 40 sessions
+cgr --history --all    # every date, not just the newest dates holding 40 sessions
+cgr --history --list --group 2 --preview   # one date by its number, with id/msgs/model/last prompt
+cgr --history --list --day 2026-10-09      # one date by name (also expands an old date)
+cgr --history --day 2026-10-09 --yes       # reopen every session of that date, no terminal needed
 sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
 ```
 
-One line per date with its session count (green saved, yellow window, red
-crash, like the picker). Space on a date expands it into its sessions, each
-with its reopen command; space on a session ticks it, `a` ticks the whole
-date, Enter reopens the ticked set in new tabs.
+One line per date with its session count, colored like the picker by the
+date's dominant kind (green saved, yellow window, red crash; a tie takes the
+worse). A mixed date also spells out its counts, e.g. `7 sessions: 4 saved, 1
+window, 2 crash`. Space on a date expands it into its sessions, each with its
+reopen command (and a preview line with `--preview`); space on a session
+ticks it, `a` ticks the whole date, Enter reopens the ticked set in new tabs.
+
+Without `--all` the list stops at the newest dates holding 40 sessions; a date
+is never cut in two, and the header says `showing 45 of 50`. Dates older than
+seven days print collapsed in `--list` (`--expand-old`, `--day` or `--group`
+shows them). `--group N` numbers the dates as printed; `--day` and `--group`
+also give a non-terminal way to reopen with `--yes`. Sessions with no id
+(`@` rows) are counted but not listed, since "continue the newest" might
+reopen another session. A session saved with `--save` keeps `saved` in the
+history after the restart, unless its harness wrote a deliberate exit record.
 
 It has store readers for 12 harnesses (claude, codex, omp, pi, hermes, jcode,
  muse, gemini, qwen, opencode/kilo, openclaw) and keeps one row per session:

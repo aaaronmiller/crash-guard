@@ -947,6 +947,26 @@ class CgrTests(unittest.TestCase):
              "last": self.crash, "how": "window closed", "argv": ["omp"]}
         self.assertEqual(self.cg.resolve(r, set(), set())["id"], "nested")
 
+    def test_session_exit_reason_reads_flat_nested_and_string_shapes(self):
+        # exit_reason() and tail_scan() each carried their own copy of this
+        # rule and neither read a string-shaped `data`.
+        reason = self.cg.session_exit_reason
+        self.assertEqual(reason({"reason": "other"}), "other")
+        self.assertEqual(reason({"data": {"reason": "sighup"}}), "sighup")
+        self.assertEqual(reason({"data": "sigterm"}), "sigterm")
+        self.assertEqual(reason({"data": None, "reason": None}), "unknown")
+        self.assertEqual(reason({"data": {}}), "unknown")
+        self.assertEqual(reason({"data": ""}), "unknown")
+
+    def test_exit_reason_and_tail_scan_agree_on_string_shaped_data(self):
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        rec = {"type": "custom", "customType": "session_exit", "data": "sighup"}
+        self.omp_session("flat", [say, rec], self.crash)
+        (path,) = (self.home / ".omp" / "agent" / "sessions" / "-m").glob("*flat.jsonl")
+        self.assertEqual(self.cg.exit_reason(path), "sighup")
+        self.assertEqual(self.cg.tail_scan(path)[0], "sighup")
+
     def test_saved_record_absorbs_the_watchers_id_less_row(self):
         # The watcher's id-less row and the saved record are the same window
         # (2026-10-17: four saved omp windows each showed twice, as `saved`
@@ -964,6 +984,338 @@ class CgrTests(unittest.TestCase):
         items = {self.cg.item_key(watcher_row): watcher_row}
         self.cg.merge(items, saved_row)
         self.assertEqual(list(items), [("omp", "kept")])
+
+    def saved_omp_in_closed_boot(self, how="machine went down"):
+        """A `cgr --save` omp window that then died in the boot before this one,
+        with the watcher's row for the same window resolving to the same id."""
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        self.omp_session("kept", [say], self.crash)
+        started = self.prev + 100
+        rec = {"pid": 1, "ticks": "1", "started": started, "harness": "omp", "argv": ["omp"],
+               "cwd": "/m", "leader": 2, "leader_ticks": "1", "boot": "crashed",
+               "session": None, "typed": "omp"}
+        self.watched_boot("crashed", self.prev)
+        if how == "window closed":
+            (self.cg.watch_dir() / "deaths.jsonl").write_text(
+                json.dumps(dict(rec, boot="crashed", died=self.crash - 30)) + "\n")
+        else:
+            f = self.cg.watch_dir() / "live-crashed.json"
+            f.write_text(json.dumps([rec]))
+            os.utime(f, (self.prev + 200,) * 2)
+        row = dict(self.cg.session("omp", "kept", "/m", self.prev + 150, "saved", "kept"),
+                   started=started, boot="crashed", pid=1, ticks="1", typed="omp", argv=["omp"])
+        self.cg.private_dir(self.cg.STATE)
+        self.cg.saved_path().write_text(json.dumps({"saved": self.prev + 150, "sessions": [row]}))
+
+    def test_saved_row_stays_saved_on_a_closed_boot_period(self):
+        # 2026-10-18 audit: `cgr --save` rows never rendered green after the
+        # restart; the watcher's row for the same id won the merge and the
+        # group fell through to "machine went down" / "window closed".
+        for how in ("machine went down", "window closed"):
+            with self.subTest(how=how):
+                self.saved_omp_in_closed_boot(how)
+                (s,) = self.cg.collect(everything=True)
+                self.assertEqual((s["id"], s["how"], s["event"]["kind"]), ("kept", "saved", "saved"))
+                self.assertEqual(self.cg.how_color(s), "32")
+                self.assertTrue(s["group"].startswith("saved:"))
+
+    def test_saved_row_is_green_in_list_and_brief(self):
+        self.saved_omp_in_closed_boot()
+        for flag in ("--list", "--brief"):
+            out = io.StringIO()
+            with patch.object(self.cg, "USE_COLOR", True), contextlib.redirect_stdout(out):
+                self.assertEqual(self.cg.main(["--all", flag]), 0)
+            self.assertIn("\x1b[1;32msaved at", out.getvalue(), flag)
+
+    def test_merge_keeps_saved_whichever_row_arrives_last(self):
+        watcher = dict(self.cg.session("omp", "x", "/m", self.crash, "window closed", "t"),
+                       started=self.prev, boot="b")
+        saved_row = dict(self.cg.session("omp", "x", "/m", self.prev + 10, "saved", "t"),
+                         started=self.prev, boot="b")
+        for first, second in ((watcher, saved_row), (saved_row, watcher)):
+            items = {}
+            self.cg.merge(items, dict(first))
+            self.cg.merge(items, dict(second))
+            self.assertEqual(items[("omp", "x")]["how"], "saved")
+            self.assertEqual(items[("omp", "x")]["last"], self.crash)
+
+    def test_history_retains_saved_evidence_and_its_date_renders_green(self):
+        # 2026-10-18 audit: build_index() dropped every `saved` row from its
+        # evidence, so the DB never held how=saved and no date could be green.
+        self.saved_omp_in_closed_boot()
+        r = self.history_rows()[("omp", "kept")]
+        self.assertEqual((r["status"], r["how"]), ("cut off", "saved"))
+        self.assertTrue(self.cg.flagged(r))
+        with patch.object(self.cg, "USE_COLOR", True):
+            self.assertIn("1;32m", self.cg.history_group_label("2026-10-17", [r]))
+
+    def test_history_saved_evidence_does_not_override_a_clean_exit_record(self):
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        self.omp_session("bye", [say, exit_marker("dispose")], self.crash)
+        row = dict(self.cg.session("omp", "bye", "/m", self.prev + 150, "saved", "bye"),
+                   started=self.prev + 100, boot="old", pid=1, ticks="1", typed="omp")
+        self.cg.private_dir(self.cg.STATE)
+        self.cg.saved_path().write_text(json.dumps({"saved": self.prev + 150, "sessions": [row]}))
+        r = self.history_rows()[("omp", "bye")]
+        self.assertEqual(r["status"], "closed")
+
+    def test_history_group_label_colors_by_the_dominant_kind_and_counts_the_rest(self):
+        # One old crash must not turn a nine-saved date red, nor hide itself.
+        row = lambda how: {"how": how, "last": self.crash}
+        label = lambda *hows: self.cg.history_group_label(
+            "2026-10-17", [row(h) for h in hows])
+        with patch.object(self.cg, "USE_COLOR", True):
+            self.assertIn("\x1b[1;32m", label("saved", "saved"))
+            self.assertIn("\x1b[1;33m", label("window closed", "killed", "window closed"))
+            self.assertIn("\x1b[1;31m", label("machine went down", "saved"))   # tie: the worse
+            mixed = label("saved", "saved", "saved", "machine went down")
+            self.assertIn("\x1b[1;32m", mixed)
+            self.assertIn("3 saved, 1 crash", mixed)
+        self.assertNotIn(" saved", label("saved", "saved"))   # a uniform date needs no breakdown
+
+    def absorb(self, cur_over, saved_over):
+        """Merge a saved omp row into one id-less watcher row; True if it absorbed."""
+        base = self.cg.session("omp", None, "/m", self.crash, "window closed", "")
+        cur = {**base, "started": self.prev + 100, "typed": "omp", "argv": ["omp"], **cur_over}
+        sav = {**self.cg.session("omp", "kept", "/m", self.prev + 50, "saved", "kept"),
+               "started": self.prev + 100, "typed": "omp", **saved_over}
+        items = {self.cg.item_key(cur): cur}
+        self.cg.merge(items, sav)
+        return ("omp", "kept") in items and len(items) == 1
+
+    def test_saved_absorb_window_boundary_is_299_seconds(self):
+        self.assertTrue(self.absorb({"started": self.prev + 100 + 299}, {}))
+        self.assertFalse(self.absorb({"started": self.prev + 100 + 300}, {}))
+
+    def test_saved_absorb_requires_the_same_process_when_both_name_one(self):
+        self.assertTrue(self.absorb({"pid": 7, "ticks": "9"}, {"pid": 7, "ticks": "9"}))
+        self.assertFalse(self.absorb({"pid": 7, "ticks": "9"}, {"pid": 8, "ticks": "9"}))
+        self.assertFalse(self.absorb({"pid": 7, "ticks": "9"}, {"pid": 7, "ticks": "10"}))
+
+    def test_saved_absorb_requires_the_same_typed_line_when_both_have_one(self):
+        self.assertFalse(self.absorb({"typed": "omp --model a"}, {"typed": "omp --model b"}))
+        self.assertTrue(self.absorb({"typed": None}, {"typed": "omp --model b"}))
+
+    def test_saved_absorb_takes_the_nearest_start_not_the_first_row(self):
+        far = dict(self.cg.session("omp", None, "/m", self.crash, "window closed", ""),
+                   started=self.prev + 100 - 250, typed="omp")
+        near = dict(far, started=self.prev + 100 + 20)
+        items = {}
+        self.cg.merge(items, far)
+        self.cg.merge(items, near)
+        sav = dict(self.cg.session("omp", "kept", "/m", self.prev + 50, "saved", "kept"),
+                   started=self.prev + 100)
+        self.cg.merge(items, sav)
+        self.assertEqual(items[("omp", "kept")]["started"], self.prev + 100)
+        (rest,) = [v for k, v in items.items() if k != ("omp", "kept")]
+        self.assertEqual(rest["started"], self.prev + 100 - 250)
+
+    def test_resolved_watcher_row_carries_its_pid_and_ticks(self):
+        r = {"harness": "omp", "cwd": "/m", "started": self.prev + 100, "last": self.crash,
+             "how": "window closed", "argv": ["omp"], "pid": 41, "ticks": "77"}
+        s = self.cg.resolve(r, set(), set())
+        self.assertEqual((s["pid"], s["ticks"]), (41, "77"))
+
+    def test_omp_resolve_pairs_each_window_with_its_own_transcript_in_any_order(self):
+        # Two bare omp windows in one directory: the older process must not
+        # adopt the newer transcript just because it was touched last.
+        import datetime
+        iso = lambda t: datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        say = {"type": "message", "message": {"role": "user", "content": [
+            {"type": "text", "text": "go"}]}}
+        t = int(self.prev)
+        for sid, began, touched in (("older", t + 10, t + 500), ("newer", t + 1010, t + 1500)):
+            head = {"type": "session", "id": sid, "cwd": "/m", "timestamp": iso(began)}
+            jsonl(self.home / ".omp" / "agent" / "sessions" / "-m" / ("2026_%s.jsonl" % sid),
+                  [head, say], touched)
+        rec = lambda started: {"harness": "omp", "cwd": "/m", "started": started, "last": t + 2000,
+                               "how": "window closed", "argv": ["omp"]}
+        first, second = rec(t), rec(t + 1000)
+        for order in ((first, second), (second, first)):
+            taken, got = set(), {}
+            for r in order:
+                s_ = self.cg.resolve(r, set(), taken)
+                taken.add(self.cg.item_key(s_))
+                got[r["started"]] = s_["id"]
+            self.assertEqual(got, {t: "older", t + 1000: "newer"})
+
+    # -- the history browser: caps, selection, previews, collapse -----------
+
+    def noon(self, days_ago):
+        d = time.localtime()
+        return time.mktime((d.tm_year, d.tm_mon, d.tm_mday - days_ago, 12, 0, 0, 0, 0, -1))
+
+    def dated_rows(self, plan, harness="jcode", **kw):
+        """{days_ago: count} -> one cut-off row per count, all on that local date."""
+        rows = []
+        for days, n in plan.items():
+            for i in range(n):
+                rows.append(self.indexed_row(harness, "d%d-%d" % (days, i),
+                                             last=self.noon(days) - i * 10, **kw))
+        return rows
+
+    def history_cli(self, rows, *args):
+        out = io.StringIO()
+        with patch.object(self.cg, "build_index", return_value=(rows, set())), \
+                contextlib.redirect_stdout(out):
+            rc = self.cg.main(["--history", *args])
+        return rc, out.getvalue()
+
+    def test_history_cap_ends_on_a_date_boundary_and_the_header_counts_both(self):
+        # 2026-10-18 audit: bad[:40] cut a date mid-way and printed it as if
+        # complete ("[2026-10-13, 3 sessions]" with more behind it).
+        rc, out = self.history_cli(self.dated_rows({0: 30, 1: 15, 2: 5}), "--list")
+        self.assertEqual(rc, 0)
+        self.assertIn(", 15 sessions", out)          # the straddling date is whole
+        self.assertNotIn(", 5 sessions", out)        # the next date is left for --all
+        self.assertIn("showing 45 of 50", out)
+        rc, out = self.history_cli(self.dated_rows({0: 30, 1: 15, 2: 5}), "--list", "--all")
+        self.assertIn(", 5 sessions", out)
+        self.assertNotIn("showing", out)
+
+    def test_history_group_and_day_select_a_date_without_a_terminal(self):
+        rows = self.dated_rows({0: 2, 1: 3, 2: 1})
+        _, out = self.history_cli(rows, "--list", "--group", "2")
+        self.assertIn(", 3 sessions", out)
+        self.assertNotIn(", 2 sessions", out)
+        self.assertNotIn(", 1 session]", out)
+        day = time.strftime("%Y-%m-%d", time.localtime(self.noon(2)))
+        _, out = self.history_cli(rows, "--list", "--day", day)
+        self.assertIn(", 1 session", out)
+        self.assertNotIn(", 3 sessions", out)
+        rc, out = self.history_cli(rows, "--list", "--group", "9")
+        self.assertIn("no sessions in group(s) 9", out)
+
+    def test_history_yes_reopens_only_a_selected_date(self):
+        rows = self.dated_rows({0: 2, 1: 3})
+        rc, out = self.history_cli(rows, "--yes")
+        self.assertEqual(rc, 1)                        # still refused without a selection
+        with patch.object(self.cg, "reopen", return_value=0) as reopen:
+            with patch.object(self.cg, "build_index", return_value=(rows, set())), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.cg.main(["--history", "--yes", "--group", "2"]), 0)
+        self.assertEqual({s["id"] for s in reopen.call_args[0][0]}, {"d1-0", "d1-1", "d1-2"})
+
+    def test_history_preview_prints_a_line_under_each_session(self):
+        rows = self.dated_rows({0: 1}, messages=42, model="opus", last_prompt="fix the thing")
+        _, plain = self.history_cli(rows, "--list")
+        _, out = self.history_cli(rows, "--list", "--preview")
+        self.assertNotIn("42 msgs", plain)
+        self.assertIn("42 msgs", out)
+        self.assertIn("fix the thing", out.split("42 msgs")[1])
+
+    def test_history_old_dates_collapse_until_expanded_or_selected(self):
+        rows = self.dated_rows({0: 1, 10: 2})
+        for r in rows:
+            r["last_prompt"] = "oldnote" if r["id"].startswith("d10-") else "freshnote"
+        _, out = self.history_cli(rows, "--list")
+        self.assertIn("[collapsed; --expand-old shows sessions]", out)
+        self.assertEqual((out.count("oldnote"), out.count("freshnote")), (0, 1))
+        _, out = self.history_cli(rows, "--list", "--expand-old")
+        self.assertNotIn("collapsed", out)
+        self.assertEqual(out.count("oldnote"), 2)
+        day = time.strftime("%Y-%m-%d", time.localtime(self.noon(10)))
+        _, out = self.history_cli(rows, "--list", "--day", day)
+        self.assertEqual(out.count("oldnote"), 2)
+
+    def test_history_picker_shows_the_preview_line_and_returns_the_pick(self):
+        rows = self.dated_rows({0: 2}, messages=42, last_prompt="fix the thing",
+                               resume="cd /w && jcode --resume ZZ")
+        data = self.home / "rows.json"
+        data.write_text(json.dumps(rows))
+        script = self.home / "hpicker.py"
+        script.write_text("import json,sys\n" +
+                          "sys.path.insert(0, " + repr(str(ROOT / "tests")) + ")\n" +
+                          "from test_cgr import load_cgr\n" +
+                          "c=load_cgr()\nrows=json.load(open(sys.argv[1]))\n" +
+                          "got=c.choose_history(rows, c.history_groups(rows), preview=True)\n" +
+                          "print('PICKED:'+json.dumps([r['id'] for r in got]))\n")
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
+                                stdout=slave, stderr=slave)
+        os.close(slave)
+        try:
+            import select
+            output = b""
+
+            def read_until(marker):
+                until = time.monotonic() + 5
+                nonlocal output
+                while marker not in output and time.monotonic() < until:
+                    if select.select([master], [], [], 0.1)[0]:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            break
+
+            read_until(b"enter reopen")
+            for key in (b" ", b" ", b"\r"):   # open the date (the cursor enters it), pick the first
+                os.write(master, key)
+                time.sleep(0.05)
+            read_until(b"PICKED:")
+            self.assertEqual(proc.wait(timeout=2), 0)
+            self.assertIn(b"42 msgs", output)
+            self.assertIn(b"jcode --resume ZZ", output)   # a long row no longer cuts its second line
+            self.assertEqual(json.loads(output.split(b"PICKED:", 1)[1].splitlines()[0]), ["d0-0"])
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+
+    def test_history_hides_id_less_rows_of_every_harness_from_picks(self):
+        # `@` rows have no id, so `--continue` would reopen the newest session
+        # in the directory, not necessarily the one that died.
+        rows = self.dated_rows({0: 1}) + [
+            self.indexed_row("kilo", "@100", last=self.noon(0)),
+            self.indexed_row("agy", "@200", last=self.noon(0))]
+        _, out = self.history_cli(rows, "--list")
+        self.assertIn(", 1 session", out)
+        self.assertNotIn("kilo", out.split("cut off or left")[-1])
+        rc, js = self.history_cli(rows, "--json")
+        self.assertEqual(len(json.loads(js)), 3)       # the data is still all there
+
+    def test_reopen_history_skips_an_id_less_row(self):
+        row = dict(self.indexed_row("kilo", "@100"), typed="kilo")
+        err = io.StringIO()
+        with patch.object(self.cg, "reopen", return_value=0) as reopen, \
+                contextlib.redirect_stderr(err):
+            self.cg.reopen_history([row])
+        self.assertEqual(reopen.call_args[0][0], [])
+        self.assertIn("@100", err.getvalue())
+
+    def test_write_index_purges_stale_native_id_less_rows(self):
+        # Older cgr minted `@` rows for claude/codex/omp/hermes; they linger in old DBs.
+        stale = [self.indexed_row(h, "@100") for h in ("claude", "omp")]
+        keep = [self.indexed_row("kilo", "@100"), self.indexed_row("omp", "real")]
+        self.cg.write_index(stale)
+        self.cg.write_index(keep)
+        con = sqlite3.connect(str(self.cg.db_path()))
+        self.addCleanup(con.close)
+        self.assertEqual(sorted(con.execute("SELECT harness, id FROM sessions")),
+                         [("kilo", "@100"), ("omp", "real")])
+
+    def test_reopen_history_keeps_what_the_row_knows(self):
+        row = dict(self.indexed_row("omp", "abc", messages=7, model="m", mid_turn=1,
+                                    last_prompt="do it", typed=None),
+                   argv=json.dumps(["omp", "--model", "fast"]))
+        with patch.object(self.cg, "reopen", return_value=0) as reopen:
+            self.cg.reopen_history([row])
+        (s,) = reopen.call_args[0][0]
+        self.assertEqual((s["started"], s["messages"], s["model"], s["mid_turn"], s["last_prompt"]),
+                         (row["started"], 7, "m", 1, "do it"))
+        self.assertEqual(self.cg.command(s), "omp --model fast --resume abc")
+        live = self.cg.session("omp", "abc", "/w", 0, "x", "")
+        self.assertEqual(self.cg.key(s), self.cg.key(live))   # reopened here, hidden in --list
+
+    def test_history_stores_the_launch_argv_of_its_evidence(self):
+        self.saved_omp_in_closed_boot()
+        r = self.history_rows()[("omp", "kept")]
+        self.assertEqual(json.loads(r["argv"]), ["omp"])
+        self.assertIn("argv", self.cg.COLUMNS)
 
     def test_history_groups_by_date_and_reopens_picks(self):
         t = self.crash
