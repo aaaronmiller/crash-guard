@@ -640,6 +640,23 @@ def write_private(path, text, append=False):
     with os.fdopen(os.open(path, flags, 0o600), "a" if append else "w") as fh:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(text)
+        if append:  # a death recorded just before WSL dies must survive it
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def death_records(text):
+    """(line, record) for each intact line of deaths.jsonl. WSL dying mid-append
+    leaves the line as NUL bytes with no newline (2026-10-22), and the next
+    append lands on the end of it: strip the NULs, skip what still won't parse."""
+    for line in text.splitlines():
+        line = line.strip("\0")
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            yield line, rec
 
 
 class Watcher:
@@ -750,12 +767,12 @@ class Watcher:
             if mtime(f) < cutoff:
                 f.unlink()
         try:
-            lines = self.deaths.read_text().splitlines()
+            text = self.deaths.read_text()
         except OSError:
             return
-        keep = [l for l in lines if (json.loads(l).get("died") or 0) >= cutoff]
-        if len(keep) != len(lines):
-            write_private(self.deaths, "".join(l + "\n" for l in keep))
+        keep = "".join(l + "\n" for l, r in death_records(text) if (r.get("died") or 0) >= cutoff)
+        if keep != text:  # also drops a torn line, so the next append starts clean
+            write_private(self.deaths, keep)
 
 
 def refresh_index():
@@ -814,14 +831,10 @@ def watched(boot_id, since, boot_since=None):
                      boot_end=(period or {}).get("end")) for r in recs
                 if session_record(r)]
     try:
-        lines = read_own(watch_dir() / "deaths.jsonl").splitlines()
+        text = read_own(watch_dir() / "deaths.jsonl")
     except OSError:
-        lines = []
-    for line in lines:
-        try:
-            r = json.loads(line)
-        except ValueError:
-            continue
+        text = ""
+    for _, r in death_records(text):
         if session_record(r) and r.get("died", 0) >= since:
             out.append(dict(r, how="window closed", last=r["died"]))
     return out
@@ -2919,7 +2932,10 @@ def main(argv=None):
             print(group_label(items[indexes[0]], len(indexes)))
         return 0
     if not watcher_running(current_boot()[1]):
+        # Enabled is not running: on 2026-10-29 the service had restarted 63,000
+        # times since 2026-10-23 behind advice to enable it.
         print("cgr: the watcher is not running, so only claude windows that close are caught."
+              "\n     check it: systemctl --user status cgr-watch   (failing: journalctl --user -u cgr-watch)"
               "\n     start it: systemctl --user enable --now cgr-watch\n")
     if not items:
         print("cgr: nothing died -- no agent session was cut off since the last boot with agents began"

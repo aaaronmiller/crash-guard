@@ -337,6 +337,34 @@ class CgrTests(unittest.TestCase):
         self.assertEqual((again["started"], again["typed"]),
                          (first["started"], "cgrtestagent --fast"))
 
+    def test_a_torn_death_record_does_not_stop_the_watcher(self):
+        # 2026-10-22: WSL died while the watcher appended a death. The line came
+        # back as 1264 NUL bytes with no newline, prune() raised on it at every
+        # start, and the watcher missed every window that closed for six days
+        # (two codex sessions on 2026-10-29).
+        d = self.cg.watch_dir()
+        d.mkdir(parents=True)
+        kept = {"pid": 1, "ticks": "1", "started": time.time() - 200, "harness": "kilo",
+                "argv": ["kilo"], "cwd": "/k", "leader": 2, "leader_ticks": "1",
+                "boot": self.boot_id, "session": None, "typed": "kilo",
+                "died": time.time() - 100}
+        (d / "deaths.jsonl").write_text(json.dumps(kept) + "\n" + "\0" * 1264)
+        w = self.cg.Watcher()
+        w.prune()
+        self.assertEqual(self.deaths(), [kept])
+        w.died(dict(kept, cwd="/later"), time.time())
+        self.assertEqual([r["cwd"] for r in self.deaths()], ["/k", "/later"])
+
+    def test_a_death_appended_after_a_torn_one_is_still_read(self):
+        d = self.cg.watch_dir()
+        d.mkdir(parents=True)
+        rec = {"pid": 1, "ticks": "1", "started": time.time() - 200, "harness": "kilo",
+               "argv": ["kilo"], "cwd": "/k", "leader": 2, "leader_ticks": "1",
+               "boot": self.boot_id, "session": None, "typed": "kilo", "died": time.time()}
+        (d / "deaths.jsonl").write_text("\0" * 64 + json.dumps(rec) + "\n")
+        (s,) = self.cg.watched(self.boot_id, time.time() - 300)
+        self.assertEqual((s["cwd"], s["how"]), ("/k", "window closed"))
+
     def test_agents_alive_when_an_earlier_boot_ended_went_down_with_it(self):
         d = self.cg.watch_dir()
         d.mkdir(parents=True)
