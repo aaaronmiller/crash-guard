@@ -514,10 +514,24 @@ Now:
   the current boot (`watcher_running()` checks `watch.pid`: the pid, its argv,
   and that it was written this boot). This answers the failure that killed the
   snapshotter.
+- **Enabled is not running (2026-10-29).** `Restart=always` hides a crash
+  loop: a watcher that dies at startup comes back every 5 seconds and the
+  unit still reads enabled. From 2026-10-23 to 2026-10-29 it restarted 63,113
+  times, and `cgr`'s warning only said to enable what was already enabled.
+  The warning now points at `systemctl --user status` and the journal. The
+  guardian 04:00 cron job (`cronjobs/bin/crash-guard.sh`) fails with rc 2
+  when the unit is not running or `NRestarts` rose since its last check: the
+  watcher never exits on its own, so any automatic restart was a death.
 - **Bounded storage.** `prune()` drops live files and death records older
   than 30 days at each start.
 - **A bad read never stops it.** `watch()` catches any exception from a scan,
-  logs it to the journal, and carries on.
+  logs it to the journal, and carries on. `prune()` runs before that loop,
+  so it must not raise either: the crash loop above was `prune()` parsing a
+  `deaths.jsonl` line that WSL dying mid-append (2026-10-22 19:11) left as
+  1,264 NUL bytes. `death_records()` now skips a line that will not parse
+  after its NULs are stripped, which also recovers a record appended onto a
+  torn one, and `prune()` rewrites the file without it. Appends are fsynced,
+  so a death recorded just before the VM dies survives it.
 
 ## 7. Putting the sources together
 
@@ -735,8 +749,11 @@ whole system.
    cannot be told apart from an accident, and the picker costs one keypress.
 3. **Watcher not running.** Only native records remain: claude in every
    mode (for sessions that wrote a pid file, see 5.1), and machine death for
-   codex, omp and hermes. Closed windows of other harnesses are missed. `cgr`
-   prints a warning with the command to start the watcher.
+   codex, omp and hermes. Closed windows of other harnesses are missed, codex
+   included (5.2). `cgr` prints a warning with the commands to check and start
+   the watcher. Measured 2026-10-29: the watcher was down six days (6.6), and
+   two codex windows closed in that boot could not be listed; they were
+   resumed by hand. A death the watcher never saw cannot be listed later.
 4. **The agent is the session leader.** If it was started with `exec claude`,
    or a terminal was configured to run the agent directly, there is no shell
    to ask, so a closed window is not recorded. Machine death is still caught
@@ -821,8 +838,9 @@ Use a throwaway directory, and never probe while a real crashed session is
 waiting to be restored.
 
 ```bash
-# 0. The suite: 40 cgr tests (6 against real processes in a pty), 76 in all
-cd /home/cheta/code/crash-guard && python3 -m pytest tests/test_cgr.py -q && python3 -m pytest tests -q
+# 0. The suite: 111 cgr tests, 147 in all (2026-10-29). Unset CGR_LAUNCH: a tab cgr
+#    reopened carries it, and the fake agents in 4 tests inherit it.
+cd /home/cheta/code/crash-guard && env -u CGR_LAUNCH python3 -m pytest tests/test_cgr.py -q && env -u CGR_LAUNCH python3 -m pytest tests -q
 
 # 0b. Clock drift: btime now, the boot start cgr uses, and wtmp's stamp for this boot
 python3 -c "import time; b=int([l for l in open('/proc/stat') if l.startswith('btime')][0].split()[1]); print('btime now ', time.ctime(b))"
@@ -925,7 +943,9 @@ All state is under `~/.local/state/crash-guard/` (or `$XDG_STATE_HOME`).
 Directories are `0700` and files `0600` (`private_dir()`,
 `write_private()`), and `cgr` reads only files this account owns
 (`read_own()`). Files are rewritten atomically (temp file, then
-`os.replace`), except the append-only `deaths.jsonl`.
+`os.replace`), except the append-only `deaths.jsonl`, which is fsynced after
+each append and read through `death_records()`, so a line torn by a crash is
+skipped (6.6).
 
 | path | written by | read by | content |
 |---|---|---|---|

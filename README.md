@@ -343,8 +343,16 @@ systemctl --user enable --now cgr-watch      # turn it back on
 ```
 
 Without the watcher, `cgr` still finds every cut-off Claude session, and
-codex, omp and hermes sessions lost to a machine death. It misses closed
-windows of the other harnesses.
+codex, omp and hermes sessions lost to a machine death. It misses every other
+closed window, codex's included: codex logs the same teardown for a closed
+window as for `/quit`.
+
+Enabled is not running. With `Restart=always`, a watcher that fails at
+startup is restarted every 5 seconds and the unit still looks alive. From
+2026-10-23 to 2026-10-29 it restarted 63,113 times on a death record torn by
+a WSL crash, and two closed codex windows were never recorded. On this
+machine the guardian cron job checks it daily at 04:00 and fails, with a
+notification, when the watcher is down or has restarted since the last check.
 
 ## Files
 
@@ -360,7 +368,10 @@ All under `~/.local/state/crash-guard/`:
 | `saved.json` | what `cgr --save` recorded, with session ids |
 | `sessions.db` | `cgr --history`: every session from every harness (SQLite) |
 
-Records older than 30 days are pruned when the watcher starts. Field-level
+Records older than 30 days are pruned when the watcher starts. Each death is
+flushed to disk as it is written; a line torn by a crash mid-write (WSL
+leaves it as NUL bytes) is skipped when read and dropped at the next start.
+Field-level
 formats are in `docs/design.md`, section 14.
 
 **Privacy.** These files hold each agent's working directory, arguments and
@@ -379,7 +390,7 @@ send escape sequences to your terminal.
 
 | symptom | cause and fix |
 |---|---|
-| `cgr: the watcher is not running` | start it: `systemctl --user enable --now cgr-watch` |
+| `cgr: the watcher is not running` | check it: `systemctl --user status cgr-watch`. Not enabled: `systemctl --user enable --now cgr-watch`. Enabled but restarting over and over: `journalctl --user -u cgr-watch -n 20` shows the error |
 | a session you exited is listed | you exited and closed the window within about 2 seconds, or closed the window on purpose. Untick it, or run `cgr --forget` once it is the only one listed |
 | a session you already resumed by hand is listed | it was resumed without its id on the command line (for example `claude --continue`) and the harness has not written its own record yet. Wait a few seconds, or use the exact command from `cgr --list` |
 | a reopened tab runs the wrong command | check the `typed` and `command` fields in `cgr --json`. History is zsh-only; other shells fall back to the process arguments |
