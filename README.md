@@ -673,3 +673,7 @@ backend, memory and process snapshot), `restore_group`, `restore_attempt`
 - User config lives under `~/.config/crash-guard/`.
 - Generated caches and local state are ignored by `.gitignore`.
 - License: MIT.
+
+### Related projects
+
+- **`guardian` (`/home/cheta/code/guardian`)**: Cooldown-gated CLI/package upgrade orchestrator and scheduled maintenance runner (`cronjobs/`). `guardian/cronjobs/bin/crash-guard.sh` invokes `crash-guard analytics --preview` and `crash-guard prune` nightly at 04:00, while `crash-guard` itself owns interactive session tracking (`cg_run`), terminal watch (`cgr --watch`), and crash recovery (`cgr`).
