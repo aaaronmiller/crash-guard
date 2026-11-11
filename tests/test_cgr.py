@@ -410,6 +410,75 @@ class CgrTests(unittest.TestCase):
         self.watched_boot("crashed", self.prev, ["/new"], last=self.crash)
         self.assertEqual([s["cwd"] for s in self.cg.collect()], ["/new"])
 
+    def record_closes(self, boot, rows):
+        """Window closes the watcher recorded: (cwd, died[, extra fields])."""
+        f = self.cg.watch_dir() / "deaths.jsonl"
+        with f.open("a") as fh:
+            for cwd, died, *extra in rows:
+                r = {"pid": int(died) % 99991, "ticks": "1", "started": died - 600,
+                     "harness": "kilo", "argv": ["kilo"], "cwd": cwd, "leader": 2,
+                     "leader_ticks": "1", "boot": boot, "session": None, "typed": "kilo",
+                     "died": died}
+                r.update(*extra)
+                fh.write(json.dumps(r) + "\n")
+
+    def terminal_crash_then_empty_boots(self):
+        # 2026-11-09 19:48: WezTerm panicked and took every agent with it, so the
+        # 16-day boot ended at 01:51 with an empty live set. Then WSL booted at
+        # 01:51, 02:13, 02:18 (the watcher never ran), 04:19 and 16:42, none
+        # with an agent. Plain cgr said nothing died.
+        long_start = self.prev - 16 * 86400
+        b1, b2, b3 = self.prev - 7200, self.prev - 3600, self.prev
+        self.write_wtmp([long_start, b1, b2, b3, self.btime + 90])
+        self.watched_boot("long", long_start, [])     # the watcher saw the end: nobody left
+        self.watched_boot("empty1", b1)
+        self.watched_boot("empty3", b3)               # b2 has no marker: unwatched
+        crash = b1 - 6 * 3600
+        self.record_closes("long", [("/early", long_start + 4 * 86400),   # a tab closed days before
+                             ("/afternoon", crash - 4 * 3600),     # one closed that afternoon
+                             ("/a", crash), ("/b", crash + 20), ("/c", crash + 50)])
+        return crash, b2
+
+    def test_a_terminal_crash_before_empty_boots_is_what_cgr_shows(self):
+        self.terminal_crash_then_empty_boots()
+        self.assertEqual(sorted(s["cwd"] for s in self.cg.collect()), ["/a", "/b", "/c"])
+
+    def test_an_unwatched_boot_with_agent_activity_still_ends_the_look_back(self):
+        crash, b2 = self.terminal_crash_then_empty_boots()
+        db = sqlite3.connect(str(self.cg.db_path()))
+        db.executescript(self.cg.SCHEMA)
+        db.execute("INSERT INTO sessions (harness, id, interactive, started, last) "
+                   "VALUES ('claude', 'x', 1, ?, ?)", (b2 + 30, b2 + 90))
+        db.commit(); db.close()
+        self.assertNotIn("/a", [s["cwd"] for s in self.cg.collect()])
+
+    def test_window_closes_hours_apart_are_separate_events(self):
+        self.terminal_crash_then_empty_boots()
+        groups = {}
+        for s in self.cg.collect(everything=True):
+            groups.setdefault(s["group"], []).append(s["cwd"])
+        self.assertIn(["/c", "/b", "/a"], groups.values())
+        self.assertIn(["/afternoon"], groups.values())
+        self.assertIn(["/early"], groups.values())
+
+    def test_a_launch_line_for_another_harness_is_not_this_sessions(self):
+        # A tab cgr reopened for omp kept CGR_LAUNCH exported; the claude typed
+        # there later was listed as `omp --resume <claude id>` (2026-11-09).
+        self.watched_boot("long", self.prev, [])
+        self.pidfile(999990, "theclaude", "/w", self.prev + 60, 1)
+        self.transcript("theclaude", [prompt("hi"), REPLY], self.crash)
+        self.record_closes("long", [("/w", self.crash, {
+            "harness": "claude", "argv": ["claude", "--resume", "theclaude"],
+            "session": "theclaude", "typed": "omp --resume 01a16dcc"})])
+        s = self.found()[("claude", "theclaude")]
+        self.assertEqual(self.cg.command(s), "claude --resume theclaude")
+
+    def test_a_reopened_tab_does_not_hand_its_launch_line_to_the_next_agent(self):
+        s = self.cg.session("omp", "o1", "/w", self.crash, "window closed", "")
+        s.update(typed="omp", started=self.crash - 60)
+        inner = self.cg.run_argv(s)[-1]
+        self.assertLess(inner.index("unset CGR_LAUNCH"), inner.index("exec "))
+
     def test_old_one_shot_records_cannot_stop_the_empty_boot_walk_or_be_restored(self):
         earlier = self.prev - 86400
         self.watched_boot("crashed", earlier, ["/real"])

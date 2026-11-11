@@ -369,29 +369,86 @@ def ended_with_agents(boot_id):
         return False
 
 
-def crash_boot_start(btime, boot_id):
-    """When the boot that went down with your agents began.
+EVENT_GAP = 600  # window closes further apart than this are separate events
 
-    Usually the boot before this one. But WSL can boot again and idle out
-    before you look: on 2026-10-13 its own update stopped the VM at 05:05 with
-    six agents running, started it at 05:06 to finish, and let it idle out at
-    05:12, so the boot before this one was five empty minutes. A boot the
-    watcher saw end with no agent running and nothing saved is stepped over to
-    the one before it; a boot it did not see is not.
-    """
-    empty = []
-    for f in watch_dir().glob("boot-*"):
-        if f.name[5:] != boot_id and not ended_with_agents(f.name[5:]):
-            try:
-                empty.append(int(read_own(f)))
-            except (OSError, ValueError):
-                pass
-    start = previous_boot_start(btime)
-    for _ in empty:
-        if not any(abs(start - began) < 300 for began in empty):  # wtmp stamps a boot late
+
+def last_burst(times):
+    """Start of the newest run of times with no gap over EVENT_GAP: the moment
+    one terminal crash or one sweep of closing tabs began."""
+    times = sorted(times)
+    start = times[-1]
+    for t in reversed(times[:-1]):
+        if start - t > EVENT_GAP:
             break
-        start = previous_boot_start(start)
+        start = t
     return start
+
+
+def agent_activity(began, ended):
+    """An interactive session in the --history index was busy inside the
+    interval, or the index cannot say otherwise because it is older than it."""
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % db_path(), uri=True)
+        try:
+            return db.execute("SELECT 1 FROM sessions WHERE interactive = 1 AND "
+                              "(started BETWEEN ? AND ? OR last BETWEEN ? AND ?) LIMIT 1",
+                              (began, ended, began, ended)).fetchone() is not None
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False  # no index: the watcher's absence is the evidence
+
+
+def crash_boot_start(btime, boot_id):
+    """Where the default list starts: just before the newest event that cut
+    agents off, walking back over boots in which none was.
+
+    Usually that is the boot before this one, which went down with agents
+    still in the watcher's live set. But WSL boots on its own and idles out:
+    on 2026-10-13 its update stopped the VM at 05:05 with six agents running
+    and the boot before 12:42 was five empty minutes. And a terminal can take
+    every agent with it before the machine goes: on 2026-11-09 WezTerm crashed
+    at 19:48, the boot ended at 01:51 with nobody left, and five empty boots
+    followed, one of them unwatched. So, newest boot first:
+
+    - it ended with agents running, or `cgr --save` ran in it: from its start;
+    - the watcher saw windows close in it: from the newest burst of closes,
+      so a tab closed days earlier in a long boot is left to --all;
+    - the watcher saw it and nothing died: step over it;
+    - the watcher did not see it: step over it when the watcher was already
+      installed and the session index shows no agent busy in it (no user
+      session starts the watcher, so none ran a terminal agent); a boot from
+      before the watcher stops the walk, since nothing says it was empty.
+    """
+    markers = {}
+    for f in watch_dir().glob("boot-*"):
+        try:
+            markers[f.name[5:]] = int(read_own(f))
+        except (OSError, ValueError):
+            pass
+    others = [t for b, t in markers.items() if b != boot_id]
+    installed = min(others) if others else None
+    try:
+        text = read_own(watch_dir() / "deaths.jsonl")
+    except OSError:
+        text = ""
+    died = {}
+    for _, r in death_records(text):
+        if session_record(r) and r.get("died"):
+            died.setdefault(r.get("boot"), []).append(r["died"])
+    for p in reversed(boot_periods()):
+        if p["boot"] == boot_id or p["start"] >= btime - 60:
+            continue
+        if p["boot"] in markers:
+            if ended_with_agents(p["boot"]):
+                return p["start"]
+            if died.get(p["boot"]):
+                return last_burst(died[p["boot"]])
+            continue
+        if installed is None or p["start"] < installed - 300 \
+                or agent_activity(p["start"], p["end"] or btime):
+            return p["start"]
+    return previous_boot_start(btime)
 
 
 def proc_stat(pid):
@@ -608,6 +665,13 @@ def launch_matches(harness, line, argv, amap):
         strip_args(argv[hit[1] + 1:], strip, harness)
 
 
+def launch_for(harness, line):
+    """A typed line, only if it starts this harness. Before 2026-11-10 a tab
+    cgr reopened kept CGR_LAUNCH exported in the shell left behind, and a
+    claude typed there later was recorded as `omp --resume <omp id>`."""
+    return line if line and harness_in(line, aliases()) == harness else None
+
+
 def launch_env(pid):
     """CGR_LAUNCH from a process environment: the typed line cgr reopened it with."""
     try:
@@ -734,7 +798,7 @@ class Watcher:
         rec = {"pid": pid, "ticks": st[3], "started": started, "harness": hit[0],
                "argv": argv, "cwd": cwd, "leader": st[1], "leader_ticks": proc_ticks(st[1]),
                "boot": self.boot, "session": None,
-               "typed": old.get("typed") or launch_env(pid)
+               "typed": old.get("typed") or launch_for(hit[0], launch_env(pid))
                or typed_for(hit[0], started, history(), aliases(), argv)}
         self.refresh(rec)
         return rec
@@ -1223,7 +1287,7 @@ def resolve(rec, live, taken):
     # No readable store: its own "continue" flag picks the newest session there.
     s = hit or session(h, None, cwd, rec["last"], rec["how"], "")
     s["last"] = max(s["last"], rec["last"])
-    s.update(started=rec["started"], typed=rec.get("typed"), argv=rec.get("argv"))
+    s.update(started=rec["started"], typed=launch_for(h, rec.get("typed")), argv=rec.get("argv"))
     s.update({f: rec[f] for f in ("pid", "ticks") if rec.get(f) is not None})
     s.update({f: rec[f] for f in ("boot", "boot_end", "died") if rec.get(f) is not None})
     if not s["title"]:
@@ -1374,6 +1438,21 @@ def group_sessions(items):
     """
     periods = boot_periods()
     by_boot = {p["boot"]: p for p in periods}
+    # One boot can run for weeks: its window closes are separate events when
+    # hours apart, not one group that dates a tab closed on 10-29 to a
+    # terminal crash on 11-09.
+    closes = {}
+    for s in items:
+        if s["how"] in ("window closed", "killed"):
+            closes.setdefault((s["how"], s.get("boot")), []).append(s.get("died") or s["last"])
+    burst = {}
+    for k, times in closes.items():
+        times.sort()
+        start = times[0]
+        for prev, t in zip([None] + times, times):
+            if prev is not None and t - prev > EVENT_GAP:
+                start = t
+            burst[k + (t,)] = start
     groups = {}
     for s in items:
         period = by_boot.get(s.get("boot"))
@@ -1390,6 +1469,8 @@ def group_sessions(items):
                 event["boot_end"] = event["end"]
                 event["end"] = s["last"]
             gid = "%s:%s" % (kind.replace(" ", "-"), period["boot"])
+            if kind in ("window closed", "killed"):
+                gid += ":%d" % burst[(s["how"], s.get("boot"), s.get("died") or s["last"])]
         else:
             day = time.strftime("%Y-%m-%d", time.localtime(s["last"]))
             gid = "activity:%s" % day
@@ -2692,11 +2773,13 @@ def choose(items, expand_old=False, preview=False):
 def run_argv(s):
     """cd, run the command through your interactive shell (so aliases work),
     then stay in a shell there. CGR_LAUNCH carries the typed line to the
-    watcher, so a reopened session keeps its original launch command."""
+    watcher, so a reopened session keeps its original launch command. It is
+    unset before the shell that stays, or the next agent typed in that tab
+    inherits it."""
     shell = os.environ.get("SHELL") or "/bin/zsh"
     launch = "export CGR_LAUNCH=%s; " % shlex.quote(s.get("typed") or command(s))
-    inner = "cd %s && { %s%s; }; exec %s -l" % (shlex.quote(s["cwd"]), launch, command(s),
-                                               shlex.quote(shell))
+    inner = "cd %s && { %s%s; }; unset CGR_LAUNCH; exec %s -l" % (
+        shlex.quote(s["cwd"]), launch, command(s), shlex.quote(shell))
     return [shell, "-lic", inner]
 
 

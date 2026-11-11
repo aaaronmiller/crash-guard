@@ -470,7 +470,12 @@ sessions the watcher never saw.
 **`CGR_LAUNCH`.** A reopened tab runs a reconstructed command, not what the
 user typed. The tab exports `CGR_LAUNCH=<original typed line>`, and
 `launch_env()` reads it from `/proc/<pid>/environ`. A session reopened twice
-therefore keeps its original launch line instead of drifting.
+therefore keeps its original launch line instead of drifting. The tab
+unsets it before the shell it leaves behind (2026-11-10): until then that
+shell inherited it, a claude typed there on 2026-11-03 was recorded with
+the omp line the tab had been reopened with, and `cgr` offered
+`omp --resume <claude id>`. `launch_for()` also drops any recorded line that
+starts a different harness, which repairs records written before the fix.
 
 **Dating the launch (fixed 2026-10-10).** History timestamps are wall-clock
 time. A process's start is only known as ticks since boot, so the watcher
@@ -565,6 +570,32 @@ Now:
    `test_an_empty_boot_after_the_crash_does_not_hide_it` (written first,
    failing with `{}`, as the real run did) and
    `test_a_boot_that_went_down_with_agents_ends_the_look_back`.
+   **The newest event, not the newest crashed boot (2026-11-10; supersedes
+   the two stopping rules above).** On 2026-11-09 at 19:48 WezTerm crashed
+   and took every agent with it. The watcher recorded the three window
+   closes, but the boot then ended at 01:51 with an empty live set, so the
+   walk stepped over it as empty. Five empty boots followed, and the walk
+   stopped at the one at 02:18, which the watcher never saw. The floor
+   was 02:16, and both `cgr` and the login notice said nothing died. The
+   walk now goes newest boot first:
+   - if the boot ended with agents running or `cgr --save` ran in it, the
+     window starts at the boot's start;
+   - if the watcher saw windows close in it, the window starts at the
+     newest burst of closes (gaps of at most `EVENT_GAP`, 600 s), so a tab
+     closed days earlier in a long boot is left to `--all`;
+   - if the watcher saw the boot and nothing died in it, the walk steps over it;
+   - if the watcher did not see the boot, the walk steps over it when the
+     watcher was already installed (a marker older than the boot exists) and
+     `sessions.db` has no interactive session busy inside it. With the
+     watcher installed, an unwatched boot is one in which no user session
+     started, so no terminal agent ran. A boot from before the watcher
+     still stops the walk.
+
+   Pinned by `test_a_terminal_crash_before_empty_boots_is_what_cgr_shows`
+   (it failed with `[]`, as the real run did) and
+   `test_an_unwatched_boot_with_agent_activity_still_ends_the_look_back`.
+   `group_sessions()` splits window closes in one boot at the same gap
+   (`test_window_closes_hours_apart_are_separate_events`).
 2. **Native sessions** from `claude()`, `codex()`, `omp()` and `hermes()`,
    keyed by (harness, id).
 3. **Watcher records** from `watched()`, newest first, each passed through
@@ -666,7 +697,7 @@ in, trying these in order:
 Each tab runs:
 
 ```
-$SHELL -lic "cd DIR && { export CGR_LAUNCH=<typed>; COMMAND; }; exec $SHELL -l"
+$SHELL -lic "cd DIR && { export CGR_LAUNCH=<typed>; COMMAND; }; unset CGR_LAUNCH; exec $SHELL -l"
 ```
 
 - `-i` loads the interactive config, so aliases and functions such as `cc` or
