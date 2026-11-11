@@ -40,6 +40,11 @@ def prompt(text, entry="cli", cwd="/w"):
             "message": {"role": "user", "content": text}}
 
 
+def re_strip(text):
+    import re
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
 REPLY = {"type": "assistant", "message": {"role": "assistant", "content": "ok"}}
 
 
@@ -587,9 +592,76 @@ class CgrTests(unittest.TestCase):
 
     def test_group_label_carries_stamp_and_count(self):
         items = self.grouped_crashes()
-        label = self.cg.group_label(items[0], 2)
+        label = self.cg.group_label(items, [0, 1])
         self.assertIn("2 sessions", label)
         self.assertRegex(label, r"20\d\d-\d\d-\d\d \d\d:\d\d")
+
+    def test_a_card_shows_title_span_duration_tokens_and_id(self):
+        # 2026-11-10: the operator asked for each event to read "from <time> to
+        # <time>", with every session under it showing where, how long, tokens,
+        # id and title, in `cgr` and `cgr --all` alike.
+        reply = lambda mid, **u: {"type": "assistant", "message": {
+            "id": mid, "role": "assistant", "content": "ok", "usage": u}}
+        self.pidfile(999990, "carded", "/w", self.prev + 60, 1)
+        self.transcript("carded", [prompt("build the thing"),
+                                   reply("m1", input_tokens=10, cache_read_input_tokens=990,
+                                         output_tokens=50),
+                                   reply("m1", input_tokens=10, cache_read_input_tokens=990,
+                                         output_tokens=50),   # one reply, two streamed blocks
+                                   reply("m2", input_tokens=0, output_tokens=150)],
+                        self.crash)
+        self.watched_boot("crashed", self.prev, [])
+        self.record_closes("crashed", [("/w", self.crash, {
+            "harness": "claude", "argv": ["claude"], "session": "carded",
+            "typed": "claude", "started": self.prev + 60})])
+        out = io.StringIO()
+        with patch.object(self.cg.shutil, "get_terminal_size",
+                          return_value=os.terminal_size((200, 40))), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(self.cg.main(["--list"]), 0)
+        text = out.getvalue()
+        self.assertIn("━━ #1 window closed · ", text)
+        self.assertIn("1 session: claude", text)
+        self.assertIn("carded", text)
+        self.assertIn("build the thing", text)
+        self.assertRegex(text, r"\(\dh\d\dm\)")
+        self.assertIn("200 out, 1k in (99% cached)", text)
+        self.assertIn("2 replies", text)
+        self.assertIn("claude --resume carded", text)
+        self.assertEqual(json.loads((self.cg.STATE / "usage.json").read_text())
+                         .popitem()[1][2:], [1000, 200, 0, 2, 990])
+
+    def test_a_title_that_is_only_the_launch_line_is_not_repeated(self):
+        s = dict(self.cg.session("agy", "c1", "/w", self.crash, "window closed",
+                                 "agy --conversation=c1"), typed="agy --conversation=c1",
+                 started=self.crash - 60, info={})
+        s["event"] = {"kind": "window closed"}
+        lines = self.cg.card(s, 200)
+        self.assertNotIn("agy --conversation=c1", "\n".join(lines[1:]))
+
+    def test_paint_cuts_to_visible_width_without_splitting_escapes(self):
+        with patch.object(self.cg, "USE_COLOR", True):
+            line = self.cg.paint([("abcdef", "31"), ("ghijkl", "32")], 8)
+        self.assertEqual(re_strip(line), "abcdefg…")
+        self.assertTrue(line.endswith("\x1b[0m"))
+
+    def test_old_undated_activity_folds_to_one_line_with_its_group_numbers(self):
+        def undated(day):
+            return dict(self.cg.session("hermes", "h%d" % day, "/h", self.prev - day * 86400,
+                                        "not closed", "t"), group="activity:%d" % day,
+                        event={"kind": "unmatched activity", "start": 0,
+                               "end": self.prev - day * 86400, "end_kind": "no boot interval"})
+        items = [undated(d) for d in (20, 21, 22)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cg.show_recovery(items)
+        self.assertIn("#1–#3 activity with no boot record", out.getvalue())
+        self.assertIn("3 dates, 3 sessions: hermes ×3", out.getvalue())
+
+    def test_a_normal_shutdown_is_not_colored_as_a_crash(self):
+        ev = lambda end_kind: {"event": {"kind": "machine went down", "end_kind": end_kind}}
+        self.assertEqual(self.cg.how_color(ev("normal shutdown")), "34")
+        self.assertEqual(self.cg.how_color(ev("crash (end inferred from next boot)")), "31")
 
     def test_select_groups_filters_by_display_number(self):
         items = self.grouped_crashes()
@@ -619,7 +691,8 @@ class CgrTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             self.assertEqual(self.cg.main(["--all", "--list", "--group", "2"]), 0)
-        self.assertEqual(output.getvalue().count(", 1 session]"), 1)
+        self.assertEqual(output.getvalue().count("━━ #"), 1)
+        self.assertIn("1 session: kilo", output.getvalue())
 
 
     def picker_keys(self, items, keys):
@@ -1123,7 +1196,7 @@ class CgrTests(unittest.TestCase):
             out = io.StringIO()
             with patch.object(self.cg, "USE_COLOR", True), contextlib.redirect_stdout(out):
                 self.assertEqual(self.cg.main(["--all", flag]), 0)
-            self.assertIn("\x1b[1;32msaved at", out.getvalue(), flag)
+            self.assertIn("\x1b[1;32m#1 saved before a restart", out.getvalue(), flag)
 
     def test_merge_keeps_saved_whichever_row_arrives_last(self):
         watcher = dict(self.cg.session("omp", "x", "/m", self.crash, "window closed", "t"),

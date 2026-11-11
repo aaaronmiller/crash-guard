@@ -60,21 +60,53 @@ cgr --save        # before a planned restart: record what runs now
 cgr --history     # browse every unfinished session grouped by date; space opens, space picks
 ```
 
-Example, after the 2026-10-09 WSL crash that this tool was rebuilt for. The
-last column shows the start of each conversation's first prompt; the two real
-prompts are replaced here:
+Example, after WezTerm crashed on 2026-11-09 and took three agents with it
+(colored in a terminal; prompts shortened here):
 
 ```
 These agent sessions were cut off:
 
-  claude    ~                           10-09 20:26  machine went down  (first words of the claude prompt)
-      cd /home/cheta && claude --resume 9a3daff8-0922-4583-a967-02a88760db6e
-  codex     ~/code/pareto               10-09 20:15  machine went down  (first words of the codex prompt)
-      cd /home/cheta/code/pareto && codex resume 01a12388-3c73-7653-94b6-250a36969bba
+━━ #1 windows closed · 2026-11-09 19:48 → 19:49 · 3 sessions: claude ×2, agy ━━━━━━━━━━━━━━━━━━━
+   during the boot of 2026-10-25 13:28 → 2026-11-10 01:51, then crashed
+
+   claude   ~/tmp  window closed  e73a12b3-8682-41eb-9105-b0dcca08d26f
+     for the file ...MethCuts.md i want yo to make a single page ...
+     2026-11-09 15:06 → 19:48  (4h42m)  ·  claude-opus-5-5  ·  401.6k out, 141.7M in (99% cached)  ·  319 replies  ·  53.8MB
+     › didyou fix the 30day skill?
+     $ cd /home/cheta/tmp && claude --resume e73a12b3-8682-41eb-9105-b0dcca08d26f
+
+   agy      …ignments/ardf-pareto-living-document-v7.2.1  window closed  c686714d-4737-4b6a-afd9-9d9a0a272a73
+     2026-11-07 01:11 → 2026-11-09 19:48  (2d18h)  ·  16.5MB
+     $ cd /home/cheta/LIVING_DOCUMENTS/new_assignments/ardf-pareto-living-document-v7.2.1 && agy --conversation c686714d-...
 ```
 
+Every view (`cgr`, `cgr --all`, `--list` and the picker) uses this layout.
+Each event gets a numbered header: what happened (crash, shutdown, windows
+closed, saved before a restart), when, from when to when, and how many
+sessions of which harnesses. The number is the one `--group N` takes. Under
+the header, each session gets a card:
+
+- harness, folder, how it ended, and the full session id;
+- its title (the first prompt, or the harness's thread name);
+- start → end with the duration, model, tokens (output, input and the share
+  of input served from cache; codex reports one total), cost where the
+  harness records it, replies, transcript size, git branch, and `mid-turn`
+  when it stopped mid-task;
+- `›` the last prompt you typed, and `$` the command that reopens it.
+
+Fields a harness does not record are left out. Details come from the
+`--history` index (`sessions.db`), and tokens from the transcripts, cached in
+`~/.local/state/crash-guard/usage.json` by size and mtime. Plain `cgr` shows
+the newest event (and anything cut off this boot); `cgr --all` shows every
+event, with those older than seven days folded to their header line, and
+each run of undated activity from before boots were recorded folded to one
+line (`#54–#84 activity with no boot record · ... · 31 dates`). Colors:
+red crash, blue normal shutdown, yellow window closed or killed, green saved
+before a restart, plain for undated activity.
+
 In the picker recent sessions start ticked: up/down to move, space to toggle,
-`a` for all or none, Enter to reopen, `q` to quit. Each chosen session opens
+`a` for all or none, `p` to fold each card to its first line, Enter to
+reopen, `q` to quit. Each chosen session opens
 in a new tab of the terminal you ran `cgr` from: a tmux window if you are in
 tmux, otherwise a WezTerm tab, otherwise a Windows Terminal tab, otherwise a
 tmux session called `cgr`. If a tab cannot be opened, `cgr` prints the command

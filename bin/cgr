@@ -2575,28 +2575,18 @@ def row(s):
 
 
 def how_color(s):
-    """Group color by provenance: green=saved, red=crash, yellow=current."""
+    """Group color by provenance: green saved, yellow window closed or killed,
+    blue a normal shutdown, red a crash, plain for activity no boot dates."""
+    ev = s.get("event", {})
     if s.get("how") == "saved":
         return "32"
-    if s.get("event", {}).get("kind") in ("window closed", "killed"):
+    if ev.get("kind") in ("window closed", "killed"):
         return "33"
+    if ev.get("kind") == "unmatched activity":
+        return "37"
+    if ev.get("kind") == "machine went down" and ev.get("end_kind") == "normal shutdown":
+        return "34"
     return "31"
-
-
-def row_colored(s):
-    """Recovery row with harness in green and how in its group color."""
-    when = time.strftime("%m-%d %H:%M", time.localtime(s["last"]))
-    base = clean("%-8s  %-26s  %-11s  %-17s  %s" % (
-        s["harness"], short_path(s["cwd"])[-26:], when, s["how"], s["title"]))
-    if not USE_COLOR:
-        return base
-    harness = clean(str(s["harness"]))
-    how = clean(str(s["how"]))
-    start = base.find(how)
-    head = base[len(harness):start] if start > 0 else base[len(harness):]
-    return (color("1;32") + harness + color("0") + head
-            + color("1;" + how_color(s)) + how + color("0")
-            + base[start + len(how):])
 
 
 def preview_line(s):
@@ -2636,41 +2626,372 @@ def old_group(s):
     return (s["event"].get("end") or s["last"]) < time.time() - 7 * 86400
 
 
-def event_title(s):
-    ev = s["event"]
-    stamp = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "still running"
+# -- event headers and session cards ------------------------------------------
+#
+# One layout for `cgr`, `cgr --all`, `--list` and the picker: each event is a
+# header (what happened, from when to when, how many sessions of which
+# harnesses), then one card per session (harness, folder, how it ended, id,
+# title, start to end, tokens, size, model, branch, last prompt).
+
+HARNESS_COLOR = {"claude": "38;5;209", "codex": "38;5;117", "omp": "38;5;141",
+                 "agy": "38;5;79", "gemini": "38;5;75", "hermes": "38;5;221",
+                 "opencode": "38;5;180", "kilo": "38;5;180", "pi": "38;5;183",
+                 "qwen": "38;5;147", "jcode": "38;5;151", "muse": "38;5;218",
+                 "openclaw": "38;5;203"}
+
+
+def paint(segs, width=None):
+    """(text, color) segments joined, cut to `width` visible columns. Cutting
+    the colored string instead could split an escape sequence."""
+    out, used = [], 0
+    for text, code in segs:
+        text = clean(text)
+        if width is not None:
+            room = width - used
+            if room <= 0:
+                break
+            if len(text) > room:
+                text = text[:max(0, room - 1)] + "…"
+        used += len(text)
+        out.append(_c(text, code) if code else text)
+    return "".join(out)
+
+
+def left_cut(text, n):
+    """The end of a long path, which names the project."""
+    return text if len(text) <= n else "…" + text[-(n - 1):]
+
+
+def stamp(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "?"
+
+
+def span(a, b):
+    """'2026-11-09 19:48 → 19:49': the end drops a date it shares with the start."""
+    if not a or not b:
+        return stamp(a or b)
+    a_, b_ = stamp(a), stamp(b)
+    if a_ == b_:
+        return a_
+    return "%s → %s" % (a_, b_[11:] if a_[:10] == b_[:10] else b_)
+
+
+def duration(sec):
+    if sec is None or sec < 0:
+        return ""
+    m = int(sec // 60)
+    if m < 60:
+        return "%dm" % m
+    h, m = divmod(m, 60)
+    if h < 48:
+        return "%dh%02dm" % (h, m)
+    d, h = divmod(h, 24)
+    return "%dd%02dh" % (d, h)
+
+
+def amount(n):
+    for unit, size in (("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= size:
+            return ("%.1f" % (n / size)).rstrip("0").rstrip(".") + unit
+    return "%d" % n
+
+
+INFO_FIELDS = ("started", "messages", "bytes", "model", "branch", "path", "mid_turn",
+               "last_prompt", "title")
+
+
+def details(items):
+    """What the --history index knows about each listed session, in s["info"].
+    The recovery list carries only what proves a session was cut off."""
+    want = [s for s in items if "info" not in s]
+    rows = {}
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % db_path(), uri=True)
+        try:
+            for s in want:
+                if s.get("id"):
+                    r = db.execute("SELECT %s FROM sessions WHERE harness = ? AND id = ?"
+                                   % ", ".join(INFO_FIELDS), (s["harness"], s["id"])).fetchone()
+                    if r:
+                        rows[(s["harness"], s["id"])] = dict(zip(INFO_FIELDS, r))
+        finally:
+            db.close()
+    except sqlite3.Error:
+        pass
+    for s in want:
+        info = {f: v for f, v in rows.get((s["harness"], s["id"]), {}).items()
+                if v not in (None, "")}
+        for f in INFO_FIELDS:
+            if s.get(f) not in (None, ""):
+                info[f] = s[f]
+        if s["harness"] == "claude" and s.get("id") and not info.get("path"):
+            info["path"] = claude_transcript(s["id"])
+        s["info"] = info
+
+
+USAGE_CACHE = None
+TRANSCRIPT_CAP = 512 << 20  # bytes; larger transcripts are not summed
+IN_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens",
+           "input", "cacheRead", "cacheWrite")
+OUT_KEYS = ("output_tokens", "output")
+CACHED_KEYS = ("cache_read_input_tokens", "cacheRead")
+
+
+def usage_cache():
+    global USAGE_CACHE
+    if USAGE_CACHE is None:
+        try:
+            USAGE_CACHE = {"rows": json.loads(read_own(STATE / "usage.json")), "dirty": False}
+        except (OSError, ValueError):
+            USAGE_CACHE = {"rows": {}, "dirty": False}
+    return USAGE_CACHE
+
+
+def save_usage_cache():
+    c = USAGE_CACHE
+    if c and c["dirty"]:
+        try:
+            private_dir(STATE)
+            tmp = STATE / "usage.json.tmp"
+            write_private(tmp, json.dumps(c["rows"]))
+            os.replace(tmp, STATE / "usage.json")
+            c["dirty"] = False
+        except OSError:
+            pass
+
+
+def transcript_usage(path):
+    """[tokens in, tokens out, cost, replies, cached in] summed over a claude, omp or pi
+    transcript. Claude repeats a reply's usage on every streamed block of it,
+    so a message id counts once. Cached by size and mtime."""
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError):
+        return None
+    if st.st_size > TRANSCRIPT_CAP:
+        return None
+    cache = usage_cache()
+    hit = cache["rows"].get(path)
+    if hit and hit[:2] == [st.st_size, st.st_mtime_ns] and len(hit) == 7:
+        return hit[2:]
+    tin = tout = cost = replies = cached = 0
+    seen = set()
+    try:
+        with open(path, "rb") as fh:
+            for line in fh:
+                if b'"usage"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                msg = rec.get("message") if isinstance(rec.get("message"), dict) else rec
+                u = msg.get("usage") if isinstance(msg, dict) else None
+                if not isinstance(u, dict):
+                    continue
+                mid = msg.get("id")
+                if mid:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                replies += 1
+                tin += sum(u.get(k) or 0 for k in IN_KEYS if isinstance(u.get(k), (int, float)))
+                tout += sum(u.get(k) or 0 for k in OUT_KEYS if isinstance(u.get(k), (int, float)))
+                cached += sum(u.get(k) or 0 for k in CACHED_KEYS if isinstance(u.get(k), (int, float)))
+                c = u.get("cost")
+                c = c.get("total") if isinstance(c, dict) else c
+                if isinstance(c, (int, float)):
+                    cost += c
+    except OSError:
+        return None
+    row = [tin, tout, cost, replies, cached]
+    cache["rows"][path] = [st.st_size, st.st_mtime_ns] + row
+    cache["dirty"] = True
+    return row
+
+
+def session_usage(s):
+    """{"in", "out", "cost", "replies", "cached"} or {"total"}, where the harness records them."""
+    if "usage" in s:
+        return s["usage"]
+    info = s.get("info") or {}
+    got = None
+    if s["harness"] in ("claude", "omp", "pi") and info.get("path"):
+        row = transcript_usage(info["path"])
+        if row:
+            got = dict(zip(("in", "out", "cost", "replies", "cached"), row))
+    elif s["harness"] == "codex" and s.get("id"):
+        db = codex_db("state_*.sqlite")
+        if db:
+            try:
+                con = ro(db)
+                try:
+                    r = con.execute("SELECT tokens_used FROM threads WHERE id = ?",
+                                    (s["id"],)).fetchone()
+                finally:
+                    con.close()
+                if r and r[0]:
+                    got = {"total": r[0]}
+            except sqlite3.Error:
+                pass
+    s["usage"] = got
+    return got
+
+
+def kind_name(ev, n):
+    k = ev["kind"]
+    if k == "machine went down":
+        return "shutdown" if ev.get("end_kind") == "normal shutdown" else "crash"
+    if k == "window closed":
+        return "window closed" if n == 1 else "windows closed"
+    if k == "saved":
+        return "saved before a restart"
+    if k == "unmatched activity":
+        return "activity with no boot record"
+    return k
+
+
+def event_span(items, indexes):
+    """When the event happened: the boot for a crash or shutdown, the first to
+    last death for window closes and saves."""
+    ev = items[indexes[0]]["event"]
     if ev["kind"] in ("window closed", "killed", "saved"):
-        return clean("%s at %s; boot began %s" % (ev["kind"], stamp(ev["end"]), stamp(ev["start"])))
+        times = [items[i].get("died") or items[i]["last"] for i in indexes]
+        return span(min(times), max(times))
     if ev["kind"] == "unmatched activity":
-        return clean("Activity on %s; no boot association" % stamp(ev["end"])[:10])
-    return clean("Boot %s to %s; %s" % (stamp(ev["start"]), stamp(ev["end"]), ev["end_kind"]))
+        return stamp(ev["end"])[:10]
+    return "boot " + span(ev["start"], ev["end"])
 
 
-def group_label(s, n):
-    """Colored group header: title + date/time + session count, provenance color."""
-    title = event_title(s)
-    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["event"].get("end") or s["last"]))
-    label = "%s  [%s, %d session%s]" % (title, stamp, n, "" if n == 1 else "s")
-    return _c(label, "1;" + how_color(s))
+def tally(items, indexes):
+    counts = {}
+    for i in indexes:
+        counts[items[i]["harness"]] = counts.get(items[i]["harness"], 0) + 1
+    return ", ".join(h if c == 1 else "%s ×%d" % (h, c)
+                     for h, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def group_label(items, indexes, number=None, width=None, bar=True, strong=True):
+    """The event header: number, what happened, when, and the harnesses in it."""
+    s, n = items[indexes[0]], len(indexes)
+    code = ("1;" if strong else "") + how_color(s)
+    text = "%s%s · %s · %d session%s: %s" % (
+        "#%d " % number if number else "", kind_name(s["event"], n), event_span(items, indexes),
+        n, "" if n == 1 else "s", tally(items, indexes))
+    if not bar:
+        return paint([(text, code)], width)
+    segs = [("━━ ", code), (text, code), (" ", "")]
+    if width:
+        segs.append(("━" * max(0, width - len(clean(text)) - 4), code))
+    return paint(segs, width)
+
+
+def boot_line(items, indexes):
+    """The boot an event happened in, under a window-close or save header."""
+    ev = items[indexes[0]]["event"]
+    if ev["kind"] not in ("window closed", "killed", "saved") or not ev.get("start"):
+        return ""
+    end = ev.get("boot_end")
+    how = {"normal shutdown": "then shut down", "running": "still running"}.get(
+        ev.get("end_kind"), "then crashed")
+    return "during the boot of %s%s" % (span(ev["start"], end) if end else stamp(ev["start"]) + " →",
+                                        ", " + how if end else ", still running")
+
+
+def card(s, width, first=(), indent="    ", commands=False, full=True):
+    """A session's lines: who and where, its title, its numbers, its last prompt."""
+    info = s.get("info") or {}
+    h = s["harness"]
+    lines = [paint(list(first) + [
+        ("%-8s " % h, "1;" + HARNESS_COLOR.get(h, "37")),
+        (left_cut(short_path(s["cwd"]), 44), "36"), ("  ", ""),
+        (s["how"], how_color(s)), ("  ", ""),
+        (s["id"] or "no id: reopens the newest session here", "2")], width)]
+    if not full:
+        return lines
+    title = info.get("title") or s.get("title") or ""
+    if title.strip() in (s.get("typed") or "", " ".join(s.get("argv") or []), s.get("command") or ""):
+        title = ""  # agy records no title; its launch line says nothing new
+    if title:
+        lines.append(paint([(indent + "  ", ""), (title, "1")], width))
+    stats = [(span(info.get("started"), s["last"]), "")]
+    if info.get("started"):
+        stats.append(("  (%s)" % duration(s["last"] - info["started"]), "2"))
+    if info.get("model"):
+        stats.append(("  ·  %s" % info["model"], "34"))
+    use = session_usage(s) or {}
+    if use.get("total"):
+        stats.append(("  ·  %s tokens" % amount(use["total"]), "35"))
+    elif use.get("in") or use.get("out"):
+        cached = " (%d%% cached)" % (100 * use["cached"] / use["in"]) if use.get("cached") else ""
+        stats.append(("  ·  %s out, %s in%s" % (amount(use["out"]), amount(use["in"]), cached), "35"))
+        if use.get("cost"):
+            stats.append(("  ·  $%.2f" % use["cost"], "35"))
+    if use.get("replies"):
+        stats.append(("  ·  %d replies" % use["replies"], ""))
+    elif info.get("messages"):
+        stats.append(("  ·  %d msgs" % info["messages"], ""))
+    if info.get("bytes"):
+        stats.append(("  ·  %s" % (amount(info["bytes"]) + "B"), "2"))
+    if info.get("branch") and info["branch"] != "HEAD":
+        stats.append(("  ·  ⎇ %s" % info["branch"], "2"))
+    if info.get("mid_turn"):
+        stats.append(("  ·  mid-turn", "1;31"))
+    lines.append(paint([(indent + "  ", "")] + stats, width))
+    last = (info.get("last_prompt") or "").replace("\n", " ").strip()
+    if last and last != title.strip():
+        lines.append(paint([(indent + "  › ", "2"), (last, "2")], width))
+    if commands:
+        lines.append(paint([(indent + "  $ ", "32"), (runnable(s), "2")], width))
+    return lines
 
 
 def show_recovery(items, expand_old=False, commands=True, preview=False):
     width = shutil.get_terminal_size((120, 20)).columns
-    for indexes in event_groups(items):
+    groups = event_groups(items)
+    details([items[i] for ix in groups for i in ix])
+    old_shown, undated = False, []
+
+    def flush():
+        # Activity from before boots were recorded, one line per run of dates.
+        if len(undated) == 1:
+            n, ix = undated[0]
+            print("  " + group_label(items, ix, n, width - 2, bar=False, strong=False))
+        elif undated:
+            every = [i for _, ix in undated for i in ix]
+            first, last = undated[-1], undated[0]
+            print("  " + paint([("#%d–#%d activity with no boot record · %s → %s · %d dates, "
+                                 "%d sessions: %s" % (
+                                     last[0], first[0], stamp(items[first[1][0]]["last"])[:10],
+                                     stamp(items[last[1][0]]["last"])[:10], len(undated),
+                                     len(every), tally(items, every)), "37")], width - 2))
+        undated.clear()
+
+    for number, indexes in enumerate(groups, 1):
         s = items[indexes[0]]
-        collapsed = old_group(s) and not expand_old
-        tail = " [collapsed; --expand-old shows sessions]" if collapsed else ""
-        print("%s%s" % (group_label(s, len(indexes)), _c(tail, "2") if tail else ""))
-        if not collapsed:
-            for i in indexes:
-                print("  " + row_colored(items[i])[:width + 30])
-                if preview:
-                    pv = preview_line(items[i])
-                    if pv:
-                        print("    " + pv[:width - 3])
-                if commands:
-                    print("      " + runnable(items[i]))
+        if old_group(s) and not expand_old:
+            if not old_shown:
+                print(_c("Older than seven days, collapsed (--expand-old shows their sessions):", "2"))
+                old_shown = True
+            if s["event"]["kind"] == "unmatched activity":
+                undated.append((number, indexes))
+                continue
+            flush()
+            print("  " + group_label(items, indexes, number, width - 2, bar=False, strong=False))
+            continue
+        flush()
+        print(group_label(items, indexes, number, width))
+        under = boot_line(items, indexes)
+        if under:
+            print(paint([("   " + under, "2")], width))
+        for i in indexes:
+            print()
+            for line in card(items[i], width, first=[("   ", "")], indent="   ",
+                             commands=commands):
+                print(line)
         print()
+    flush()
+    save_usage_cache()
 
 
 def choose(items, expand_old=False, preview=False):
@@ -2679,11 +3000,13 @@ def choose(items, expand_old=False, preview=False):
     import tty
     fd = sys.stdin.fileno()
     picked, cur = [not old_group(s) for s in items], 0
-    show_preview = preview
+    show_details = True  # `p` folds each session to its first line
     groups = event_groups(items)
+    number = {items[ix[0]]["group"]: n for n, ix in enumerate(groups, 1)}
     expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
+    details([items[i] for ix in groups if items[ix[0]]["group"] in expanded for i in ix])
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = "  up/down move   space group/session   o expand/collapse   a all/none   p preview   enter reopen   q quit"
+    help_line = "  up/down move   space pick group/session   o expand/collapse   a all/none   p details   enter reopen   q quit"
     drawn = 0
 
     def entries():
@@ -2694,33 +3017,48 @@ def choose(items, expand_old=False, preview=False):
                 rows.extend(([i], False) for i in indexes)
         return rows
 
+    def render(pos, indexes, header):
+        """An entry's screen lines; the first carries the cursor and the tick."""
+        on = pos == cur
+        state = "x" if all(picked[i] for i in indexes) else "+" if any(picked[i] for i in indexes) else " "
+        mark = [("▶ " if on else "  ", "1;36"), ("[%s] " % state, "1;32" if state != " " else "2")]
+        s = items[indexes[0]]
+        w = width - 1
+        if header:
+            gid = s["group"]
+            lines = [paint(mark, w) + group_label(items, indexes, number[gid], w - 6,
+                                                  bar=gid in expanded)]
+            under = boot_line(items, indexes) if gid in expanded else ""
+            if under:
+                lines.append(paint([("        " + under, "2")], w))
+            return lines
+        lines = card(s, w, first=[("    ", "")] + mark, indent="          ", full=show_details)
+        return ([""] if show_details else []) + lines
+
     def draw(first):
         nonlocal drawn
         rows = entries()
+        phys = []
+        for pos, (indexes, header) in enumerate(rows):
+            if header and pos:
+                phys.append((None, ""))
+            phys.extend((pos, line) for line in render(pos, indexes, header))
         height = shutil.get_terminal_size((120, 24)).lines
-        count = max(1, height - 3)
-        start = max(0, min(cur - count // 2, len(rows) - count))
-        visible = rows[start:start + count]
+        count = max(1, height - 2)
+        mine = [n for n, (pos, _) in enumerate(phys) if pos == cur]
+        top = max(0, min(mine[0] - count // 3, len(phys) - count))
+        if mine[-1] >= top + count:
+            top = mine[-1] - count + 1
+        visible = phys[top:top + count]
         out = [] if first else ["\r\x1b[%dA" % drawn]
-        for pos, (indexes, header) in enumerate(visible, start):
-            state = "x" if all(picked[i] for i in indexes) else "+" if any(picked[i] for i in indexes) else " "
-            s = items[indexes[0]]
-            if header:
-                label = group_label(s, len(indexes)) + (_c(" [collapsed]", "2") if s["group"] not in expanded else "")
-            else:
-                label = "  " + row_colored(s)
-                if show_preview:
-                    pv = preview_line(s)
-                    if pv:
-                        label += "\n      " + pv
-            line = ("%s [%s] %s" % (">" if pos == cur else " ", state, label))[:width - 1]
-            out.append("\r\x1b[K" + ("\x1b[7m%s\x1b[0m" % line if pos == cur else line) + "\n")
+        for _, line in visible:
+            out.append("\r\x1b[K" + line + "\n")
         # Clear leftover rows after collapsing a group, then return to the help line.
         if drawn > len(visible):
             out.extend("\r\x1b[K\n" for _ in range(drawn - len(visible)))
             out.append("\r\x1b[%dA" % (drawn - len(visible)))
         drawn = len(visible)
-        out.append("\r\x1b[K" + help_line[:width - 1])
+        out.append("\r\x1b[K" + _c(help_line[:width - 1], "2"))
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -2751,12 +3089,13 @@ def choose(items, expand_old=False, preview=False):
                     expanded.remove(gid)
                 else:
                     expanded.add(gid)
+                    details([items[i] for i in rows[cur][0]])
                 cur = next(i for i, (ix, header) in enumerate(entries())
                            if header and items[ix[0]]["group"] == gid)
             elif k == b"a":
                 picked = [not all(picked)] * len(items)
             elif k == b"p":
-                show_preview = not show_preview
+                show_details = not show_details
             elif k in (b"\r", b"\n"):
                 return [s for s, p in zip(items, picked) if p]
             elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
@@ -3011,8 +3350,8 @@ def main(argv=None):
             return 0
 
     if args.brief:
-        for indexes in event_groups(items):
-            print(group_label(items[indexes[0]], len(indexes)))
+        for n, indexes in enumerate(event_groups(items), 1):
+            print(group_label(items, indexes, n, bar=False))
         return 0
     if not watcher_running(current_boot()[1]):
         # Enabled is not running: on 2026-10-29 the service had restarted 63,000
@@ -3040,11 +3379,12 @@ def main(argv=None):
             print("\nnot a terminal: run `cgr --yes` to reopen all, or the commands above")
             return 0
         print(_c("Reopening %d session%s:" % (len(items), "" if len(items) == 1 else "s"), "1;32"))
-        for indexes in event_groups(items):
-            print("  " + group_label(items[indexes[0]], len(indexes)))
+        for n, indexes in enumerate(event_groups(items), 1):
+            print("  " + group_label(items, indexes, n, bar=False))
         chosen = items
     else:
         chosen = choose(items, expand_old=args.expand_old, preview=args.preview)
+        save_usage_cache()
         if not chosen:
             print("nothing reopened")
             return 0
