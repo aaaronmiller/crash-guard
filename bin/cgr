@@ -2247,12 +2247,27 @@ def flagged(r):
         r["status"] == "cut off" or (r["status"] == "unknown" and bool(r["mid_turn"])))
 
 
-def history_row(r):
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["last"] or 0))
-    mark = "mid-turn" if r["mid_turn"] else ""
-    return clean("%-8s  %-24s  %s  %-8s  %-24s  %s" % (
-        r["harness"], short_path(r["cwd"] or "")[-24:], when, mark, (r["how"] or "")[:24],
-        r["last_prompt"] or r["title"] or ""))
+STATUS_COLOR = {"cut off": "31", "running": "1;32", "closed": "2", "unknown": "33"}
+
+
+def history_row(r, width=None, lead=""):
+    """One session on one line, its date given by the group header above it:
+    harness, (age) start–end, folder, how it ended, title, how long it ran."""
+    h = r["harness"]
+    status = r.get("status") or ""
+    how = r.get("how") or ""
+    ended = status if not how or how == status else "%s: %s" % (status, how) if status else how
+    segs = [(lead, ""), ("%-8s " % h, "1;" + HARNESS_COLOR.get(h, "37"))]
+    segs += when(r.get("started"), r.get("last"), show_day=False, pad=True)
+    segs += [("  ", ""), (left_cut(short_path(r.get("cwd") or ""), 28), "34"), ("  ", ""),
+             (ended[:28], STATUS_COLOR.get(status, "2"))]
+    if r.get("mid_turn"):
+        segs.append(("  mid-turn", "1;31"))
+    used = sum(len(clean(t)) for t, _ in segs)
+    title = (r.get("title") or r.get("last_prompt") or "").replace("\n", " ").strip()
+    length = ran({"last": r.get("last"), "started": r.get("started")})
+    tail = title_segments("  ", title, length, None if width is None else width - used)
+    return paint(segs + tail, width)
 
 
 HISTORY_CAP = 40                # sessions shown before --all; a date is never cut in two
@@ -2281,14 +2296,26 @@ def print_history_groups(groups, collapse, preview):
         print(history_group_label(day, grows) + tail)
         if not folded:
             for r in grows:
-                print("  " + history_row(r)[:width - 3])
+                print(history_row(r, width - 1, lead="  "))
                 if preview and preview_line(r):
-                    print("    " + preview_line(r)[:width - 3])
+                    print("    " + preview_line(r))
         print()
 
 
+def reopenable(r):
+    """A row without an id could only be reopened with "continue the newest",
+    which is not necessarily the session meant."""
+    return not str(r["id"]).startswith("@")
+
+
+def full_rows(rows):
+    """Every session you ran that can be reopened, finished or not: the
+    cross-harness counterpart of `claude --resume`."""
+    return [r for r in rows if r["interactive"] and reopenable(r)]
+
+
 def show_history(everything=False, as_json=False, list_only=False, groups=None, days=None,
-                 yes=False, expand_old=False, preview=False):
+                 yes=False, expand_old=False, preview=False, full=False):
     rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
     if as_json:
         print(json.dumps(rows, indent=1))
@@ -2305,11 +2332,9 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
     print("  %-9s" % "harness" + "".join("%9s" % c for c in cols))
     for h in sorted(by, key=lambda h: -by[h]["sessions"]):
         print("  %-9s" % h + "".join("%9d" % by[h][c] for c in cols))
-    flagged_rows = [r for r in rows if flagged(r)]
-    # A row without an id could only be reopened with "continue the newest",
-    # which is not necessarily the session that died.
-    bad = [r for r in flagged_rows if not r["id"].startswith("@")]
-    every = history_groups(bad)
+    bad = [r for r in rows if flagged(r) and reopenable(r)]
+    everyone = full_rows(rows)
+    every = history_groups(everyone if full else bad)
     selected = bool(days or groups)
     if days:
         every = [g for g in every if g[0] in days]
@@ -2332,11 +2357,21 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
         note = ""
         if not selected and not everything and len(shown_rows) < total:
             note = " (showing %d of %d, whole dates; --all shows every one)" % (len(shown_rows), total)
-        print("\n%d you ran were cut off or left mid-turn, newest first%s:\n" % (total, note))
+        print("\n%d you ran%s, newest first%s:\n" % (
+            total, "" if full else " were cut off or left mid-turn", note))
         print_history_groups(shown, not (expand_old or selected), preview)
         print("audit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
         return 0
-    chosen = choose_history(shown_rows, shown, preview=preview)
+    # `f` in the picker switches between the cut-off sessions and every session.
+    other = everyone if not full else bad
+    other_groups = history_groups(other)
+    if days:
+        other_groups = [g for g in other_groups if g[0] in days]
+    if full and not selected and not everything:
+        shown, shown_rows = every, [r for _, g in every for r in g]  # dates fold in the picker
+    chosen = choose_history(shown_rows, shown, preview=preview,
+                            alt=([r for _, g in other_groups for r in g], other_groups),
+                            full=full)
     if not chosen:
         print("nothing reopened")
         return 0
@@ -2380,20 +2415,35 @@ def history_group_label(day, rows):
     return _c(label, "1;" + code)
 
 
-def choose_history(rows, groups, preview=False):
+def choose_history(rows, groups, preview=False, alt=None, full=False):
     """A date group per line with its count; space expands one group into its
-    sessions, and inside an open group space picks sessions to reopen."""
+    sessions, and inside an open group space picks sessions to reopen. `f`
+    swaps to `alt` (rows, groups): every session instead of the cut-off ones,
+    or back. Picks survive the swap."""
     import termios
     import tty
     fd = sys.stdin.fileno()
     picked, cur = set(), 0
     open_day = None
+    sets = {full: (rows, groups)}
+    if alt is not None:
+        sets[not full] = alt
+    known = {(r["harness"], r["id"]): r for rs, _ in sets.values() for r in rs}
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = ("  up/down move   space open group / pick session   "
-                 "a all/none in group   enter reopen   q quit")
+
+    def help_line():
+        swap = ("   f only cut off" if full else "   f every session") if alt is not None else ""
+        return ("  up/down move   space open group / pick session   "
+                "a all/none in group%s   enter reopen   q quit" % swap)
+
+    def title_line():
+        n = len(rows)
+        what = "every session you ran" if full else "cut off or left mid-turn"
+        return _c("  %s: %d session%s in %d date%s" % (
+            what, n, "" if n == 1 else "s", len(groups), "" if len(groups) == 1 else "s"), "1")
 
     def entries():
-        rows_out = []
+        rows_out = [(None, None)]
         for day, grows in groups:
             rows_out.append((day, None))
             if day == open_day:
@@ -2402,6 +2452,8 @@ def choose_history(rows, groups, preview=False):
 
     def lines_of(day, r):
         """The screen lines of one entry; only the first is the highlighted one."""
+        if day is None:
+            return [title_line()]
         if r is None:
             grows = dict(groups)[day]
             n = len(picked & {(x["harness"], x["id"]) for x in grows})
@@ -2410,7 +2462,7 @@ def choose_history(rows, groups, preview=False):
             return ["%s [%s] %s" % (marker, tick, history_group_label(day, grows))]
         key = (r["harness"], r["id"])
         head = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
-        out = [head + history_row(r)]
+        out = [head + history_row(r, width - 8)]
         if preview and preview_line(r):
             out.append("        " + preview_line(r))
         if r.get("resume"):
@@ -2431,8 +2483,8 @@ def choose_history(rows, groups, preview=False):
             if used + len(shown[pos]) > budget and screen:
                 break
             for n, text in enumerate(shown[pos][:max(1, budget - used)]):
-                line = ("%s %s" % (">" if pos == cur and n == 0 else " ", text))[:width - 1]
-                screen.append("\x1b[7m%s\x1b[0m" % line if pos == cur and n == 0 else line)
+                here = pos == cur and n == 0
+                screen.append(_c("▶ ", "1;36") + text if here else "  " + text)
             used = len(screen)
         out = [] if first else ["\r\x1b[%dA" % drawn]
         out.extend("\r\x1b[K" + line + "\n" for line in screen)
@@ -2440,11 +2492,12 @@ def choose_history(rows, groups, preview=False):
             out.extend("\r\x1b[K\n" for _ in range(drawn - len(screen)))
             out.append("\r\x1b[%dA" % (drawn - len(screen)))
         drawn = len(screen)
-        out.append("\r\x1b[K" + help_line[:width - 1])
+        out.append("\r\x1b[K" + _c(help_line()[:width - 1], "2"))
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
     top = 0
+    cur = 1
     drawn = 0
     old = termios.tcgetattr(fd)
     try:
@@ -2458,11 +2511,16 @@ def choose_history(rows, groups, preview=False):
                 if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
                     break
             ents = entries()
-            if k in (b"\x1b[A", b"\x1bOA", b"k"):
-                cur = (cur - 1) % len(ents)
-            elif k in (b"\x1b[B", b"\x1bOB", b"j"):
-                cur = (cur + 1) % len(ents)
-            elif k == b" ":
+            # Entry 0 is the title line; the cursor cycles over the rest.
+            if k in (b"\x1b[A", b"\x1bOA", b"k") and len(ents) > 1:
+                cur = (cur - 2) % (len(ents) - 1) + 1
+            elif k in (b"\x1b[B", b"\x1bOB", b"j") and len(ents) > 1:
+                cur = cur % (len(ents) - 1) + 1
+            elif k == b"f" and alt is not None:
+                full = not full
+                rows, groups = sets[full]
+                open_day, cur, top = None, 1, 0
+            elif k == b" " and len(ents) > 1:
                 day, r = ents[cur]
                 if r is None:
                     # Space opens a closed date; on the open date it closes it again.
@@ -2474,12 +2532,13 @@ def choose_history(rows, groups, preview=False):
                 else:
                     key = (r["harness"], r["id"])
                     picked.discard(key) if key in picked else picked.add(key)
-            elif k == b"a":
+            elif k == b"a" and len(ents) > 1:
                 grows = dict(groups)[ents[cur][0]]
                 keys = {(x["harness"], x["id"]) for x in grows}
-                picked -= keys if keys <= picked else picked | keys
+                # All picked: unpick them. Otherwise pick the rest, keeping other dates.
+                picked = picked - keys if keys <= picked else picked | keys
             elif k in (b"\r", b"\n"):
-                return [r for r in rows if (r["harness"], r["id"]) in picked]
+                return [r for key, r in known.items() if key in picked]
             elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
                 return []
             draw(False)
@@ -2687,6 +2746,76 @@ def duration(sec):
         return "%dh%02dm" % (h, m)
     d, h = divmod(h, 24)
     return "%dd%02dh" % (d, h)
+
+
+def ago(t, now=None):
+    """'5h 52m ago': days, hours and minutes since t (minutes dropped past 30 days)."""
+    m = int(max(0, (now or time.time()) - t) // 60)
+    d, m = divmod(m, 1440)
+    h, m = divmod(m, 60)
+    if not (d or h or m):
+        return "just now"
+    if d >= 30:
+        return "%dd %dh ago" % (d, h)
+    parts = ["%dd" % d] * bool(d) + ["%dh" % h] * bool(d or h) + ["%dm" % m]
+    return " ".join(parts) + " ago"
+
+
+def ago_color(t, now=None):
+    """Fresher is louder: bright green within the hour, green today, yellow this week, dim after."""
+    sec = (now or time.time()) - t
+    return "1;32" if sec < 3600 else "32" if sec < 86400 else "33" if sec < 7 * 86400 else "2"
+
+
+def clock(t):
+    return time.strftime("%I:%M%p", time.localtime(t)).lstrip("0").lower()
+
+
+def day_name(t, short=False, now=None):
+    """'Monday, October 12th' (the year only when it is not this one)."""
+    lt = time.localtime(t)
+    d = lt.tm_mday
+    suffix = "th" if 10 <= d % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
+    text = time.strftime("%a, %b " if short else "%A, %B ", lt) + "%d%s" % (d, suffix)
+    if lt.tm_year != time.localtime(now or time.time()).tm_year:
+        text += ", %d" % lt.tm_year
+    return text
+
+
+def when(a, b, show_day=True, short=False, now=None, pad=False):
+    """Colored segments for when a session ran, read left to right as what you
+    care about first: '(5h 52m ago)  Monday, October 12th  4:45am–5:56pm'.
+    The age counts from the end. With the day shown, an end on a later day
+    names that day; without it (a date header above names the end's day), a
+    start on an earlier day names the start's. `pad` aligns rows in a list."""
+    end = b or a
+    if not end:
+        return [("?", "2")]
+    start = a or end
+    age = "(%s)" % ago(end, now)
+    segs = [(age.ljust(17) if pad else age, ago_color(end, now)), (" " if pad else "  ", "")]
+    if show_day:
+        segs += [(day_name(start, short, now), "1"), ("  ", "")]
+    same_day = bool(a and b) and time.localtime(a)[:3] == time.localtime(b)[:3]
+    if not (a and b) or same_day and clock(a) == clock(b):
+        segs.append((clock(end).ljust(15) if pad else clock(end), "36"))
+    elif same_day:
+        text = "%s–%s" % (clock(a), clock(b))
+        segs.append((text.ljust(15) if pad else text, "36"))
+    elif show_day:
+        segs += [("%s → " % clock(a), "36"), (day_name(b, True, now) + " ", "1"), (clock(b), "36")]
+    else:
+        segs += [("from ", "2"), (day_name(a, True, now) + " ", "1"),
+                 ("%s → %s" % (clock(a), clock(b)), "36")]
+    return segs
+
+
+def ran(s, info=None):
+    """How long a session ran, '1h11m', or '' when its start is unknown."""
+    started = (info or {}).get("started") or s.get("started")
+    if not (started and s.get("last")):
+        return ""
+    return "<1m" if s["last"] - started < 60 else duration(s["last"] - started)
 
 
 def amount(n):
@@ -2898,6 +3027,20 @@ def boot_line(items, indexes):
                                         ", " + how if end else ", still running")
 
 
+RAN_COLOR = "38;5;180"
+
+
+def title_segments(lead, title, length, width=None):
+    """A title cut short enough that ' · ran 1h11m' after it always shows."""
+    tail = "   ran %s" % length if length else ""
+    title = clean(title)
+    if width is not None:
+        room = width - len(clean(lead)) - len(tail)
+        if len(title) > room:
+            title = title[:max(0, room - 1)] + "…"
+    return [(lead, ""), (title, "1")] + ([(tail, RAN_COLOR)] if tail else [])
+
+
 def card(s, width, first=(), indent="    ", commands=False, full=True):
     """A session's lines: who and where, its title, its numbers, its last prompt."""
     info = s.get("info") or {}
@@ -2912,11 +3055,14 @@ def card(s, width, first=(), indent="    ", commands=False, full=True):
     title = info.get("title") or s.get("title") or ""
     if title.strip() in (s.get("typed") or "", " ".join(s.get("argv") or []), s.get("command") or ""):
         title = ""  # agy records no title; its launch line says nothing new
+    # How long it ran sits after the title, apart from when it ran: it says how
+    # much work the session holds, not when it happened.
+    length = ran(s, info)
     if title:
-        lines.append(paint([(indent + "  ", ""), (title, "1")], width))
-    stats = [(span(info.get("started"), s["last"]), "")]
-    if info.get("started"):
-        stats.append(("  (%s)" % duration(s["last"] - info["started"]), "2"))
+        lines.append(paint(title_segments(indent + "  ", title, length, width), width))
+    stats = when(info.get("started"), s["last"])
+    if length and not title:
+        stats.append(("  ·  ran %s" % length, RAN_COLOR))
     if info.get("model"):
         stats.append(("  ·  %s" % info["model"], "34"))
     use = session_usage(s) or {}
@@ -2994,6 +3140,9 @@ def show_recovery(items, expand_old=False, commands=True, preview=False):
     save_usage_cache()
 
 
+FULL_LIST = "full list"  # what choose() returns when `f` asks for every session
+
+
 def choose(items, expand_old=False, preview=False):
     """Space on a header selects its whole group. Old groups start collapsed and unticked."""
     import termios
@@ -3006,7 +3155,8 @@ def choose(items, expand_old=False, preview=False):
     expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
     details([items[i] for ix in groups if items[ix[0]]["group"] in expanded for i in ix])
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = "  up/down move   space pick group/session   o expand/collapse   a all/none   p details   enter reopen   q quit"
+    help_line = ("  up/down move   space pick group/session   o expand/collapse   a all/none   "
+                 "p details   f every session   enter reopen   q quit")
     drawn = 0
 
     def entries():
@@ -3096,6 +3246,8 @@ def choose(items, expand_old=False, preview=False):
                 picked = [not all(picked)] * len(items)
             elif k == b"p":
                 show_details = not show_details
+            elif k == b"f":
+                return FULL_LIST
             elif k in (b"\r", b"\n"):
                 return [s for s, p in zip(items, picked) if p]
             elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
@@ -3302,6 +3454,9 @@ def main(argv=None):
     ap.add_argument("--history", action="store_true",
                     help="browse every unfinished session grouped by date; --list prints "
                          "the groups, --all shows every date")
+    ap.add_argument("--full", "-f", action="store_true",
+                    help="browse every session you ran, finished or not, grouped by date "
+                         "(like claude --resume, across every harness); f in a picker does the same")
     ap.add_argument("--notify", action="store_true", help="one line if anything died")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--watch", action="store_true", help="run the watcher (systemd does this)")
@@ -3309,7 +3464,7 @@ def main(argv=None):
 
     if args.watch:
         return watch()
-    if args.history:
+    if args.history or args.full:
         if args.yes and not (args.group or args.day):
             print("cgr: --yes with --history needs --group N or --day YYYY-MM-DD; "
                   "without one, pick from --history instead")
@@ -3317,7 +3472,7 @@ def main(argv=None):
         return show_history(everything=args.all, as_json=args.json,
                             list_only=args.list or args.dry_run, groups=args.group,
                             days=args.day, yes=args.yes, expand_old=args.expand_old,
-                            preview=args.preview)
+                            preview=args.preview, full=args.full)
     if args.save:
         items = save()
         if not items:
@@ -3361,7 +3516,8 @@ def main(argv=None):
               "\n     start it: systemctl --user enable --now cgr-watch\n")
     if not items:
         print("cgr: nothing died -- no agent session was cut off since the last boot with agents began"
-              + ("" if args.all else " (--all looks further back)"))
+              + ("" if args.all else " (--all looks further back)")
+            + "\n     every session you ran, finished or not: cgr --full")
         return 0
     if args.forget:
         mark_handled(items)
@@ -3385,6 +3541,8 @@ def main(argv=None):
     else:
         chosen = choose(items, expand_old=args.expand_old, preview=args.preview)
         save_usage_cache()
+        if chosen == FULL_LIST:
+            return show_history(full=True, preview=args.preview)
         if not chosen:
             print("nothing reopened")
             return 0

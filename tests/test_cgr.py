@@ -624,7 +624,11 @@ class CgrTests(unittest.TestCase):
         self.assertIn("1 session: claude", text)
         self.assertIn("carded", text)
         self.assertIn("build the thing", text)
-        self.assertRegex(text, r"\(\dh\d\dm\)")
+        # 2026-11-13: when it ran leads with how long ago it ended; how long it
+        # ran sits after the title, apart from the clock times.
+        self.assertRegex(text, r"build the thing   ran \dh\d\dm")
+        self.assertRegex(text, r"\((\d+h )?\d+m ago\)  \w+day, \w+ \d+(st|nd|rd|th)")
+        self.assertRegex(text, r"\d+:\d\d[ap]m–\d+:\d\d[ap]m")
         self.assertIn("200 out, 1k in (99% cached)", text)
         self.assertIn("2 replies", text)
         self.assertIn("claude --resume carded", text)
@@ -1335,6 +1339,130 @@ class CgrTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             rc = self.cg.main(["--history", *args])
         return rc, out.getvalue()
+
+    def history_picker_keys(self, rows, alt, keys, full=False):
+        """Run choose_history in a pty with `alt` as the `f` set; the picked ids and screen."""
+        data = self.home / "hrows.json"
+        data.write_text(json.dumps([rows, alt]))
+        script = self.home / "hfull.py"
+        script.write_text("import json,sys\n" +
+                          "sys.path.insert(0, " + repr(str(ROOT / "tests")) + ")\n" +
+                          "from test_cgr import load_cgr\n" +
+                          "c=load_cgr()\nrows,alt=json.load(open(sys.argv[1]))\n" +
+                          "got=c.choose_history(rows, c.history_groups(rows), "
+                          "alt=(alt, c.history_groups(alt)), full=%r)\n" % full +
+                          "print('PICKED:'+json.dumps(sorted(r['id'] for r in got)))\n")
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
+                                stdout=slave, stderr=slave)
+        os.close(slave)
+        try:
+            import select
+            output = b""
+
+            def read_until(marker):
+                nonlocal output
+                until = time.monotonic() + 5
+                while marker not in output and time.monotonic() < until:
+                    if select.select([master], [], [], 0.1)[0]:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            break
+
+            read_until(b"enter reopen")
+            for key in keys:
+                os.write(master, key)
+                time.sleep(0.05)
+            read_until(b"PICKED:")
+            self.assertEqual(proc.wait(timeout=2), 0)
+            return json.loads(output.split(b"PICKED:", 1)[1].splitlines()[0]), output
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+
+    def test_ago_counts_days_hours_and_minutes(self):
+        now = 1_000_000_000
+        self.assertEqual(self.cg.ago(now - 20, now), "just now")
+        self.assertEqual(self.cg.ago(now - 12 * 60, now), "12m ago")
+        self.assertEqual(self.cg.ago(now - (5 * 60 + 52) * 60, now), "5h 52m ago")
+        self.assertEqual(self.cg.ago(now - (2 * 1440 + 60 + 3) * 60, now), "2d 1h 3m ago")
+        self.assertEqual(self.cg.ago(now - 40 * 86400 - 7200 - 300, now), "40d 2h ago")
+        self.assertEqual(self.cg.ago_color(now - 60, now), "1;32")
+        self.assertEqual(self.cg.ago_color(now - 8 * 86400, now), "2")
+
+    def test_when_reads_age_then_day_then_clock_times(self):
+        start = time.mktime((2026, 10, 12, 4, 45, 0, 0, 0, -1))
+        end = time.mktime((2026, 10, 12, 17, 56, 0, 0, 0, -1))
+        now = end + (5 * 60 + 52) * 60
+        text = "".join(t for t, _ in self.cg.when(start, end, now=now))
+        self.assertEqual(text, "(5h 52m ago)  Monday, October 12th  4:45am–5:56pm")
+        late = time.mktime((2026, 10, 13, 2, 10, 0, 0, 0, -1))
+        text = "".join(t for t, _ in self.cg.when(end, late, now=late + 60))
+        self.assertEqual(text, "(1m ago)  Monday, October 12th  5:56pm → Tue, Oct 13th 2:10am")
+        # Under a date header (the end's day), an earlier start names its own day.
+        text = "".join(t for t, _ in self.cg.when(end, late, show_day=False, now=late + 60))
+        self.assertEqual(text, "(1m ago)  from Mon, Oct 12th 5:56pm → 2:10am")
+        for day, word in ((1, "1st"), (2, "2nd"), (3, "3rd"), (11, "11th"), (22, "22nd")):
+            t = time.mktime((2026, 10, day, 12, 0, 0, 0, 0, -1))
+            self.assertIn(word, self.cg.day_name(t, now=t))
+        old = time.mktime((2025, 3, 1, 12, 0, 0, 0, 0, -1))
+        self.assertTrue(self.cg.day_name(old, now=now).endswith(", 2025"))
+
+    def test_history_row_keeps_how_long_it_ran_when_the_title_is_cut(self):
+        r = self.indexed_row("claude", "x", title="t" * 300, started=self.crash - 3600)
+        line = re_strip(self.cg.history_row(r, 120))
+        self.assertLessEqual(len(line), 120)
+        self.assertTrue(line.endswith("ran 1h00m"), line)
+        self.assertIn("cut off: status Crashed", line)
+
+    def test_full_lists_finished_sessions_too(self):
+        # 2026-11-13: the operator asked for every session, like claude
+        # --resume, not only the ones that were cut off.
+        rows = self.dated_rows({0: 1}) + [
+            self.indexed_row("jcode", "done", last=self.noon(0) - 99, status="closed", how="exit"),
+            self.indexed_row("jcode", "bot", last=self.noon(0) - 98, status="closed", interactive=0)]
+        _, out = self.history_cli(rows, "--list")
+        self.assertIn(", 1 session", out)
+        _, out = self.history_cli(rows, "--list", "--full")
+        self.assertIn(", 2 sessions", out)
+        self.assertIn("closed: exit", out)
+        self.assertIn("2 you ran, newest first", out)
+        out = io.StringIO()
+        with patch.object(self.cg, "build_index", return_value=(rows, set())), \
+                contextlib.redirect_stdout(out):
+            self.cg.main(["--full", "--list"])
+        self.assertIn(", 2 sessions", out.getvalue())
+
+    def test_f_in_the_recovery_picker_opens_the_full_list(self):
+        self.watched_boot("recent", self.prev, ["/one"])
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        with patch.object(self.cg, "choose", return_value=self.cg.FULL_LIST), \
+                patch.object(self.cg, "show_history", return_value=0) as hist, \
+                patch.object(self.cg.sys.stdin, "isatty", return_value=True), \
+                contextlib.redirect_stdout(Tty()):
+            self.assertEqual(self.cg.main(["--all"]), 0)
+        self.assertTrue(hist.call_args.kwargs["full"])
+
+    def test_history_picker_f_swaps_to_every_session_and_keeps_picks(self):
+        cut = self.dated_rows({0: 2})
+        every = cut + [self.indexed_row("jcode", "done", last=self.noon(0) - 99, status="closed")]
+        # open the date, pick the first; f to every session, open, a picks the rest
+        picked, screen = self.history_picker_keys(cut, every, (b" ", b" ", b"f", b" ", b"a", b"\r"))
+        self.assertEqual(picked, ["d0-0", "d0-1", "done"])
+        self.assertIn(b"f only cut off", screen)
+        self.assertIn(b"every session you ran: 3 sessions", screen)
+
+    def test_history_picker_a_picks_the_rest_without_dropping_other_picks(self):
+        # Regression: `a` on a partly picked date emptied every pick.
+        rows = self.dated_rows({0: 2, 1: 1})
+        keys = (b"\x1b[B", b" ", b" ", b"\x1b[A", b"\x1b[A", b" ", b" ", b"a", b"\r")
+        picked, _ = self.history_picker_keys(rows, rows, keys)
+        self.assertEqual(picked, ["d0-0", "d0-1", "d1-0"])
 
     def test_history_cap_ends_on_a_date_boundary_and_the_header_counts_both(self):
         # 2026-10-18 audit: bad[:40] cut a date mid-way and printed it as if

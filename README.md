@@ -58,7 +58,11 @@ cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
 cgr --save        # before a planned restart: record what runs now
 cgr --history     # browse every unfinished session grouped by date; space opens, space picks
+cgr --full        # every session you ran, finished or not (like claude --resume, all harnesses)
 ```
+
+In either picker, `f` switches to that full list; in `--history` it switches
+back too, and picks are kept across the switch.
 
 Example, after WezTerm crashed on 2026-11-09 and took three agents with it
 (colored in a terminal; prompts shortened here):
@@ -70,13 +74,13 @@ These agent sessions were cut off:
    during the boot of 2026-10-25 13:28 → 2026-11-10 01:51, then crashed
 
    claude   ~/tmp  window closed  e73a12b3-8682-41eb-9105-b0dcca08d26f
-     for the file ...MethCuts.md i want yo to make a single page ...
-     2026-11-09 15:06 → 19:48  (4h42m)  ·  claude-opus-5-5  ·  401.6k out, 141.7M in (99% cached)  ·  319 replies  ·  53.8MB
+     for the file ...MethCuts.md i want yo to make a single page ...   ran 4h42m
+     (5h 52m ago)  Monday, November 9th  3:06pm–7:48pm  ·  claude-opus-5-5  ·  401.6k out, 141.7M in (99% cached)  ·  319 replies  ·  53.8MB
      › didyou fix the 30day skill?
      $ cd /home/cheta/tmp && claude --resume e73a12b3-8682-41eb-9105-b0dcca08d26f
 
    agy      …ignments/ardf-pareto-living-document-v7.2.1  window closed  c686714d-4737-4b6a-afd9-9d9a0a272a73
-     2026-11-07 01:11 → 2026-11-09 19:48  (2d18h)  ·  16.5MB
+     (5h 52m ago)  Saturday, November 7th  1:11am → Mon, Nov 9th 7:48pm  ·  ran 2d18h  ·  16.5MB
      $ cd /home/cheta/LIVING_DOCUMENTS/new_assignments/ardf-pareto-living-document-v7.2.1 && agy --conversation c686714d-...
 ```
 
@@ -87,8 +91,10 @@ sessions of which harnesses. The number is the one `--group N` takes. Under
 the header, each session gets a card:
 
 - harness, folder, how it ended, and the full session id;
-- its title (the first prompt, or the harness's thread name);
-- start → end with the duration, model, tokens (output, input and the share
+- its title (the first prompt, or the harness's thread name), then how long
+  it ran: that says how much work it holds, so it sits apart from the clock;
+- how long ago it ended (bright green within the hour, green today, yellow
+  this week, dim after), the day, and start to end times, then model, tokens (output, input and the share
   of input served from cache; codex reports one total), cost where the
   harness records it, replies, transcript size, git branch, and `mid-turn`
   when it stopped mid-task;
@@ -153,6 +159,7 @@ cgr --history --all    # every date, not just the newest dates holding 40 sessio
 cgr --history --list --group 2 --preview   # one date by its number, with id/msgs/model/last prompt
 cgr --history --list --day 2026-10-09      # one date by name (also expands an old date)
 cgr --history --day 2026-10-09 --yes       # reopen every session of that date, no terminal needed
+cgr --full --list      # the same, for every session you ran, not only the cut-off ones
 sqlite3 -box ~/.local/state/crash-guard/sessions.db 'SELECT * FROM audit'
 ```
 
