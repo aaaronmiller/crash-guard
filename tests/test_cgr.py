@@ -1087,6 +1087,78 @@ class CgrTests(unittest.TestCase):
             self.assertFalse([c for c in text if ord(c) < 32 or 127 <= ord(c) < 160], repr(text))
         self.assertIn("fix?[2J", self.cg.row(s))
 
+    BIDI = "\u202e\u202d\u202a\u2066\u2067\u2068\u2069\u200e\u200f\u061c\u2028\u2029"
+
+    def test_bidi_controls_and_line_separators_are_shown_as_question_marks(self):
+        # They send no escape sequence, but a right-to-left override in a title or a
+        # directory name can make one row read as another (B077 to B079 review).
+        bad = lambda text: [c for c in text if c in self.BIDI]  # noqa: E731
+        s = self.cg.session("codex", "t", "/p" + self.BIDI, time.time(), "machine went down",
+                            "fix" + self.BIDI + " it")
+        s["typed"] = "codex -m y"
+        for text in (self.cg.row(s), self.cg.tab_title(s), self.cg.runnable(s), self.cg.card(s, 100)):
+            self.assertEqual(bad(text), [], repr(text))
+        h = self.cg.history_row({"harness": "claude", "status": "cut off", "how": "x" + self.BIDI,
+                                 "cwd": "/p" + self.BIDI, "started": 1.7e9, "last": 1.7e9 + 60,
+                                 "title": "t" + self.BIDI})
+        self.assertEqual(bad(h), [], repr(h))
+        self.assertEqual(self.cg.clean("a\u202eb"), "a?b")
+        self.assertEqual(self.cg.clean("family \U0001f468\u200d\U0001f469 ok"), "family \U0001f468\u200d\U0001f469 ok")
+
+    def test_epoch_returns_none_for_what_is_not_a_time_instead_of_raising(self):
+        for v in ("2026-13-45T00:00:00Z", "2026-02-30T10:00:00Z", float("nan"), float("inf"), 1e300, 10 ** 400,
+                  "0000-01-01T00:00:00Z", True, None, "yesterday"):
+            self.assertIsNone(self.cg.epoch(v), repr(v))
+        import calendar
+        self.assertEqual(self.cg.epoch("2026-10-01T10:00:00Z"), calendar.timegm((2026, 10, 1, 10, 0, 0)))
+        self.assertEqual(self.cg.epoch(1_790_000_000_000), 1_790_000_000.0)  # milliseconds still work
+
+    def index_with(self, **cols):
+        self.cg.STATE.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(str(self.cg.db_path()))
+        db.executescript(self.cg.SCHEMA)
+        names = ", ".join(["harness", "id"] + list(cols))
+        db.execute("INSERT INTO sessions (%s) VALUES (%s)" % (names, ", ".join("?" * (2 + len(cols)))),
+                   ["claude", "x"] + list(cols.values()))
+        db.commit(); db.close()
+
+    def test_the_history_index_is_not_read_when_another_account_owns_it(self):
+        # ensure_index already refuses a foreign-owned index; agent_activity and details did not.
+        self.index_with(interactive=1, started=1000, last=2000, title="from the index")
+        self.assertEqual(self.cg.own_db(), self.cg.db_path())
+        self.assertTrue(self.cg.agent_activity(900, 1500))
+        s = {"harness": "claude", "id": "x"}
+        self.cg.details([s])
+        self.assertEqual(s["info"].get("title"), "from the index")
+        self.cg.ME = os.getuid() + 1
+        try:
+            self.assertIsNone(self.cg.own_db())
+            self.assertFalse(self.cg.agent_activity(900, 1500))
+            t = {"harness": "claude", "id": "x"}
+            self.cg.details([t])
+            self.assertNotIn("title", t["info"])
+        finally:
+            self.cg.ME = os.getuid()
+
+    def test_a_missing_index_is_not_an_error(self):
+        self.assertIsNone(self.cg.own_db())
+        self.assertFalse(self.cg.agent_activity(0, 10 ** 10))
+
+    def test_windows_terminal_title_escapes_semicolons_like_the_command_does(self):
+        # wt.exe splits its command line on ';', and the title carries the directory name.
+        s = self.cg.session("codex", "t", "/p;new-tab --title pwned", time.time(), "machine went down", "x")
+        s["typed"] = "codex"
+        seen = []
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with patch.object(self.cg.subprocess, "run", fake_run):
+            list(self.cg.open_windows_terminal([s]))
+        argv = seen[0]
+        title = argv[argv.index("--title") + 1]
+        self.assertNotRegex(title, r"(?<!\\);")
+        self.assertIn("\\;", title)
+
     # -- omp and command lines -----------------------------------------------
 
     def omp_session(self, sid, records, when, cwd="/m"):

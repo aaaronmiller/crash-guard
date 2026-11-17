@@ -384,11 +384,24 @@ def last_burst(times):
     return start
 
 
+def own_db():
+    """The --history index when it exists and belongs to this account, else None
+    (ensure_index refuses a foreign-owned index the same way)."""
+    path = db_path()
+    try:
+        return path if path.stat().st_uid == ME else None
+    except OSError:
+        return None
+
+
 def agent_activity(began, ended):
     """An interactive session in the --history index was busy inside the
     interval, or the index cannot say otherwise because it is older than it."""
+    path = own_db()
+    if path is None:
+        return False  # no index (or not ours): the watcher's absence is the evidence
     try:
-        db = sqlite3.connect("file:%s?mode=ro" % db_path(), uri=True)
+        db = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         try:
             return db.execute("SELECT 1 FROM sessions WHERE interactive = 1 AND "
                               "(started BETWEEN ? AND ? OR last BETWEEN ? AND ?) LIMIT 1",
@@ -1608,16 +1621,22 @@ def epoch(v):
     """Seconds since the epoch from the harnesses' assorted timestamps."""
     if isinstance(v, bool) or v is None:
         return None
-    if isinstance(v, (int, float)):
-        return v / 1e6 if v > 1e14 else v / 1000 if v > 1e11 else float(v)
-    m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?$",
-                 str(v).strip())
-    if not m:
+    # A harness store is the user's own, but a corrupt or odd record must not abort the whole list:
+    # anything that is not a plausible time (month 13, NaN, 1e300, year past 9999) is None.
+    try:
+        if isinstance(v, (int, float)):
+            t = v / 1e6 if v > 1e14 else v / 1000 if v > 1e11 else float(v)
+            return t if abs(t) < 253402300800 else None  # False for NaN too
+        m = re.match(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:?\d\d)?$",
+                     str(v).strip())
+        if not m:
+            return None
+        import datetime
+        zone = m.group(4) if m.group(4) not in (None, "Z") else "+00:00"
+        return datetime.datetime.fromisoformat("%sT%s%s%s" % (m.group(1), m.group(2),
+                                                              (m.group(3) or "")[:7], zone)).timestamp()
+    except (ValueError, OverflowError, OSError):
         return None
-    import datetime
-    zone = m.group(4) if m.group(4) not in (None, "Z") else "+00:00"
-    return datetime.datetime.fromisoformat("%sT%s%s%s" % (m.group(1), m.group(2),
-                                                          (m.group(3) or "")[:7], zone)).timestamp()
 
 
 def blocks(content):
@@ -2612,7 +2631,10 @@ def command(s):
 
 # -- showing -----------------------------------------------------------------
 
-CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# C0 and C1 controls, plus the bidirectional controls (marks, embeddings, overrides, isolates) and
+# the line and paragraph separators: they send no escape sequence but can reorder or hide text, so
+# a title or directory name could make one row read as another. Joiners are left alone (emoji).
+CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]")
 
 
 def clean(text):
@@ -2834,8 +2856,11 @@ def details(items):
     The recovery list carries only what proves a session was cut off."""
     want = [s for s in items if "info" not in s]
     rows = {}
+    path = own_db()
     try:
-        db = sqlite3.connect("file:%s?mode=ro" % db_path(), uri=True)
+        if path is None:
+            raise sqlite3.Error("no index of ours")
+        db = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
         try:
             for s in want:
                 if s.get("id"):
@@ -3324,7 +3349,8 @@ def open_windows_terminal(items):
     for s in items:
         # wt.exe splits its own command line on ';', so escape them for the shell.
         argv = [a.replace(";", "\\;") for a in run_argv(s)]
-        r = subprocess.run(["wt.exe", "-w", "0", "new-tab", "--title", tab_title(s), "wsl.exe",
+        # the title carries the directory name, so it needs the same ';' escape as the argv
+        r = subprocess.run(["wt.exe", "-w", "0", "new-tab", "--title", tab_title(s).replace(";", "\\;"), "wsl.exe",
                             *(["-d", distro] if distro else []), "--exec", *argv],
                            capture_output=True, text=True, timeout=15)
         if r.returncode != 0:
