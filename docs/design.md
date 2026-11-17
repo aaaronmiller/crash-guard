@@ -869,7 +869,7 @@ Use a throwaway directory, and never probe while a real crashed session is
 waiting to be restored.
 
 ```bash
-# 0. The suite: 111 cgr tests, 147 in all (2026-10-29). Unset CGR_LAUNCH: a tab cgr
+# 0. The suite: 140 cgr tests, 177 in all (2026-11-17). Unset CGR_LAUNCH: a tab cgr
 #    reopened carries it, and the fake agents in 4 tests inherit it.
 cd /home/cheta/code/crash-guard && env -u CGR_LAUNCH python3 -m pytest tests/test_cgr.py -q && env -u CGR_LAUNCH python3 -m pytest tests -q
 
@@ -1173,7 +1173,8 @@ that `cgr` can read.
 Each row gets one status. The first rule that applies wins:
 
 1. **running**: a live process holds it (`running_sessions()`, Claude's live
-   pid files, or its id on a running command line).
+   pid files, or its id on a running command line; all three are
+   `held_sessions()`). A running row is shown but never reopened (18.7).
 2. **cut off**: the crash path found it (`cut_off(everything=True)`): a
    watcher death or live-set record, a stale Claude pid file, and so on. Its
    `how` is the crash path's: `machine went down`, `window closed`, `killed`,
@@ -1278,6 +1279,11 @@ size, where the session is a file), `model`, `branch`, `path`, `typed`,
 8. **Formats move.** Each reader depends on a private store layout. A reader
    that fails prints `cgr: <harness>: <error>` and the rest still run; re-run
    audit check 8 after a harness upgrade.
+9. **"Running" is only as good as its three signals** (18.7). A session
+   without an id cannot be matched to a process. A claude started with
+   `--continue` names no id and writes its pid file late, so until its
+   transcript is touched it is not seen as running. An agent `harness_of()`
+   does not recognize is invisible to the command-line signal.
 
 
 ## 18. Recovery corrections, 2026-10-13
@@ -1496,3 +1502,70 @@ Two items the T7 session left open:
   them by id, and both pickers already refuse them; keeping them only fed
   `--json` with unreopenable rows. The history view filter and the picker
   refusal stay as defense in depth for rows already in memory.
+
+### 18.7 A running session is never reopened (R17 B077, 2026-11-17)
+
+**The defect.** `cgr --full --yes --day D` reopened every row of the date.
+`full_rows()` keeps every interactive session with an id, finished or not,
+and a `running` row is one of those; nothing between the list and `reopen()`
+looked at the status. Two live agents (one known by its pid file, one only by
+`claude --resume <id>` on a command line) were opened a second time, each
+beside the process that already held its transcript. The listing was right
+about the rows (`running: process alive`) but its date header counted them as
+crashes (`3 crash`), because `history_kind()` called everything that was not
+`saved` or a closed window a crash. Reproduced first by
+`test_full_yes_does_not_reopen_a_session_whose_agent_is_alive` and
+`test_the_full_listing_shows_a_running_session_as_running_not_recoverable`.
+
+**The rule.** A session a live agent holds is shown as running and is never
+reopened, whichever path asked. One definition serves the listing and the
+guard: `held_sessions()` returns the `(harness, id)` pairs of Claude's live pid
+files and of `running_sessions()`, and the words on the command lines of
+running agents. `build_index()` uses it for the status, `drop_running()` for
+the guard.
+
+**Where it applies.** Every path that opens tabs ends in `reopen()`:
+
+| path | guard |
+|---|---|
+| `cgr`, picker | `reopen()` asks `/proc` again before opening |
+| `cgr --yes [--group N]` | the same; the list is built from `collect()`, which already left running sessions out |
+| `cgr --history` and `--full`, picker | `[-]` rows cannot be ticked, `a` skips them; `reopen_history()` drops `running` rows, then `reopen()` asks `/proc` |
+| `cgr --history --yes` and `--full --yes` (`--group`, `--day`) | `show_history()` drops `running` rows before it prints the count it will open |
+| `crash-guard restore` (the old ledger) | not changed and not re-tested here; `restore_groups()` skips any session its own history marks `running` |
+
+The second look matters because a picker can stay open for minutes: a session
+resumed in that time was not running when the list was drawn. A skipped session
+is named on stderr (`cgr: not reopening N sessions, still running: ...`), is
+not marked handled, and is not reported as failed.
+
+**What did not change.** `--full --yes` still reopens closed sessions: the
+owner decided that a date means every session of it. Only the running ones are
+left out.
+
+**Limits.** See 17.7 item 9. The guard is as good as the three signals; a
+session without an id, or a claude started with `--continue` before its pid
+file or transcript shows which session it took, is not seen.
+
+**Test environment, same day.** Four tests read the machine they ran on, and
+the suite failed on a host that differed from the author's:
+
+- `test_a_card_shows_title_span_duration_tokens_and_id` built its timeline
+  from the host's real boot and aged it against the real clock, so after a day
+  of uptime the card read `(1d 0h 40m ago)` and the test's `(\d+h )?\d+m ago`
+  did not match; a boot within three hours of midnight would also have made
+  the card spell out two dates. It now pins the boot and the clock
+  (`pin_host()`), and `watcher_up()` leaves the state a running watcher
+  leaves, so it can also assert that the card is not preceded by the
+  "watcher is not running" warning. `test_cgr_warns_only_when_the_watcher_is_not_running`
+  pins the warning in its three states. The assertions about the card are
+  unchanged.
+- The pty pickers ran in a 0x0 terminal, where `shutil.get_terminal_size`
+  falls back to 120 columns and the footer was cut before "enter reopen"
+  unless the caller had a wide `COLUMNS`. `sized_pty()` sets a real window
+  size and the matching environment.
+- `test_marker_patterns_match_real_files` read this machine's home for
+  markers that exist only while their harness runs (omp's client file goes with
+  the client). It is now `test_marker_patterns_match_the_files_each_harness_writes`,
+  which makes those files in a temporary home, and the live-home variant is
+  skipped when no marker is open.

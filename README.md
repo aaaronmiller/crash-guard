@@ -194,6 +194,18 @@ Each session gets one **status**, with its evidence in the `how` column:
 | `cut off` | it ended without choosing to: machine went down, window closed, killed, a crash status, or no end record where the harness always writes one |
 | `unknown` | the harness keeps no end record and nothing else saw it end (pi, gemini, qwen, opencode) |
 
+A `running` session is listed, in green as `running: process alive`, but it is
+never offered for recovery and never reopened: reopening it would start a
+second copy beside the live one. `--full --yes --day D` and `--group N` leave
+it out and print `cgr: not reopening 2 sessions, still running: claude <id>,
+...`; in the picker its box reads `[-]`, space does nothing on it and `a`
+skips it. `cgr` also asks `/proc` again at the moment it opens tabs, so a
+session you resumed while a list was open is not opened twice, on every path
+(`cgr`, `cgr --yes`, `--history`, `--full`). A date's header counts these apart
+from the crashes (`4 sessions: 2 running, 1 window, 1 closed`), and `--full`
+still reopens the closed ones. A session with no id (a few harnesses keep
+none) cannot be matched to a live process, so it is not checked.
+
 `mid_turn` = 1 means the record stops on your prompt, a tool call, a tool
 result or an error: the agent was still working. The `audit` view lists
 sessions you ran yourself (not SDK, `exec`, subagent or scheduled runs) that
@@ -432,6 +444,7 @@ send escape sequences to your terminal.
 | `cgr: the watcher is not running` | check it: `systemctl --user status cgr-watch`. Not enabled: `systemctl --user enable --now cgr-watch`. Enabled but restarting over and over: `journalctl --user -u cgr-watch -n 20` shows the error |
 | a session you exited is listed | you exited and closed the window within about 2 seconds, or closed the window on purpose. Untick it, or run `cgr --forget` once it is the only one listed |
 | a session you already resumed by hand is listed | it was resumed without its id on the command line (for example `claude --continue`) and the harness has not written its own record yet. Wait a few seconds, or use the exact command from `cgr --list` |
+| `cgr: not reopening N sessions, still running: ...` | an agent process holds each named session (it was resumed in another tab, or never died), so `cgr` left it alone. Switch to that tab. To open it again anyway, exit the live one first and rerun. A claude resumed by id is seen at once, from its command line (`claude --resume <id>`); one started with `--continue` is not seen until its pid file or a touched transcript shows which session it took |
 | a reopened tab runs the wrong command | check the `typed` and `command` fields in `cgr --json`. History is zsh-only; other shells fall back to the process arguments |
 | nothing reopens, commands are printed instead | no tmux, WezTerm or Windows Terminal CLI was usable; run the printed commands |
 | `cgr` is the old restore picker (crash-guard banner) | an `alias cgr=...` shadows the program: remove it from your rc file. A tab opened before you removed it keeps the alias in memory: open a new tab, or run `unalias cgr` there |

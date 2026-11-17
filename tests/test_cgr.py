@@ -3,6 +3,7 @@ watcher, and reopens them with the command you typed -- one test per rule."""
 import importlib.machinery
 import importlib.util
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -12,7 +13,9 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import struct
 import tempfile
+import termios
 import time
 import unittest
 from unittest.mock import patch
@@ -66,6 +69,12 @@ class CgrTests(unittest.TestCase):
         self.cg.WTMP = self.home / "wtmp"
         os.environ["HISTFILE"] = str(self.home / ".zsh_history")
         self.cg.HARNESSES["cgrtestagent"] = (None, None, set())
+        # cgr asks the terminal for its width, and COLUMNS (or a real tty) answers
+        # before the default does; the layout tests want the default, always.
+        width = patch.object(self.cg.shutil, "get_terminal_size",
+                             side_effect=lambda fallback=(80, 24): os.terminal_size(fallback))
+        width.start()
+        self.addCleanup(width.stop)
         self.btime, self.boot_id = self.cg.current_boot()
         self.prev = self.btime - 3 * 3600          # the boot that died
         self.crash = self.btime - 600              # last sign of life in it
@@ -596,10 +605,58 @@ class CgrTests(unittest.TestCase):
         self.assertIn("2 sessions", label)
         self.assertRegex(label, r"20\d\d-\d\d-\d\d \d\d:\d\d")
 
+    # -- a fixed host: boot, clock and watcher ------------------------------
+
+    def pin_host(self, boot, ago_min=40):
+        """Make the rest of the test independent of the machine running it.
+
+        setUp builds its timeline from this host's real boot, and cgr ages a
+        session against the real clock, so the card test failed whenever the
+        host had been up more than a day ("1d 0h 40m ago") or its boot fell
+        within three hours of midnight (the card then spells out two dates).
+        The boot starts at `boot` (a local epoch), and `now` is `ago_min`
+        minutes after the crash that ended the previous one."""
+        self.btime = int(boot)
+        self.prev, self.crash = self.btime - 3 * 3600, self.btime - 600
+        self.write_wtmp([self.prev - 86400, self.prev, self.btime + 90])
+
+        class Clock:  # the time module, except what time it is
+            def __init__(self, now):
+                self.now = now
+
+            def time(self):
+                return self.now
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+        for p in (patch.object(self.cg, "current_boot", return_value=(self.btime, self.boot_id)),
+                  patch.object(self.cg, "time", Clock(self.crash + ago_min * 60))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def watcher_up(self):
+        """The state a running cgr-watch leaves: watch.pid naming a live process
+        whose command line says --watch, for this boot."""
+        script = self.home / "cgr-watch.py"
+        script.write_text("import time\ntime.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, str(script), "--watch"], start_new_session=True)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        for _ in range(100):  # until the exec has replaced the forked copy's argv
+            if self.cg.proc_argv(p.pid)[-1:] == ["--watch"]:
+                break
+            time.sleep(0.05)
+        d = self.cg.watch_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "watch.pid").write_text("%d %s\n" % (p.pid, self.boot_id))
+        return p
+
     def test_a_card_shows_title_span_duration_tokens_and_id(self):
         # 2026-11-10: the operator asked for each event to read "from <time> to
         # <time>", with every session under it showing where, how long, tokens,
         # id and title, in `cgr` and `cgr --all` alike.
+        self.pin_host(time.mktime((2026, 11, 10, 12, 0, 0, 0, 0, -1)))
+        self.watcher_up()
         reply = lambda mid, **u: {"type": "assistant", "message": {
             "id": mid, "role": "assistant", "content": "ok", "usage": u}}
         self.pidfile(999990, "carded", "/w", self.prev + 60, 1)
@@ -620,6 +677,7 @@ class CgrTests(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self.assertEqual(self.cg.main(["--list"]), 0)
         text = out.getvalue()
+        self.assertNotIn("the watcher is not running", text)
         self.assertIn("━━ #1 window closed · ", text)
         self.assertIn("1 session: claude", text)
         self.assertIn("carded", text)
@@ -634,6 +692,18 @@ class CgrTests(unittest.TestCase):
         self.assertIn("claude --resume carded", text)
         self.assertEqual(json.loads((self.cg.STATE / "usage.json").read_text())
                          .popitem()[1][2:], [1000, 200, 0, 2, 990])
+
+    def test_cgr_warns_only_when_the_watcher_is_not_running(self):
+        def listing():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.cg.main(["--list"])
+            return out.getvalue()
+        self.assertIn("cgr: the watcher is not running", listing())
+        self.watcher_up()
+        self.assertNotIn("the watcher is not running", listing())
+        (self.cg.watch_dir() / "watch.pid").write_text("%d other-boot\n" % os.getpid())
+        self.assertIn("cgr: the watcher is not running", listing())  # a watcher of another boot
 
     def test_a_title_that_is_only_the_launch_line_is_not_repeated(self):
         s = dict(self.cg.session("agy", "c1", "/w", self.crash, "window closed",
@@ -699,6 +769,16 @@ class CgrTests(unittest.TestCase):
         self.assertIn("1 session: kilo", output.getvalue())
 
 
+    def sized_pty(self, rows=40, cols=200):
+        """A pty with a real window size, and the environment a child must read it with.
+
+        A bare pty is 0x0, so cgr falls back to its default width and cuts the
+        picker's footer ("enter reopen") off: whether a test saw it then
+        depended on the COLUMNS of whoever ran the suite."""
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        return master, slave, dict(os.environ, COLUMNS=str(cols), LINES=str(rows))
+
     def picker_keys(self, items, keys):
         data = self.home / "picker.json"; data.write_text(json.dumps(items))
         script = self.home / "picker.py"
@@ -707,9 +787,9 @@ class CgrTests(unittest.TestCase):
                           "from test_cgr import load_cgr\n" +
                           "c=load_cgr()\nitems=json.load(open(sys.argv[1]))\n" +
                           "picked=c.choose(items)\nprint('PICKED:'+json.dumps([s['cwd'] for s in picked]))\n")
-        master, slave = pty.openpty()
+        master, slave, env = self.sized_pty()
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
-                                stdout=slave, stderr=slave)
+                                stdout=slave, stderr=slave, env=env)
         os.close(slave)
         try:
             import select
@@ -1424,9 +1504,9 @@ class CgrTests(unittest.TestCase):
                           "got=c.choose_history(rows, c.history_groups(rows), "
                           "alt=(alt, c.history_groups(alt)), full=%r)\n" % full +
                           "print('PICKED:'+json.dumps(sorted(r['id'] for r in got)))\n")
-        master, slave = pty.openpty()
+        master, slave, env = self.sized_pty()
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
-                                stdout=slave, stderr=slave)
+                                stdout=slave, stderr=slave, env=env)
         os.close(slave)
         try:
             import select
@@ -1571,6 +1651,116 @@ class CgrTests(unittest.TestCase):
                 self.assertEqual(self.cg.main(["--history", "--yes", "--group", "2"]), 0)
         self.assertEqual({s["id"] for s in reopen.call_args[0][0]}, {"d1-0", "d1-1", "d1-2"})
 
+    # -- a running session is never reopened (R17 B077) ----------------------
+
+    def live_agent(self, *args):
+        """A fake agent process alive now. `claude.py` is a harness name to cgr,
+        and its own session keeps it off any terminal, so the real cgr-watch
+        never records it."""
+        script = self.home / "claude.py"
+        script.write_text("import time\ntime.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, str(script), *args], start_new_session=True)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        for _ in range(100):  # until the exec has replaced the forked copy's argv
+            if self.cg.proc_argv(p.pid)[-len(args):] == list(args) and self.cg.proc_ticks(p.pid):
+                break
+            time.sleep(0.05)
+        return p
+
+    def sessions_of_a_busy_day(self):
+        """Four claude sessions of one date: two ended, two with a live agent
+        (one known by its pid file, one only by a running command line)."""
+        t = time.time() - 3600
+        self.transcript("gone", [prompt("one"), REPLY, exit_marker("other")], t)
+        self.transcript("done", [prompt("two"), REPLY, exit_marker("prompt_input_exit")], t - 5)
+        self.transcript("pidfiled", [prompt("three"), REPLY], t - 10)
+        self.transcript("named", [prompt("four"), REPLY], t - 15)
+        filed = self.live_agent()
+        self.pidfile(filed.pid, "pidfiled", "/w", time.time() - 30, self.cg.proc_ticks(filed.pid))
+        self.live_agent("--resume", "named")
+        return time.strftime("%Y-%m-%d", time.localtime(t))
+
+    def history_cli_live(self, *args):
+        """`cgr --history ARGS` against the fake home and the real /proc."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.cg.main(list(args))
+        return rc, out.getvalue()
+
+    def test_full_yes_does_not_reopen_a_session_whose_agent_is_alive(self):
+        # R17 B077: `cgr --full --yes --day D` reopened every session of D,
+        # including the ones still running in another tab.
+        day = self.sessions_of_a_busy_day()
+        err = io.StringIO()
+        with patch.object(self.cg, "reopen", return_value=0) as reopen, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(self.cg.main(["--full", "--yes", "--day", day]), 0)
+        self.assertEqual({s["id"] for s in reopen.call_args[0][0]}, {"gone", "done"})
+        self.assertIn("still running", err.getvalue())
+
+    def test_the_full_listing_shows_a_running_session_as_running_not_recoverable(self):
+        day = self.sessions_of_a_busy_day()
+        _, out = self.history_cli_live("--full", "--list", "--day", day)
+        text = re_strip(out)
+        for title in ("three", "four"):  # the pid-file session and the command-line one
+            (line,) = [l for l in text.splitlines() if l.rstrip().endswith(title)]
+            self.assertIn("running: process alive", line)
+            self.assertNotIn("cut off", line)
+        # the date counts them as running, not as the crashes they were once taken for
+        self.assertRegex(text, r"\[%s, 4 sessions: 2 running, 1 window, 1 closed\]" % day)
+        self.assertNotIn("crash", text)
+
+    def test_a_running_session_does_not_set_the_color_of_its_date(self):
+        label = lambda *kinds: self.cg.history_group_label("2026-11-10", [
+            self.indexed_row("jcode", "r%d" % i, status=st, how=how, last=self.crash)
+            for i, (st, how) in enumerate(kinds)])
+        with patch.object(self.cg, "USE_COLOR", True):
+            running = ("running", "process alive")
+            self.assertIn("\x1b[1;32m", label(running, running))                        # nothing to recover
+            self.assertIn("\x1b[1;31m", label(running, running, ("cut off", "status Crashed")))
+            self.assertIn("\x1b[1;33m", label(running, ("cut off", "window closed")))
+        self.assertIn("2 running, 1 crash", re_strip(label(
+            ("running", "process alive"), ("running", "process alive"), ("cut off", "x"))))
+
+    def test_history_yes_does_not_reopen_a_session_whose_agent_is_alive(self):
+        # The cut-off list (no --full) already left running sessions out; this
+        # pins it, with one resumed by hand after its window closed.
+        day = self.sessions_of_a_busy_day()
+        self.transcript("hup", [prompt("five"), REPLY, exit_marker("other")], time.time() - 3600 - 20)
+        self.live_agent("--resume", "hup")  # resumed by hand after its window closed
+        with patch.object(self.cg, "reopen", return_value=0) as reopen, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.cg.main(["--history", "--yes", "--day", day]), 0)
+        self.assertEqual({s["id"] for s in reopen.call_args[0][0]}, {"gone"})
+
+    def test_reopen_asks_again_so_a_list_gone_stale_cannot_start_a_second_copy(self):
+        # The recovery picker (`cgr`, `cgr --yes`) lists sessions nobody holds,
+        # then waits for you. One resumed meanwhile must not be opened again.
+        self.live_agent("--resume", "late")
+        late = self.cg.session("claude", "late", str(self.home), self.crash, "window closed", "t")
+        free = self.cg.session("claude", "free", str(self.home), self.crash, "window closed", "t")
+        err = io.StringIO()
+        with patch.dict(os.environ, {"TMUX": "x"}), \
+                patch.object(self.cg.shutil, "which", return_value="/fake/tmux"), \
+                patch.object(self.cg, "open_tmux", side_effect=lambda items, inside: iter(items)) as opener, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(self.cg.reopen([late, free]), 0)
+        self.assertEqual([s["id"] for s in opener.call_args[0][0]], ["free"])
+        self.assertIn("claude late", err.getvalue())
+        self.assertEqual(list(self.cg.load_handled()), [self.cg.key(free)])  # late stays unhandled
+
+    def test_the_history_picker_shows_a_running_session_but_cannot_pick_it(self):
+        rows = self.dated_rows({0: 2})
+        rows[0].update(status="running", how="process alive")
+        # open the date (the cursor enters it, on the running row), space does
+        # nothing there, `a` ticks the rest of the date, enter reopens
+        picked, screen = self.history_picker_keys(rows, rows, (b" ", b" ", b"a", b"\r"))
+        self.assertEqual(picked, ["d0-1"])            # the running one is never ticked
+        self.assertIn(b"[-] ", screen)                # drawn as not pickable
+        self.assertIn(b"[x] ", screen)
+        picked, _ = self.history_picker_keys(rows, rows, (b" ", b" ", b"\r"))
+        self.assertEqual(picked, [])                  # space on it picked nothing
+
     def test_history_preview_prints_a_line_under_each_session(self):
         rows = self.dated_rows({0: 1}, messages=42, model="opus", last_prompt="fix the thing")
         _, plain = self.history_cli(rows, "--list")
@@ -1605,9 +1795,9 @@ class CgrTests(unittest.TestCase):
                           "c=load_cgr()\nrows=json.load(open(sys.argv[1]))\n" +
                           "got=c.choose_history(rows, c.history_groups(rows), preview=True)\n" +
                           "print('PICKED:'+json.dumps([r['id'] for r in got]))\n")
-        master, slave = pty.openpty()
+        master, slave, env = self.sized_pty()
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
-                                stdout=slave, stderr=slave)
+                                stdout=slave, stderr=slave, env=env)
         os.close(slave)
         try:
             import select

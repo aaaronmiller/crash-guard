@@ -1328,6 +1328,38 @@ def running_words():
     return words
 
 
+def held_sessions():
+    """What agents running now hold: ({(harness, id)}, the words on their
+    command lines). A session in either is running: the listings mark it so
+    and nothing reopens it. Read fresh from /proc and the harness pid files,
+    so it is right at the moment of the question, not when a list was drawn."""
+    live, _ = claude_pids(boot_start()[0])
+    held = {("claude", sid) for sid in live}
+    held |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
+    return held, running_words()
+
+
+def is_held(s, held, named):
+    return bool(s["id"]) and ((s["harness"], s["id"]) in held or s["id"] in named)
+
+
+def drop_running(items, rescan=True):
+    """`items` without the sessions a live agent holds; those are named on
+    stderr. Reopening one starts a second copy beside the first, two writers
+    on one transcript, so every path that reopens goes through this. A row
+    that says `running` is dropped on its word; `rescan` also asks /proc now,
+    because a picker can sit open for minutes after its list was drawn."""
+    held, named = held_sessions() if rescan and items else (set(), set())
+    kept, busy = [], []
+    for s in items:
+        (busy if s.get("status") == "running" or is_held(s, held, named) else kept).append(s)
+    if busy:
+        print("cgr: not reopening %d session%s, still running: %s" % (
+            len(busy), "" if len(busy) == 1 else "s",
+            ", ".join(clean("%s %s" % (s["harness"], s["id"])) for s in busy)), file=sys.stderr)
+    return kept
+
+
 def load_handled():
     try:
         return json.loads(read_own(STATE / "cgr-handled.json"))
@@ -2162,11 +2194,7 @@ def build_index():
         if r["exit_record"] and r["harness"] in WRITES_EXIT:
             first[r["harness"]] = min(first.get(r["harness"], r["last"] or 0),
                                       r["started"] or r["last"] or 0)
-    btime = boot_start()[0]
-    live, _ = claude_pids(btime)
-    running = {("claude", sid) for sid in live}
-    running |= {(s["harness"], s["id"]) for s in running_sessions() if s["id"]}
-    named = running_words()
+    running, named = held_sessions()
     # A `cgr --save` record is cut-off evidence once its process is gone: you
     # named this exact session for reopening, so it stays `saved` (green)
     # even when the harness also wrote a deliberate exit record. Exiting
@@ -2369,6 +2397,7 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
     total = sum(len(g) for _, g in every)
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if yes:
+        shown_rows = drop_running(shown_rows, rescan=False)  # the count below is what opens
         print("\nReopening %d session%s from %d date%s" % (
             len(shown_rows), "" if len(shown_rows) == 1 else "s", len(shown), "" if len(shown) == 1 else "s"))
         return reopen_history(shown_rows)
@@ -2410,6 +2439,8 @@ def history_groups(rows):
 
 def history_kind(r):
     how = r.get("how")
+    if r.get("status") in ("running", "closed"):
+        return r["status"]  # a live or finished session is not a crash, whatever `how` says
     return "saved" if how == "saved" else "window" if how in ("window closed", "killed") else "crash"
 
 
@@ -2422,14 +2453,17 @@ def history_group_label(day, rows):
     counts = {}
     for r in rows:
         counts[history_kind(r)] = counts.get(history_kind(r), 0) + 1
+    # The color is the worst thing to recover; running and closed sessions
+    # need no recovery, so they neither set it nor hide a crash.
+    need = max([counts.get(k, 0) for k in ("saved", "window", "crash")])
     code = "32"
     for kind, c in (("window", "33"), ("crash", "31")):  # later wins a tie
-        if counts.get(kind, 0) and counts[kind] >= max(counts.values()):
+        if counts.get(kind, 0) and counts[kind] >= need:
             code = c
     detail = ""
     if len(counts) > 1:
-        detail = ": " + ", ".join("%d %s" % (counts[k], k) for k in ("saved", "window", "crash")
-                                  if k in counts)
+        detail = ": " + ", ".join("%d %s" % (counts[k], k) for k in (
+            "running", "saved", "window", "crash", "closed") if k in counts)
     label = "%s  [%s, %d session%s%s]" % (stamp, day, len(rows), "" if len(rows) == 1 else "s", detail)
     return _c(label, "1;" + code)
 
@@ -2469,18 +2503,27 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
                 rows_out.extend((day, r) for r in grows)
         return rows_out
 
+    def pickable(grows):
+        """A running session is shown but cannot be ticked: reopening it
+        would start a second copy beside the live one."""
+        return [x for x in grows if x.get("status") != "running"]
+
     def lines_of(day, r):
         """The screen lines of one entry; only the first is the highlighted one."""
         if day is None:
             return [title_line()]
         if r is None:
             grows = dict(groups)[day]
-            n = len(picked & {(x["harness"], x["id"]) for x in grows})
-            tick = "x" if n == len(grows) and grows else "+" if n else " "
+            able = pickable(grows)
+            n = len(picked & {(x["harness"], x["id"]) for x in able})
+            tick = "x" if n == len(able) and able else "+" if n else " "
             marker = "-" if day == open_day else "+"
             return ["%s [%s] %s" % (marker, tick, history_group_label(day, grows))]
         key = (r["harness"], r["id"])
-        head = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
+        if r.get("status") == "running":
+            head = "    " + _c("[-] ", "2")
+        else:
+            head = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
         out = [head + history_row(r, width - 8)]
         if preview and preview_line(r):
             out.append("        " + preview_line(r))
@@ -2548,11 +2591,11 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
                         cur = next(i for i, e in enumerate(entries()) if e[0] == day and e[1] is not None)
                     else:
                         cur = next(i for i, e in enumerate(entries()) if e == (day, None))
-                else:
+                elif r.get("status") != "running":
                     key = (r["harness"], r["id"])
                     picked.discard(key) if key in picked else picked.add(key)
             elif k == b"a" and len(ents) > 1:
-                grows = dict(groups)[ents[cur][0]]
+                grows = pickable(dict(groups)[ents[cur][0]])
                 keys = {(x["harness"], x["id"]) for x in grows}
                 # All picked: unpick them. Otherwise pick the rest, keeping other dates.
                 picked = picked - keys if keys <= picked else picked | keys
@@ -3373,7 +3416,7 @@ def open_tmux(items, inside):
 
 def reopen(items):
     """Open each item in a new tab of the terminal cgr was run from."""
-    requested = items
+    requested = drop_running(items)
     items = []
     for s in requested:
         if Path(s["cwd"]).is_dir():
@@ -3415,7 +3458,7 @@ def reopen(items):
 def reopen_history(rows):
     """Reopen `cgr --history` picks, which name the session but not the window."""
     items = []
-    for r in rows:
+    for r in drop_running(rows, rescan=False):  # reopen() asks /proc again
         if str(r["id"]).startswith("@"):
             print("cgr: %s %s has no session id; reopen it with `cgr` or by hand"
                   % (r["harness"], clean(r["id"])), file=sys.stderr)
