@@ -274,6 +274,24 @@ cannot see it. Only the watcher's live set (section 6.4) covers it. Why some
 sessions skip the file has not been investigated (it may be written on the
 first prompt).
 
+**Limit: the pid file can name a session the process has left (2026-11-17).**
+Claude can carry a running session on in a new transcript without a restart.
+The old transcript gains `{"type":"continued-in","continuedInSessionId":...}`,
+but the pid file and the `SessionEnd` hook keep naming the old id. On
+2026-11-16 at 23:59 PST, pid 1918 (`claude --resume 83481486`) moved into
+70a55956 and worked there for 32 hours. When the machine went down on
+2026-11-17 at 08:18, the watcher recorded 83481486 and `cgr` reopened it,
+without the 32 hours. The default view listed nothing else, so the real
+session was offered only under `--all`.
+
+`cgr` now follows `continued-in` records (`claude_current()`):
+- when it resolves a dead process;
+- in the native scan (`superseded()`);
+- in the index, where such a transcript reads "closed: continued in <id>".
+
+A user or assistant message written after the record means the old id was
+resumed again, so the old id is kept.
+
 **Why this signal and not the older one.** `cg-forensic` used
 `~/.claude/security_warnings_state_<id>.json`, which is never removed (198
 files against 20 sessions on 2026-08-19). A marker that is never removed

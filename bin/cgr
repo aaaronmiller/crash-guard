@@ -1048,6 +1048,8 @@ def claude(since, btime, live, dead):
             how = "machine went down" if last < btime else "killed"
         else:
             continue  # closed on purpose, or no evidence either way
+        if superseded(path):
+            continue  # its process carried on in another transcript; that one is the session
         entry, cwd, title = head(path)
         if entry not in (None, "cli") or not title:
             continue
@@ -1060,6 +1062,58 @@ def claude(since, btime, live, dead):
 def claude_transcript(sid):
     found = glob.glob(str(HOME / ".claude" / "projects" / "*" / (sid + ".jsonl")))
     return found[0] if found else None
+
+
+CLAUDE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
+CONVERSED = re.compile(rb'"type":\s*"(?:user|assistant)"')
+
+
+def continued_in(path):
+    """The session this transcript says it carried on in, else None.
+
+    Claude can move a running session into a new transcript without restarting:
+    the old file gains {"type":"continued-in","continuedInSessionId":...}, while
+    the pid file and the SessionEnd hook keep naming the old id. A message
+    written after that record means the old id was resumed again and is current.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    at = data.rfind(b'"continued-in"')
+    if at < 0:
+        return None
+    start = data.rfind(b"\n", 0, at) + 1
+    end = data.find(b"\n", at)
+    end = len(data) if end < 0 else end
+    if CONVERSED.search(data, end):
+        return None
+    try:
+        rec = json.loads(data[start:end])
+    except ValueError:
+        return None
+    nxt = rec.get("continuedInSessionId") if rec.get("type") == "continued-in" else None
+    return nxt if isinstance(nxt, str) and CLAUDE_ID.match(nxt) else None
+
+
+def superseded(path):
+    """The id of the transcript this one carried on in, when that transcript exists."""
+    nxt = continued_in(path)
+    return nxt if nxt and claude_transcript(nxt) else None
+
+
+def claude_current(sid):
+    """Follow continued-in records from `sid` to the transcript the process last wrote."""
+    path, seen = claude_transcript(sid), {sid}
+    while path:
+        nxt = continued_in(path)
+        nxt_path = nxt and nxt not in seen and claude_transcript(nxt)
+        if not nxt_path:
+            break
+        sid, path = nxt, nxt_path
+        seen.add(sid)
+    return sid, path
 
 
 def claude_in(cwd, since, live, taken, until=None):
@@ -1247,9 +1301,9 @@ def resolve(rec, live, taken):
             for _, _, title, updated, _ in codex_threads("id = ?", (named,)):
                 hit.update(title=title or "", last=updated)
     elif h == "claude":
-        path = rec.get("session") and claude_transcript(rec["session"])
+        sid, path = claude_current(rec["session"]) if rec.get("session") else (None, None)
         if path:
-            hit = session(h, rec["session"], cwd, mtime(path), rec["how"], head(path)[2])
+            hit = session(h, sid, cwd, mtime(path), rec["how"], head(path)[2])
         else:
             found = claude_in(cwd, since, live, taken, rec["last"] + 5)
             if found:
@@ -1820,6 +1874,10 @@ def index_claude():
                   mid_turn=mid, last_prompt=prompt, model=model, branch=meta.get("branch"))
         r["verdict"] = exit_verdict(end) or (
             None if source == "cli" else ("unknown", "%s run: no end record" % source))
+        if r["verdict"] and r["verdict"][0] == "cut off":
+            nxt = superseded(path)
+            if nxt:
+                r["verdict"] = ("closed", "continued in %s" % nxt)
         yield r
 
 

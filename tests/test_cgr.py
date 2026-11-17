@@ -533,6 +533,31 @@ class CgrTests(unittest.TestCase):
         self.shutdown_at(self.crash)
         self.assertEqual(self.found()[("claude", "again")]["last"], self.crash)
 
+    def continued_death(self, after_fork=()):
+        """A claude whose pid file still names `old` after it carried on in `new`."""
+        moved = {"type": "continued-in", "sessionId": "old", "continuedInSessionId": "new"}
+        self.transcript("old", [prompt("hi"), REPLY, moved, exit_marker("other")] + list(after_fork),
+                        self.crash)
+        self.transcript("new", [prompt("hi"), REPLY, prompt("later work"), REPLY], self.crash - 60)
+        d = self.cg.watch_dir(); d.mkdir(parents=True, exist_ok=True)
+        r = {"pid": 7, "ticks": "1", "started": self.btime + 100, "harness": "claude",
+             "argv": ["claude", "--resume", "old"], "cwd": "/w", "boot": self.boot_id,
+             "session": "old", "died": self.btime + 200}
+        (d / "deaths.jsonl").write_text(json.dumps(r) + "\n")
+        return self.found()
+
+    def test_a_claude_that_continued_in_a_new_transcript_reopens_the_new_one(self):
+        # 2026-11-17: pid 1918 ran `claude --resume 83481486`, carried on in
+        # 70a55956 for 32 hours, and cgr reopened the stale 83481486.
+        found = self.continued_death()
+        self.assertIn(("claude", "new"), found)
+        self.assertNotIn(("claude", "old"), found)
+        self.assertEqual(self.cg.command(found[("claude", "new")]), "claude --resume new")
+
+    def test_a_continued_session_resumed_again_under_its_old_id_stays_old(self):
+        found = self.continued_death(after_fork=[prompt("back on the old id"), REPLY])
+        self.assertIn(("claude", "old"), found)
+
     def test_two_dead_agents_in_one_place_without_ids_reopen_once(self):
         d = self.cg.watch_dir()
         d.mkdir(parents=True)
