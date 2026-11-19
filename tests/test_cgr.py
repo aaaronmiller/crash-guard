@@ -1517,7 +1517,7 @@ class CgrTests(unittest.TestCase):
             rc = self.cg.main(["--history", *args])
         return rc, out.getvalue()
 
-    def history_picker_keys(self, rows, alt, keys, full=False):
+    def history_picker_keys(self, rows, alt, keys, full=False, cols=200):
         """Run choose_history in a pty with `alt` as the `f` set; the picked ids and screen."""
         data = self.home / "hrows.json"
         data.write_text(json.dumps([rows, alt]))
@@ -1529,7 +1529,7 @@ class CgrTests(unittest.TestCase):
                           "got=c.choose_history(rows, c.history_groups(rows), "
                           "alt=(alt, c.history_groups(alt)), full=%r)\n" % full +
                           "print('PICKED:'+json.dumps(sorted(r['id'] for r in got)))\n")
-        master, slave, env = self.sized_pty()
+        master, slave, env = self.sized_pty(cols=cols)
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
                                 stdout=slave, stderr=slave, env=env)
         os.close(slave)
@@ -1547,7 +1547,7 @@ class CgrTests(unittest.TestCase):
                         except OSError:
                             break
 
-            read_until(b"enter reopen")
+            read_until(b"up/down move")
             for key in keys:
                 os.write(master, key)
                 time.sleep(0.05)
@@ -1633,6 +1633,30 @@ class CgrTests(unittest.TestCase):
         self.assertEqual(picked, ["d0-0", "d0-1", "done"])
         self.assertIn(b"f only cut off", screen)
         self.assertIn(b"every session you ran: 3 sessions", screen)
+
+    def test_history_picker_lines_never_wrap_on_a_narrow_terminal(self):
+        # 2026-11-19: on an 80- or 120-column terminal the picker scrambled
+        # itself once a date was opened. A session row was the terminal width
+        # plus its 10-column tick and cursor, and the resume line was never
+        # cut, so each wrapped onto a second screen row. The redraw moves up
+        # one row per line it drew, so every key then redrew from the wrong
+        # row and left old lines behind.
+        long = self.indexed_row("claude", "wide", last=self.noon(0) + 5,
+                                cwd="/w/" + "deep/" * 20, title="emoji 🚀 漢字 " + "t" * 300,
+                                resume="cd /w/" + "deep/" * 30 + " && claude --resume wide")
+        rows = [long] + self.dated_rows({0: 2, 1: 1})
+        cols = 80
+        picked, screen = self.history_picker_keys(
+            rows, rows, (b" ", b" ", b"\x1b[B", b"\x1b[B", b"\x1b[B", b"a", b"f", b"f", b"\r"),
+            cols=cols)
+        self.assertEqual(picked, ["d1-0", "wide"])
+        import re
+        import unicodedata
+        text = screen.decode("utf-8", "replace").split("PICKED:")[0]
+        for line in re.split(r"[\r\n]", re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)):
+            width = sum(0 if unicodedata.combining(ch) else
+                        2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in line)
+            self.assertLess(width, cols, line)
 
     def test_history_picker_a_picks_the_rest_without_dropping_other_picks(self):
         # Regression: `a` on a partly picked date emptied every pick.

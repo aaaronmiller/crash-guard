@@ -62,6 +62,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 NO_COLOR = os.environ.get("NO_COLOR")
@@ -2421,7 +2422,17 @@ def full_rows(rows):
 
 def show_history(everything=False, as_json=False, list_only=False, groups=None, days=None,
                  yes=False, expand_old=False, preview=False, full=False):
+    # Reading every transcript takes 8-16 s. Silent, `f` in the recovery
+    # picker looked dead, and keys pressed meanwhile echoed as junk and were
+    # then dropped when the next picker took the terminal.
+    loading = sys.stdout.isatty() and not as_json
+    if loading:
+        sys.stdout.write(_c("cgr: reading every session from every harness…", "2"))
+        sys.stdout.flush()
     rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
+    if loading:
+        sys.stdout.write("\r\x1b[K")
+        sys.stdout.flush()
     if as_json:
         print(json.dumps(rows, indent=1))
         return 0
@@ -2544,8 +2555,13 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
 
     def help_line():
         swap = ("   f only cut off" if full else "   f every session") if alt is not None else ""
-        return ("  up/down move   space open group / pick session   "
+        text = ("  up/down move   space open group / pick session   "
                 "a all/none in group%s   enter reopen   q quit" % swap)
+        if len(text) < width:
+            return text
+        # Cut short, the long one hid how to reopen and quit.
+        swap = ("  f cut off" if full else "  f every") if alt is not None else ""
+        return "  ↑↓ move  space open/pick  a all%s  enter reopen  q quit" % swap
 
     def title_line():
         n = len(rows)
@@ -2582,17 +2598,19 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
             head = "    " + _c("[-] ", "2")
         else:
             head = "    " + _c("[x] " if key in picked else "[ ] ", "1;32" if key in picked else "2")
-        out = [head + history_row(r, width - 8)]
+        # 8 for the tick, 2 for the cursor draw() puts in front, 1 spare so
+        # the line never fills the last column.
+        out = [head + history_row(r, width - 11)]
         if preview and preview_line(r):
             out.append("        " + preview_line(r))
         if r.get("resume"):
-            out.append("        " + _c(r["resume"], "2"))
+            out.append(paint([("        ", ""), (r["resume"], "2")], width - 3))
         return out
 
     def draw(first):
-        nonlocal drawn, top
+        nonlocal drawn, top, width
         ents = entries()
-        height = shutil.get_terminal_size((120, 24)).lines
+        width, height = shutil.get_terminal_size((120, 24))
         budget = max(2, height - 2)
         shown = [lines_of(day, r) for day, r in ents]
         top = min(top, cur)
@@ -2604,7 +2622,7 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
                 break
             for n, text in enumerate(shown[pos][:max(1, budget - used)]):
                 here = pos == cur and n == 0
-                screen.append(_c("▶ ", "1;36") + text if here else "  " + text)
+                screen.append(fit(_c("▶ ", "1;36") + text if here else "  " + text, width - 1))
             used = len(screen)
         out = [] if first else ["\r\x1b[%dA" % drawn]
         out.extend("\r\x1b[K" + line + "\n" for line in screen)
@@ -2612,7 +2630,7 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
             out.extend("\r\x1b[K\n" for _ in range(drawn - len(screen)))
             out.append("\r\x1b[%dA" % (drawn - len(screen)))
         drawn = len(screen)
-        out.append("\r\x1b[K" + _c(help_line()[:width - 1], "2"))
+        out.append("\r\x1b[K" + fit(_c(help_line(), "2"), width - 1))
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
@@ -2832,10 +2850,58 @@ def paint(segs, width=None):
             room = width - used
             if room <= 0:
                 break
-            if len(text) > room:
-                text = text[:max(0, room - 1)] + "…"
-        used += len(text)
+            if cols_of(text) > room:
+                text = cut_cols(text, max(0, room - 1)) + "…"
+        used += cols_of(text)
         out.append(_c(text, code) if code else text)
+    return "".join(out)
+
+
+def char_cols(ch):
+    """Terminal columns one character takes: emoji and CJK take two, a
+    combining mark or joiner none. Counting characters instead made titles
+    with emoji wider than their cut."""
+    if unicodedata.combining(ch) or ch in "​‍︎️":
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def cols_of(text):
+    return sum(char_cols(ch) for ch in text)
+
+
+def cut_cols(text, n):
+    """The longest start of plain text that fits `n` columns."""
+    out, used = [], 0
+    for ch in text:
+        used += char_cols(ch)
+        if used > n:
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+SGR = re.compile(r"(\x1b\[[0-9;]*m)")
+
+
+def fit(line, cols):
+    """A drawn picker line cut to `cols` columns, its color escapes kept whole.
+    A line as wide as the terminal or wider wraps onto a second row, and the
+    pickers redraw by moving up one row per line drawn, so one wrapped line
+    shifts every later redraw and leaves old lines on screen."""
+    out, used = [], 0
+    for part in SGR.split(line):
+        if not part or SGR.fullmatch(part):
+            out.append(part)
+            continue
+        room = cols - used
+        if cols_of(part) <= room:
+            out.append(part)
+            used += cols_of(part)
+            continue
+        out.append(cut_cols(part, max(0, room - 1)) + ("…" if room > 0 else ""))
+        out.append(color("0"))
+        break
     return "".join(out)
 
 
@@ -3281,8 +3347,9 @@ def choose(items, expand_old=False, preview=False):
     expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
     details([items[i] for ix in groups if items[ix[0]]["group"] in expanded for i in ix])
     width = shutil.get_terminal_size((120, 20)).columns
-    help_line = ("  up/down move   space pick group/session   o expand/collapse   a all/none   "
+    long_help = ("  up/down move   space pick group/session   o expand/collapse   a all/none   "
                  "p details   f every session   enter reopen   q quit")
+    short_help = "  ↑↓ move  space pick  o open  a all  p details  f every  enter reopen  q quit"
     drawn = 0
 
     def entries():
@@ -3312,7 +3379,8 @@ def choose(items, expand_old=False, preview=False):
         return ([""] if show_details else []) + lines
 
     def draw(first):
-        nonlocal drawn
+        nonlocal drawn, width
+        width = shutil.get_terminal_size((120, 20)).columns
         rows = entries()
         phys = []
         for pos, (indexes, header) in enumerate(rows):
@@ -3328,13 +3396,14 @@ def choose(items, expand_old=False, preview=False):
         visible = phys[top:top + count]
         out = [] if first else ["\r\x1b[%dA" % drawn]
         for _, line in visible:
-            out.append("\r\x1b[K" + line + "\n")
+            out.append("\r\x1b[K" + fit(line, width - 1) + "\n")
         # Clear leftover rows after collapsing a group, then return to the help line.
         if drawn > len(visible):
             out.extend("\r\x1b[K\n" for _ in range(drawn - len(visible)))
             out.append("\r\x1b[%dA" % (drawn - len(visible)))
         drawn = len(visible)
-        out.append("\r\x1b[K" + _c(help_line[:width - 1], "2"))
+        help_line = long_help if len(long_help) < width else short_help
+        out.append("\r\x1b[K" + fit(_c(help_line, "2"), width - 1))
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 

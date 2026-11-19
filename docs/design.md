@@ -1587,3 +1587,42 @@ the suite failed on a host that differed from the author's:
   the client). It is now `test_marker_patterns_match_the_files_each_harness_writes`,
   which makes those files in a temporary home, and the live-home variant is
   skipped when no marker is open.
+
+### 18.8 The pickers fit the terminal (2026-11-19)
+
+**The defect.** `f` and `a` in the pickers "don't display correctly, and often
+don't work at all", with a different failure each time. Driving both pickers
+in tmux at 120x30 and 80x24, capturing the screen after each key, found two
+causes.
+
+1. *Lines wider than the terminal.* In the `--history`/`--full` picker a session
+   row was cut to `width - 8`, then given an 8-column tick and the 2-column
+   cursor: `width + 2`. The resume line under it was never cut. Each wrapped
+   onto a second screen row, but `draw()` moves up one row per line it drew,
+   so after the first open date every redraw started too low and left
+   fragments of earlier frames on screen. Which rows wrapped depended on title,
+   folder and path length, so each try failed differently. `paint()` also
+   counted characters, not columns, so an emoji or CJK title ran wider than
+   its cut.
+2. *A silent 8 to 16 s load.* `show_history()` rebuilds the index from every
+   transcript (`build_index()`) before the picker draws, including after `f` in
+   the recovery picker. Nothing was printed meanwhile, so the old picker sat
+   frozen on screen. Keys pressed during the wait echoed as junk (`^[[B`) and
+   were then dropped, because `tty.setcbreak()` flushes pending input.
+
+**The fix.** `fit()` cuts every drawn picker line, help line included, to
+`width - 1` terminal columns and keeps its color escapes whole. `paint()` and
+the title cut count columns (`char_cols()`: emoji and CJK take two). The
+history row leaves room for its tick and cursor (`width - 11`), and the resume
+line is painted to the width. Both pickers re-read the terminal size on every
+draw, and switch to a short help line when the long one would be cut, which
+used to hide `enter reopen` and `q quit` on an 80-column terminal.
+`show_history()` prints `cgr: reading every session from every harness…`
+while it reads. Regression test:
+`test_history_picker_lines_never_wrap_on_a_narrow_terminal`.
+
+**Not changed.** The full rescan itself: about 8 s warm and 16 s cold for
+1,399 sessions, mostly `json.loads` in `head_meta()` and `tail_scan()` over
+transcripts that have not changed. Caching those per (path, size, mtime) would
+make the load near-instant. That is a separate change to the index, which by
+rule rebuilds from the stores and never trusts cached verdicts.
