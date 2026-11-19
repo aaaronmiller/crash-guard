@@ -804,14 +804,15 @@ class CgrTests(unittest.TestCase):
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         return master, slave, dict(os.environ, COLUMNS=str(cols), LINES=str(rows))
 
-    def picker_keys(self, items, keys):
+    def picker_keys(self, items, keys, months=None):
         data = self.home / "picker.json"; data.write_text(json.dumps(items))
         script = self.home / "picker.py"
         script.write_text("import json,sys\n" +
                           "sys.path.insert(0, " + repr(str(ROOT / "tests")) + ")\n" +
                           "from test_cgr import load_cgr\n" +
                           "c=load_cgr()\nitems=json.load(open(sys.argv[1]))\n" +
-                          "picked=c.choose(items)\nprint('PICKED:'+json.dumps([s['cwd'] for s in picked]))\n")
+                          "picked=c.choose(items, months=%r)\n" % months +
+                          "print('PICKED:'+json.dumps([s['cwd'] for s in picked]))\n")
         master, slave, env = self.sized_pty()
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
                                 stdout=slave, stderr=slave, env=env)
@@ -1517,7 +1518,7 @@ class CgrTests(unittest.TestCase):
             rc = self.cg.main(["--history", *args])
         return rc, out.getvalue()
 
-    def history_picker_keys(self, rows, alt, keys, full=False, cols=200):
+    def history_picker_keys(self, rows, alt, keys, full=False, cols=200, window=False):
         """Run choose_history in a pty with `alt` as the `f` set; the picked ids and screen."""
         data = self.home / "hrows.json"
         data.write_text(json.dumps([rows, alt]))
@@ -1526,8 +1527,21 @@ class CgrTests(unittest.TestCase):
                           "sys.path.insert(0, " + repr(str(ROOT / "tests")) + ")\n" +
                           "from test_cgr import load_cgr\n" +
                           "c=load_cgr()\nrows,alt=json.load(open(sys.argv[1]))\n" +
+                          ("calls=[]\n"
+                           "def keep(rs, n):\n"
+                           "    s=c.window_since(n)\n"
+                           "    return [r for r in rs if s is None or r['last']>=s]\n"
+                           "def reload(n):\n"
+                           "    calls.append(n)\n"
+                           "    return {%r: (keep(R,n), c.history_groups(keep(R,n))),\n"
+                           "            %r: (keep(A,n), c.history_groups(keep(A,n)))}\n"
+                           "R,A=rows,alt\n"
+                           "rows,alt=keep(R,1),keep(A,1)\n"
+                           "win=dict(months=1, reload=reload)\n" % (full, not full)
+                           if window else "calls=[]\nwin={}\n") +
                           "got=c.choose_history(rows, c.history_groups(rows), "
-                          "alt=(alt, c.history_groups(alt)), full=%r)\n" % full +
+                          "alt=(alt, c.history_groups(alt)), full=%r, **win)\n" % full +
+                          "print('RELOADS:'+json.dumps(calls))\n"
                           "print('PICKED:'+json.dumps(sorted(r['id'] for r in got)))\n")
         master, slave, env = self.sized_pty(cols=cols)
         proc = subprocess.Popen([sys.executable, str(script), str(data)], stdin=slave,
@@ -1553,6 +1567,7 @@ class CgrTests(unittest.TestCase):
                 time.sleep(0.05)
             read_until(b"PICKED:")
             self.assertEqual(proc.wait(timeout=2), 0)
+            self.reloads = json.loads(output.split(b"RELOADS:", 1)[1].splitlines()[0])
             return json.loads(output.split(b"PICKED:", 1)[1].splitlines()[0]), output
         finally:
             if proc.poll() is None:
@@ -1606,7 +1621,7 @@ class CgrTests(unittest.TestCase):
         _, out = self.history_cli(rows, "--list", "--full")
         self.assertIn(", 2 sessions", out)
         self.assertIn("closed: exit", out)
-        self.assertIn("2 you ran, newest first", out)
+        self.assertIn("2 you ran in the last 30 days, newest first", out)
         out = io.StringIO()
         with patch.object(self.cg, "build_index", return_value=(rows, set())), \
                 contextlib.redirect_stdout(out):
@@ -1633,6 +1648,101 @@ class CgrTests(unittest.TestCase):
         self.assertEqual(picked, ["d0-0", "d0-1", "done"])
         self.assertIn(b"f only cut off", screen)
         self.assertIn(b"every session you ran: 3 sessions", screen)
+
+    def month_rows(self):
+        """One session today and one 40 days ago, on separate dates."""
+        return [self.indexed_row("jcode", "new", last=self.noon(0)),
+                self.indexed_row("jcode", "old", last=self.noon(40))]
+
+    def test_history_picker_shows_30_days_and_m_adds_a_month(self):
+        # 2026-11-19: the operator asked for the last 30 days by default, a key
+        # that adds one month, and a typed number for that many months.
+        rows = self.month_rows()
+        down, space = b"\x1b[B", b" "
+        picked, screen = self.history_picker_keys(rows, rows, (b"\r",), window=True)
+        self.assertIn(b"in the last 30 days: 1 session in 1 date", screen)
+        self.assertIn(b"m adds a month", screen)
+        # m reads one more month; the old date is then there to open and pick
+        picked, screen = self.history_picker_keys(
+            rows, rows, (b"m", down, space, space, b"\r"), window=True)
+        self.assertEqual((picked, self.reloads), (["old"], [2]))
+        self.assertIn(b"in the last 2 months: 2 sessions", screen)
+        self.assertIn(b"reading sessions from the last 2 months", screen)
+
+    def test_history_picker_a_typed_number_sets_the_months(self):
+        rows = self.month_rows()
+        down, space = b"\x1b[B", b" "
+        picked, _ = self.history_picker_keys(rows, rows, (b"3", down, space, space, b"\r"),
+                                             window=True)
+        self.assertEqual((picked, self.reloads), (["old"], [3]))
+        # one write: a loaded machine can space separate writes past NUMBER_WAIT
+        picked, screen = self.history_picker_keys(rows, rows, (b"12", b"\r"), window=True)
+        self.assertEqual(self.reloads, [12])
+        self.assertIn(b"show the last 12 months", screen)
+        _, screen = self.history_picker_keys(rows, rows, (b"0", b"\r"), window=True)
+        self.assertEqual(self.reloads, [0])
+        self.assertIn(b"in all time: 2 sessions", screen)
+
+    def test_history_picker_narrowing_the_window_drops_picks_it_hides(self):
+        rows = self.month_rows()
+        down, space = b"\x1b[B", b" "
+        picked, _ = self.history_picker_keys(
+            rows, rows, (b"m", down, space, space, b"1", b"\r"), window=True)
+        self.assertEqual((picked, self.reloads), ([], [2, 1]))
+
+    def test_history_lists_30_days_unless_months_says_more(self):
+        rows = self.month_rows()
+        old_day = time.strftime("%Y-%m-%d", time.localtime(self.noon(40)))
+        _, out = self.history_cli(rows, "--list")
+        self.assertIn("1 you ran were cut off or left mid-turn in the last 30 days", out)
+        self.assertNotIn(old_day, out)
+        self.assertIn("--months N", out)
+        _, out = self.history_cli(rows, "--list", "--months", "2")
+        self.assertIn("2 you ran were cut off or left mid-turn in the last 2 months", out)
+        self.assertIn(old_day, out)
+        _, out = self.history_cli(rows, "--list", "--months", "0")
+        self.assertIn("in all time", out)
+        self.assertNotIn("--months N", out)
+
+    def test_a_windowed_scan_skips_old_transcripts_and_keeps_their_rows(self):
+        now = time.time()
+        self.transcript("fresh", [prompt("new work")], now - 3600)
+        self.transcript("stale", [prompt("old work")], now - 60 * 86400)
+        since = self.cg.window_since(1)
+        rows, _ = self.cg.build_index(since)
+        ids = {r["id"] for r in rows if r["harness"] == "claude"}
+        self.assertIn("fresh", ids)
+        self.assertNotIn("stale", ids)
+        # A full scan stored the old one; a windowed one must not call it gone.
+        self.cg.write_index(*self.cg.build_index())
+        self.cg.write_index(*self.cg.build_index(since), since=since)
+        con = sqlite3.connect(str(self.cg.db_path()))
+        try:
+            in_store = dict(con.execute("SELECT id, in_store FROM sessions WHERE harness='claude'"))
+        finally:
+            con.close()
+        self.assertEqual(in_store, {"fresh": 1, "stale": 1})
+        self.assertIsNone(self.cg.SCAN_SINCE)
+
+    def test_all_picker_shows_30_days_and_m_or_a_number_reaches_further(self):
+        self.watched_boot("recent", self.prev, ["/one", "/two"])
+        self.watched_boot("earlier", self.prev - 86400, ["/other"])
+        items = self.cg.collect(everything=True)
+        for s in items:
+            if s["cwd"] == "/other":  # a crash 40 days ago: outside the window, unticked
+                s["last"] = time.time() - 40 * 86400
+                s["event"] = dict(s["event"], end=s["last"])
+        # recent sessions start ticked; the 40-day-old group is hidden
+        self.assertEqual(set(self.picker_keys(items, (b"\r",), months=1)), {"/one", "/two"})
+        self.assertEqual(set(self.picker_keys(items, (b"m", b"a", b"\r"), months=1)),
+                         {"/one", "/two", "/other"})
+        self.assertEqual(set(self.picker_keys(items, (b"2", b"a", b"\r"), months=1)),
+                         {"/one", "/two", "/other"})
+        # picked, then hidden again: not reopened unseen
+        self.assertEqual(set(self.picker_keys(items, (b"0", b"a", b"1", b"\r"), months=1)),
+                         {"/one", "/two"})
+        self.assertEqual([s["cwd"] for s in self.cg.in_window(items, 1)].count("/other"), 0)
+        self.assertEqual(len(self.cg.in_window(items, 0)), len(items))
 
     def test_history_picker_lines_never_wrap_on_a_narrow_terminal(self):
         # 2026-11-19: on an 80- or 120-column terminal the picker scrambled

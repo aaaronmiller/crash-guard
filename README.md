@@ -52,7 +52,8 @@ how to re-verify every claim.
 cgr               # pick with the arrow keys, reopen each in a new tab
 cgr --list        # print what died and the exact command each would run; open no tabs
 cgr --yes         # reopen all of them without asking
-cgr --all         # earlier events too; groups older than seven days are collapsed
+cgr --all         # earlier events too, from the last 30 days; groups older than seven days are collapsed
+cgr --all --months 3           # the last 3 months (30 days each); --months 0 is all time
 cgr --all --expand-old --list  # show every session and command in older groups
 cgr --forget      # stop listing the sessions shown now
 cgr --json        # machine-readable list
@@ -63,6 +64,14 @@ cgr --full        # every session you ran, finished or not (like claude --resume
 
 In either picker, `f` switches to that full list; in `--history` it switches
 back too, and picks are kept across the switch.
+
+`cgr --all`, `--history` and `--full` show the last 30 days unless you ask for
+more. In their pickers `m` adds one month, and typing a number shows that many
+months (`6` for six, `12` for a year, `0` for all time); the number counts once
+you stop typing for a moment, or on the next key. `--months N` does the same
+from the command line. Reading a wider window for `--history` and `--full`
+takes a few seconds (every transcript in it is read), and the picker says so
+while it reads.
 
 Example, after WezTerm crashed on 2026-11-09 and took three agents with it
 (colored in a terminal; prompts shortened here):
@@ -155,7 +164,8 @@ newest session in their directory.
 ```bash
 cgr --history          # grouped by date with counts; space opens a date, space picks, enter reopens
 cgr --history --list   # print the same groups and sessions; open no tabs
-cgr --history --all    # every date, not just the newest dates holding 40 sessions
+cgr --history --all    # every date in the window, not just the newest dates holding 40 sessions
+cgr --history --months 0   # all time instead of the last 30 days
 cgr --history --list --group 2 --preview   # one date by its number, with id/msgs/model/last prompt
 cgr --history --list --day 2026-10-09      # one date by name (also expands an old date)
 cgr --history --day 2026-10-09 --yes       # reopen every session of that date, no terminal needed

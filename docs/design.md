@@ -1626,3 +1626,44 @@ while it reads. Regression test:
 transcripts that have not changed. Caching those per (path, size, mtime) would
 make the load near-instant. That is a separate change to the index, which by
 rule rebuilds from the stores and never trusts cached verdicts.
+
+### 18.9 A month window for `--all`, `--history` and `--full` (2026-11-19)
+
+**The request.** "Show the last 30 days by default, then additional months:
+a button to add a single month, or type a number to go that many months, and
+show the message whenever it is slow."
+
+**What it does.** `--months N` (default 1, 0 for all time) sets a window of
+N 30-day months. In the history picker (`--history`, `--full`, and `f` from the
+recovery picker) the title names the window; `m` adds a month, and a typed
+number replaces it once `NUMBER_WAIT` (0.8 s) passes without another digit or
+another key arrives, which then still counts. Widening rereads the stores for
+the new window through `reload()`, showing `reading sessions from the last N
+months…` on the help line meanwhile. The `cgr --all` recovery picker already
+holds every group, so there the window only filters whole event groups
+(`in_window()`); a line pinned above the help line names the window and how
+many older groups it hides. A pick that a narrower window hides is dropped,
+never reopened unseen. Plain `cgr` has no window: it is already bounded by
+the last boot with agents.
+
+**The scan.** `build_index(since)` sets `SCAN_SINCE`, and each indexer skips
+sessions untouched since then (`recent()` for transcript files by mtime,
+`scanned()` for rows of codex, hermes, opencode and kilo). `write_index(...,
+since)` only marks rows that recent as gone from the store; older rows keep
+what a wider scan stored. Watcher evidence older than the window is not turned
+into rows, because a thin evidence row would overwrite the stored one. A
+harness's first exit record (which decides "cut off, no end record" against
+"unknown") comes from the stored rows too, via `indexed_first_exits()`, since a
+windowed scan may not reach it.
+
+**Measured.** On this machine 354 of about 460 Claude transcripts were written
+in the last 30 days, so the default window reads in about 8 s against 12 to 30 s
+for all time (the spread is machine load). The window bounds the wait; the
+per-transcript cache noted in 18.8 would remove most of it.
+
+Tests: `test_history_picker_shows_30_days_and_m_adds_a_month`,
+`test_history_picker_a_typed_number_sets_the_months`,
+`test_history_picker_narrowing_the_window_drops_picks_it_hides`,
+`test_history_lists_30_days_unless_months_says_more`,
+`test_a_windowed_scan_skips_old_transcripts_and_keeps_their_rows`,
+`test_all_picker_shows_30_days_and_m_or_a_number_reaches_further`.

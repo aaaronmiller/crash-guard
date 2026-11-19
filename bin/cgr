@@ -1865,8 +1865,24 @@ def exit_verdict(end):
     return "closed", "exit record: %s" % end
 
 
+SCAN_SINCE = None  # build_index(since=...): skip sessions untouched since then
+
+
+def recent(paths):
+    """Paths written since SCAN_SINCE. A transcript's mtime is its row's
+    `last`, so a skipped file is one the window would not show anyway."""
+    if SCAN_SINCE is None:
+        return paths
+    return [p for p in paths if mtime(p) >= SCAN_SINCE]
+
+
+def scanned(last):
+    """A store row the window reaches: SCAN_SINCE is None, or `last` is since it."""
+    return SCAN_SINCE is None or last is None or (epoch(last) or 0) >= SCAN_SINCE
+
+
 def index_claude():
-    for path in glob.glob(str(HOME / ".claude" / "projects" / "*" / "*.jsonl")):
+    for path in recent(glob.glob(str(HOME / ".claude" / "projects" / "*" / "*.jsonl"))):
         meta = head_meta(path)
         end, mid, prompt, model = tail_scan(path)
         source = meta.get("source") or "cli"
@@ -1883,7 +1899,7 @@ def index_claude():
 
 
 def jsonl_index(harness, pattern, sid_of):
-    for path in glob.glob(str(HOME / pattern)):
+    for path in recent(glob.glob(str(HOME / pattern))):
         meta = head_meta(path)
         end, mid, prompt, model = tail_scan(path)
         r = entry(harness, sid_of(path, meta), path, cwd=meta.get("cwd"),
@@ -1949,6 +1965,8 @@ def index_codex():
         con.close()
     for t in rows:
         t = dict(t)
+        if not scanned(t.get("updated_at")):
+            continue
         path = t.get("rollout_path")
         _, mid, prompt, _ = tail_scan(path, codex_step) if path else (None, None, "", None)
         src = t.get("source") or ""
@@ -1984,6 +2002,8 @@ def index_hermes():
     try:
         con.row_factory = sqlite3.Row
         for s in [dict(x) for x in con.execute("SELECT * FROM sessions")]:
+            if not scanned(s.get("last_activity_at") or s.get("ended_at") or s.get("started_at")):
+                continue
             msgs = con.execute("SELECT role, content, tool_calls FROM messages WHERE session_id = ? "
                                "ORDER BY id DESC LIMIT 60", (s["id"],)).fetchall()
             steps = []
@@ -2015,7 +2035,7 @@ def index_hermes():
 
 
 def index_jcode():
-    for path in glob.glob(str(HOME / ".jcode" / "sessions" / "*.json")):
+    for path in recent(glob.glob(str(HOME / ".jcode" / "sessions" / "*.json"))):
         try:
             d = json.loads(Path(path).read_text(errors="replace"))
         except (OSError, ValueError):
@@ -2045,7 +2065,7 @@ def index_jcode():
 
 
 def index_muse():
-    for path in glob.glob(str(HOME / ".local/share/muse/sessions/*/*/*/*/session.jsonl")):
+    for path in recent(glob.glob(str(HOME / ".local/share/muse/sessions/*/*/*/*/session.jsonl"))):
         meta = {}
         for rec in first_records(path):
             p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
@@ -2082,7 +2102,7 @@ def muse_prompt(payload):
 
 
 def index_gemini():
-    for path in glob.glob(str(HOME / ".gemini" / "tmp" / "*" / "chats" / "*.json")):
+    for path in recent(glob.glob(str(HOME / ".gemini" / "tmp" / "*" / "chats" / "*.json"))):
         try:
             d = json.loads(Path(path).read_text(errors="replace"))
             cwd = (Path(path).parent.parent / ".project_root").read_text().strip()
@@ -2118,6 +2138,8 @@ def index_opencode():
             sessions = con.execute("SELECT id, directory, title, time_created, time_updated, "
                                    "parent_id, time_archived FROM session").fetchall()
             for sid, cwd, title, created, updated, parent, archived in sessions:
+                if not scanned(updated):
+                    continue
                 msgs = con.execute("SELECT id, data FROM message WHERE session_id = ? "
                                    "ORDER BY time_created DESC", (sid,)).fetchall()
                 steps, model = [], None
@@ -2238,17 +2260,26 @@ def indexed_cut_off(since, btime):
     return out
 
 
-def build_index():
-    """Every session every harness on this machine kept, with how each one ended."""
+def build_index(since=None):
+    """Every session every harness on this machine kept, with how each one
+    ended. With `since`, only sessions active since then: the rest keep the
+    rows an earlier, wider scan wrote (write_index leaves them alone)."""
+    global SCAN_SINCE
     rows, failed = {}, set()
-    for indexer in INDEXERS:
-        try:
-            for r in indexer():
-                rows[(r["harness"], r["id"])] = r
-        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as e:
-            failed.add(indexer.__name__[6:])  # its rows not read this time are not gone
-            print("cgr: %s: %s" % (indexer.__name__[6:], e), file=sys.stderr)
-    first = {}
+    SCAN_SINCE = since
+    try:
+        for indexer in INDEXERS:
+            try:
+                for r in indexer():
+                    rows[(r["harness"], r["id"])] = r
+            except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as e:
+                failed.add(indexer.__name__[6:])  # its rows not read this time are not gone
+                print("cgr: %s: %s" % (indexer.__name__[6:], e), file=sys.stderr)
+    finally:
+        SCAN_SINCE = None
+    # A harness's first exit record dates when it began writing them; a
+    # windowed scan may not reach it, so the stored rows count too.
+    first = indexed_first_exits() if since is not None else {}
     for r in rows.values():
         if r["exit_record"] and r["harness"] in WRITES_EXIT:
             first[r["harness"]] = min(first.get(r["harness"], r["last"] or 0),
@@ -2264,6 +2295,8 @@ def build_index():
         sid = s["id"] or "@%d" % int(s["started"] or s["last"])
         if (s["harness"], sid) in rows:
             continue  # watcher evidence can also resolve an exact id
+        if since is not None and (s["last"] or 0) < since:
+            continue  # outside the window: a thin row would replace the stored one
         path = s.get("path")
         if s["harness"] == "agy" and s["id"]:
             path = HOME / ".gemini/antigravity-cli/conversations" / (s["id"] + ".db")
@@ -2299,9 +2332,25 @@ def build_index():
         r["last_seen"] = r["first_seen"] = now
     return [rows[k] for k in sorted(rows, key=lambda k: -(rows[k]["last"] or 0))], failed
 
-def write_index(rows, failed=()):
+
+def indexed_first_exits():
+    """{harness: start of its earliest session with an exit record} from sessions.db."""
+    try:
+        con = ro(db_path())
+        try:
+            return {h: t for h, t in con.execute(
+                "SELECT harness, MIN(COALESCE(started, last)) FROM sessions "
+                "WHERE exit_record IS NOT NULL GROUP BY harness") if h in WRITES_EXIT and t}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+
+
+def write_index(rows, failed=(), since=None):
     """Upsert into sessions.db. A row outlives its transcript: once a harness
-    deletes an old session, the row keeps what was known, with in_store 0."""
+    deletes an old session, the row keeps what was known, with in_store 0.
+    After a scan from `since`, only rows that recent can be judged gone."""
     private_dir(STATE)
     path = db_path()
     con = sqlite3.connect(str(path), timeout=10)
@@ -2334,7 +2383,8 @@ def write_index(rows, failed=()):
             con.execute("DELETE FROM sessions WHERE id LIKE '@%%'")
             if read:
                 con.execute("UPDATE sessions SET in_store = 0 WHERE harness IN (%s)"
-                            % ",".join("?" * len(read)), read)
+                            % ",".join("?" * len(read)) + (" AND last >= ?" if since else ""),
+                            read + ([since] if since else []))
             con.executemany(
                 "INSERT INTO sessions (%s) VALUES (%s) ON CONFLICT(harness, id) DO UPDATE SET %s"
                 % (", ".join(COLUMNS), ", ".join("?" * len(COLUMNS)), ", ".join(sets)),
@@ -2420,16 +2470,40 @@ def full_rows(rows):
     return [r for r in rows if r["interactive"] and reopenable(r)]
 
 
+MONTH = 30 * 86400  # a "month" of the --months window
+
+
+def window_since(months, now=None):
+    """The start of a window of `months` 30-day months; 0 or None is all time."""
+    return None if not months else (now or time.time()) - months * MONTH
+
+
+def window_name(months):
+    if not months:
+        return "all time"
+    return "the last 30 days" if months == 1 else "the last %d months" % months
+
+
+def load_history(months):
+    """The indexed sessions active in the window, after scanning only it.
+    Reading every transcript takes 8-16 s; the last 30 days, a fraction."""
+    since = window_since(months)
+    rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index(since), since=since)]
+    return [r for r in rows if since is None or (r["last"] or 0) >= since]
+
+
 def show_history(everything=False, as_json=False, list_only=False, groups=None, days=None,
-                 yes=False, expand_old=False, preview=False, full=False):
-    # Reading every transcript takes 8-16 s. Silent, `f` in the recovery
-    # picker looked dead, and keys pressed meanwhile echoed as junk and were
-    # then dropped when the next picker took the terminal.
+                 yes=False, expand_old=False, preview=False, full=False, months=1):
+    if days:
+        months = 0  # a date you name is shown wherever it falls
+    # Silent, the load made `f` in the recovery picker look dead, and keys
+    # pressed meanwhile echoed as junk and were then dropped when the next
+    # picker took the terminal.
     loading = sys.stdout.isatty() and not as_json
     if loading:
-        sys.stdout.write(_c("cgr: reading every session from every harness…", "2"))
+        sys.stdout.write(_c("cgr: reading sessions from %s…" % window_name(months), "2"))
         sys.stdout.flush()
-    rows = [dict(zip(COLUMNS, t)) for t in write_index(*build_index())]
+    rows = load_history(months)
     if loading:
         sys.stdout.write("\r\x1b[K")
         sys.stdout.flush()
@@ -2443,7 +2517,8 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
         c["sessions"] += 1
         c[r["status"]] = c.get(r["status"], 0) + 1
         c["mid-turn"] += 1 if r["mid_turn"] else 0
-    print("cgr: %d sessions from %d harnesses, in\n%s\n" % (len(rows), len(by), db_path()))
+    print("cgr: %d sessions from %d harnesses in %s, in\n%s\n" % (
+        len(rows), len(by), window_name(months), db_path()))
     cols = ("sessions", "running", "closed", "cut off", "unknown", "mid-turn")
     print("  %-9s" % "harness" + "".join("%9s" % c for c in cols))
     for h in sorted(by, key=lambda h: -by[h]["sessions"]):
@@ -2474,21 +2549,32 @@ def show_history(everything=False, as_json=False, list_only=False, groups=None, 
         note = ""
         if not selected and not everything and len(shown_rows) < total:
             note = " (showing %d of %d, whole dates; --all shows every one)" % (len(shown_rows), total)
-        print("\n%d you ran%s, newest first%s:\n" % (
-            total, "" if full else " were cut off or left mid-turn", note))
+        print("\n%d you ran%s in %s, newest first%s:\n" % (
+            total, "" if full else " were cut off or left mid-turn", window_name(months), note))
         print_history_groups(shown, not (expand_old or selected), preview)
+        if months:
+            print("further back:  --months N (N months of 30 days), --months 0 for all time")
         print("audit them:   sqlite3 -box %s 'SELECT * FROM audit'" % shlex.quote(str(db_path())))
         return 0
+    def both_sets(rows):
+        """{full?: (rows, date groups)}: every session, and the cut-off ones."""
+        out = {}
+        for is_full, rs in ((True, full_rows(rows)),
+                            (False, [r for r in rows if flagged(r) and reopenable(r)])):
+            g = history_groups(rs)
+            if days:
+                g = [x for x in g if x[0] in days]
+            out[is_full] = ([r for _, x in g for r in x], g)
+        return out
+
     # `f` in the picker switches between the cut-off sessions and every session.
-    other = everyone if not full else bad
-    other_groups = history_groups(other)
-    if days:
-        other_groups = [g for g in other_groups if g[0] in days]
-    if full and not selected and not everything:
+    other_rows, other_groups = both_sets(rows)[not full]
+    if (full or months) and not selected and not everything:
         shown, shown_rows = every, [r for _, g in every for r in g]  # dates fold in the picker
     chosen = choose_history(shown_rows, shown, preview=preview,
-                            alt=([r for _, g in other_groups for r in g], other_groups),
-                            full=full)
+                            alt=(other_rows, other_groups), full=full,
+                            months=None if selected else months,
+                            reload=None if selected else (lambda n: both_sets(load_history(n))))
     if not chosen:
         print("nothing reopened")
         return 0
@@ -2537,11 +2623,44 @@ def history_group_label(day, rows):
     return _c(label, "1;" + code)
 
 
-def choose_history(rows, groups, preview=False, alt=None, full=False):
+def read_key(fd):
+    """One keypress: a byte, or a whole arrow-key escape sequence."""
+    k = os.read(fd, 1)
+    while k in (b"\x1b", b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.05)[0]:
+        k += os.read(fd, 1)
+        if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
+            break
+    return k
+
+
+NUMBER_WAIT = 0.8  # seconds after a digit before the typed number counts
+
+
+def read_number(fd, first, show):
+    """A number typed digit by digit, starting with the key `first`. It counts
+    once NUMBER_WAIT passes without another digit, or on any other key, which
+    is returned too so it is not lost. `show(text)` echoes it as typed."""
+    typed = first.decode()
+    while True:
+        show(typed)
+        if not select.select([fd], [], [], NUMBER_WAIT)[0]:
+            return int(typed), None
+        k = read_key(fd)
+        if not (k.isdigit() and len(k) == 1):
+            return int(typed), k
+        typed = (typed + k.decode())[-3:]
+
+
+WINDOW_KEYS = "m adds a month, a number shows that many months, 0 all time"
+
+
+def choose_history(rows, groups, preview=False, alt=None, full=False, months=None, reload=None):
     """A date group per line with its count; space expands one group into its
     sessions, and inside an open group space picks sessions to reopen. `f`
     swaps to `alt` (rows, groups): every session instead of the cut-off ones,
-    or back. Picks survive the swap."""
+    or back. Picks survive the swap. With `reload`, `m` widens the window by
+    a month and a typed number sets it to that many months (0 all time):
+    reload(months) returns both sets again, read from that window."""
     import termios
     import tty
     fd = sys.stdin.fileno()
@@ -2552,8 +2671,13 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
         sets[not full] = alt
     known = {(r["harness"], r["id"]): r for rs, _ in sets.values() for r in rs}
     width = shutil.get_terminal_size((120, 20)).columns
+    note = ""  # replaces the help line while a number is typed or a window loads
+    if reload is None:
+        months = None
 
     def help_line():
+        if note:
+            return note
         swap = ("   f only cut off" if full else "   f every session") if alt is not None else ""
         text = ("  up/down move   space open group / pick session   "
                 "a all/none in group%s   enter reopen   q quit" % swap)
@@ -2566,8 +2690,33 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
     def title_line():
         n = len(rows)
         what = "every session you ran" if full else "cut off or left mid-turn"
-        return _c("  %s: %d session%s in %d date%s" % (
-            what, n, "" if n == 1 else "s", len(groups), "" if len(groups) == 1 else "s"), "1")
+        span = "" if months is None else " in %s" % window_name(months)
+        hint = "" if months is None else _c("   " + WINDOW_KEYS, "2")
+        return _c("  %s%s: %d session%s in %d date%s" % (
+            what, span, n, "" if n == 1 else "s", len(groups), "" if len(groups) == 1 else "s"),
+            "1") + hint
+
+    def show_note(text):
+        nonlocal note
+        note = text
+        draw(False)
+
+    def widen(n):
+        """Read the window of `n` months and show it; picks are kept."""
+        nonlocal sets, rows, groups, months, open_day, cur, top, note, picked
+        if n == months:
+            return
+        show_note(_c("  reading sessions from %s… (slow: every transcript in it is read)"
+                     % window_name(n), "1;33"))
+        sets = reload(n)
+        months, note = n, ""
+        known.clear()
+        known.update({(r["harness"], r["id"]): r for rs, _ in sets.values() for r in rs})
+        picked &= set(known)  # a pick outside a narrower window is not reopened unseen
+        rows, groups = sets[full]
+        if open_day not in dict(groups):
+            open_day = None
+        cur, top = 1, 0
 
     def entries():
         rows_out = [(None, None)]
@@ -2642,12 +2791,17 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
         tty.setcbreak(fd)
         sys.stdout.write("\x1b[?25l")
         draw(True)
+        pending = None
         while True:
-            k = os.read(fd, 1)
-            while k in (b"\x1b", b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.05)[0]:
-                k += os.read(fd, 1)
-                if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
-                    break
+            k, pending = pending or read_key(fd), None
+            if months is not None and k.isdigit() and len(k) == 1:
+                n, pending = read_number(fd, k, lambda s: show_note(_c(
+                    "  show the last %s month%s (keep typing, or wait)" % (s, "" if s == "1" else "s"),
+                    "1;33")))
+                note = ""
+                widen(n)
+                draw(False)
+                continue
             ents = entries()
             # Entry 0 is the title line; the cursor cycles over the rest.
             if k in (b"\x1b[A", b"\x1bOA", b"k") and len(ents) > 1:
@@ -2658,6 +2812,8 @@ def choose_history(rows, groups, preview=False, alt=None, full=False):
                 full = not full
                 rows, groups = sets[full]
                 open_day, cur, top = None, 1, 0
+            elif k == b"m" and months:
+                widen(months + 1)
             elif k == b" " and len(ents) > 1:
                 day, r = ents[cur]
                 if r is None:
@@ -3335,15 +3491,43 @@ def show_recovery(items, expand_old=False, commands=True, preview=False):
 FULL_LIST = "full list"  # what choose() returns when `f` asks for every session
 
 
-def choose(items, expand_old=False, preview=False):
-    """Space on a header selects its whole group. Old groups start collapsed and unticked."""
+def in_window(items, months):
+    """The items of every event group active in the last `months` months,
+    whole groups, so a group is never cut in two; None or 0 keeps them all."""
+    since = window_since(months)
+    if since is None:
+        return items
+    keep = {i for ix in event_groups(items) if max(items[i]["last"] or 0 for i in ix) >= since
+            for i in ix}
+    return [s for i, s in enumerate(items) if i in keep]
+
+
+def choose(items, expand_old=False, preview=False, months=None):
+    """Space on a header selects its whole group. Old groups start collapsed
+    and unticked. With `months`, only groups active in that many months show:
+    `m` adds a month, a typed number sets it, 0 shows all of them."""
     import termios
     import tty
     fd = sys.stdin.fileno()
     picked, cur = [not old_group(s) for s in items], 0
     show_details = True  # `p` folds each session to its first line
-    groups = event_groups(items)
-    number = {items[ix[0]]["group"]: n for n, ix in enumerate(groups, 1)}
+    every_group = event_groups(items)
+    number = {items[ix[0]]["group"]: n for n, ix in enumerate(every_group, 1)}
+    note = ""  # replaces the window line while a number is typed
+
+    def windowed():
+        since = window_since(months)
+        return [ix for ix in every_group
+                if since is None or max(items[i]["last"] or 0 for i in ix) >= since]
+
+    def window_line():
+        if note:
+            return note
+        hidden = len(every_group) - len(groups)
+        older = ", %d older group%s hidden" % (hidden, "" if hidden == 1 else "s") if hidden else ""
+        return _c("  %s%s   " % (window_name(months), older), "1") + _c(WINDOW_KEYS, "2")
+
+    groups = windowed()
     expanded = {items[ix[0]]["group"] for ix in groups if expand_old or not old_group(items[ix[0]])}
     details([items[i] for ix in groups if items[ix[0]]["group"] in expanded for i in ix])
     width = shutil.get_terminal_size((120, 20)).columns
@@ -3387,13 +3571,15 @@ def choose(items, expand_old=False, preview=False):
             if header and pos:
                 phys.append((None, ""))
             phys.extend((pos, line) for line in render(pos, indexes, header))
+        # The window line sits above the help line, never scrolled away.
+        pinned = [window_line()] if months is not None else []
         height = shutil.get_terminal_size((120, 24)).lines
-        count = max(1, height - 2)
-        mine = [n for n, (pos, _) in enumerate(phys) if pos == cur]
+        count = max(1, height - 2 - len(pinned))
+        mine = [n for n, (pos, _) in enumerate(phys) if pos == cur] or [0]
         top = max(0, min(mine[0] - count // 3, len(phys) - count))
         if mine[-1] >= top + count:
             top = mine[-1] - count + 1
-        visible = phys[top:top + count]
+        visible = phys[top:top + count] + [(None, line) for line in pinned]
         out = [] if first else ["\r\x1b[%dA" % drawn]
         for _, line in visible:
             out.append("\r\x1b[K" + fit(line, width - 1) + "\n")
@@ -3412,13 +3598,29 @@ def choose(items, expand_old=False, preview=False):
         tty.setcbreak(fd)
         sys.stdout.write("\x1b[?25l")
         draw(True)
+        pending = None
         while True:
-            k = os.read(fd, 1)
-            while k in (b"\x1b", b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.05)[0]:
-                k += os.read(fd, 1)
-                if k != b"\x1b" and k not in (b"\x1b[", b"\x1bO"):
-                    break
+            k, pending = pending or read_key(fd), None
+            new = None
+            if months is not None and k.isdigit() and len(k) == 1:
+                def typing(s):
+                    nonlocal note
+                    note = _c("  show the last %s month%s (keep typing, or wait)"
+                              % (s, "" if s == "1" else "s"), "1;33")
+                    draw(False)
+                new, pending = read_number(fd, k, typing)
+                note = ""
+            elif k == b"m" and months:
+                new = months + 1
+            if new is not None:
+                months = new
+                groups = windowed()
+                cur = 0
+                draw(False)
+                continue
             rows = entries()
+            if not rows and k not in (b"f", b"", b"q", b"\x1b", b"\x03", b"\x04"):
+                continue  # nothing in the window: m, a number, f or q
             if k in (b"\x1b[A", b"\x1bOA", b"k"):
                 cur = (cur - 1) % len(rows)
             elif k in (b"\x1b[B", b"\x1bOB", b"j"):
@@ -3438,13 +3640,17 @@ def choose(items, expand_old=False, preview=False):
                 cur = next(i for i, (ix, header) in enumerate(entries())
                            if header and items[ix[0]]["group"] == gid)
             elif k == b"a":
-                picked = [not all(picked)] * len(items)
+                shown = [i for ix in groups for i in ix]
+                value = not all(picked[i] for i in shown)
+                for i in shown:
+                    picked[i] = value
             elif k == b"p":
                 show_details = not show_details
             elif k == b"f":
                 return FULL_LIST
             elif k in (b"\r", b"\n"):
-                return [s for s, p in zip(items, picked) if p]
+                shown = {i for ix in groups for i in ix}  # a hidden pick is not reopened unseen
+                return [s for i, s in enumerate(items) if picked[i] and i in shown]
             elif k in (b"", b"q", b"\x1b", b"\x03", b"\x04"):
                 return []
             draw(False)
@@ -3633,7 +3839,8 @@ def main(argv=None):
     ap.add_argument("--yes", "-y", action="store_true", help="reopen all without asking")
     ap.add_argument("--dry-run", "-n", action="store_true", help="same as --list")
     ap.add_argument("--all", "-a", action="store_true",
-                    help="include sessions that died before the last boot that had agents running")
+                    help="include sessions that died before the last boot that had agents "
+                         "running, from the last 30 days (--months for more)")
     ap.add_argument("--expand-old", action="store_true",
                     help="show sessions in groups older than seven days (--all includes the groups)")
     ap.add_argument("--preview", "-p", action="store_true",
@@ -3653,10 +3860,17 @@ def main(argv=None):
     ap.add_argument("--full", "-f", action="store_true",
                     help="browse every session you ran, finished or not, grouped by date "
                          "(like claude --resume, across every harness); f in a picker does the same")
+    ap.add_argument("--months", type=int, default=None, metavar="N",
+                    help="with --all, --history or --full: the last N months of 30 days "
+                         "(default 1); 0 is all time. In the picker m adds a month and a "
+                         "typed number sets it")
     ap.add_argument("--notify", action="store_true", help="one line if anything died")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--watch", action="store_true", help="run the watcher (systemd does this)")
     args = ap.parse_args(argv)
+    if args.months is not None and args.months < 0:
+        ap.error("--months takes 0 (all time) or more")
+    months = 1 if args.months is None else args.months
 
     if args.watch:
         return watch()
@@ -3668,7 +3882,7 @@ def main(argv=None):
         return show_history(everything=args.all, as_json=args.json,
                             list_only=args.list or args.dry_run, groups=args.group,
                             days=args.day, yes=args.yes, expand_old=args.expand_old,
-                            preview=args.preview, full=args.full)
+                            preview=args.preview, full=args.full, months=months)
     if args.save:
         items = save()
         if not items:
@@ -3683,6 +3897,10 @@ def main(argv=None):
     items = collect(everything=args.all)
     for s in items:
         s["command"] = command(s)
+    # --all reaches back past the last boot, so it shows a window: by default
+    # the last 30 days. Plain cgr is already bounded by that boot.
+    window = months if args.all else None
+    every_item, items = items, in_window(items, window)
 
     if args.json:
         print(json.dumps(items, indent=1))
@@ -3710,7 +3928,14 @@ def main(argv=None):
         print("cgr: the watcher is not running, so only claude windows that close are caught."
               "\n     check it: systemctl --user status cgr-watch   (failing: journalctl --user -u cgr-watch)"
               "\n     start it: systemctl --user enable --now cgr-watch\n")
-    if not items:
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    picker = interactive and not (args.list or args.dry_run or args.yes or args.forget)
+    if not items and every_item and window:
+        if not picker:
+            print("cgr: nothing died in %s; %d older session%s: --months N, or --months 0 for all"
+                  % (window_name(window), len(every_item), "" if len(every_item) == 1 else "s"))
+            return 0
+    elif not items:
         print("cgr: nothing died -- no agent session was cut off since the last boot with agents began"
               + ("" if args.all else " (--all looks further back)")
             + "\n     every session you ran, finished or not: cgr --full")
@@ -3720,12 +3945,14 @@ def main(argv=None):
         print("cgr: forgot %d session%s" % (len(items), "" if len(items) == 1 else "s"))
         return 0
 
-    print("These agent sessions were cut off:\n")
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    print("These agent sessions were cut off%s:\n" % (" in %s" % window_name(window) if window else ""))
     if args.list or args.dry_run or args.yes or not interactive:
         show_recovery(items, expand_old=args.expand_old, preview=args.preview,
                       commands=args.list or args.dry_run or not interactive)
         if args.list or args.dry_run:
+            if window and len(items) < len(every_item):
+                print("\n%d older: --months N (N months of 30 days), --months 0 for all time"
+                      % (len(every_item) - len(items)))
             return 0
         if not args.yes:
             print("\nnot a terminal: run `cgr --yes` to reopen all, or the commands above")
@@ -3735,10 +3962,14 @@ def main(argv=None):
             print("  " + group_label(items, indexes, n, bar=False))
         chosen = items
     else:
-        chosen = choose(items, expand_old=args.expand_old, preview=args.preview)
+        if window is None:
+            chosen = choose(items, expand_old=args.expand_old, preview=args.preview)
+        else:
+            chosen = choose(every_item, expand_old=args.expand_old, preview=args.preview,
+                            months=window)
         save_usage_cache()
         if chosen == FULL_LIST:
-            return show_history(full=True, preview=args.preview)
+            return show_history(full=True, preview=args.preview, months=months)
         if not chosen:
             print("nothing reopened")
             return 0
