@@ -50,7 +50,9 @@ Each signal was checked against live processes on 2026-10-09.
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
+import hashlib
 import json
 import os
 import re
@@ -1060,6 +1062,106 @@ def claude(since, btime, live, dead):
     return out
 
 
+# -- the read cache -----------------------------------------------------------
+#
+# build_index reads every transcript in its window, and most of them have not
+# changed since the last scan. reads.db keeps what head_meta, tail_scan and
+# continued_in returned for each file, keyed by its inode, size and mtime: a
+# file that changed in any of them is read again. Only reads are kept, never
+# verdicts, which are still worked out from the reads on every scan. A new cgr
+# (any change to this file) starts the cache over, since its reading may differ.
+
+READS = None  # a ReadCache while build_index runs
+
+
+def code_version():
+    try:
+        with open(os.path.realpath(__file__), "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()[:16]
+    except (OSError, NameError):
+        return None
+
+
+class ReadCache:
+    RACY = 2  # seconds: a file written this recently can change within one mtime tick
+
+    def __init__(self):
+        self.path = STATE / "reads.db"
+        self.version = code_version()
+        self.rows, self.new, self.start = {}, {}, time.time()
+        if not self.version or not self.path.exists():
+            return
+        try:
+            con = ro(self.path)
+            try:
+                if con.execute("SELECT value FROM meta WHERE key = 'version'").fetchone() \
+                        == (self.version,):
+                    self.rows = {(fn, p): (sig, v) for fn, p, sig, v
+                                 in con.execute("SELECT fn, path, sig, value FROM reads")}
+            finally:
+                con.close()
+        except sqlite3.Error:
+            self.rows = {}  # unreadable or an older layout: read everything again
+
+    def get(self, fn, path, compute):
+        try:
+            st = os.stat(path)
+        except OSError:
+            return compute()
+        sig = "%d:%d:%d" % (st.st_ino, st.st_size, st.st_mtime_ns)
+        hit = self.rows.get((fn, path))
+        if hit and hit[0] == sig:
+            return json.loads(hit[1])
+        value = compute()
+        if st.st_mtime < self.start - self.RACY:
+            try:
+                self.new[(fn, path)] = (sig, json.dumps(value))
+            except (TypeError, ValueError):
+                pass
+        return value
+
+    def save(self):
+        if not self.version:
+            return
+        gone = [(fn, p) for fn, p in self.rows if (fn, p) not in self.new
+                and not os.path.exists(p)]
+        if not self.new and not gone:
+            return
+        try:
+            private_dir(STATE)
+            con = sqlite3.connect(str(self.path), timeout=5)
+            try:
+                os.chmod(self.path, 0o600)
+                con.executescript("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
+                                  "CREATE TABLE IF NOT EXISTS reads (fn TEXT, path TEXT, sig TEXT, "
+                                  "value TEXT, PRIMARY KEY (fn, path));")
+                old = con.execute("SELECT value FROM meta WHERE key = 'version'").fetchone()
+                if old != (self.version,):
+                    con.execute("DELETE FROM reads")
+                    con.execute("INSERT OR REPLACE INTO meta VALUES ('version', ?)",
+                                (self.version,))
+                con.executemany("INSERT OR REPLACE INTO reads VALUES (?, ?, ?, ?)",
+                                [(fn, p, sig, v) for (fn, p), (sig, v) in self.new.items()])
+                con.executemany("DELETE FROM reads WHERE fn = ? AND path = ?", gone)
+                con.commit()
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error) as e:
+            print("cgr: read cache: %s" % e, file=sys.stderr)  # the scan itself stands
+
+
+def cached_read(fn):
+    """Serve fn(path, *how) from READS while a scan runs; `how` (a step
+    reader) is part of the key."""
+    @functools.wraps(fn)
+    def wrap(path, *how):
+        if READS is None or not path:
+            return fn(path, *how)
+        name = ":".join([fn.__name__] + [h.__name__ for h in how])
+        return READS.get(name, str(path), lambda: fn(path, *how))
+    return wrap
+
+
 def claude_transcript(sid):
     found = glob.glob(str(HOME / ".claude" / "projects" / "*" / (sid + ".jsonl")))
     return found[0] if found else None
@@ -1069,6 +1171,7 @@ CLAUDE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}$")
 CONVERSED = re.compile(rb'"type":\s*"(?:user|assistant)"')
 
 
+@cached_read
 def continued_in(path):
     """The session this transcript says it carried on in, else None.
 
@@ -1806,6 +1909,7 @@ def first_records(path, limit=300):
         return
 
 
+@cached_read
 def head_meta(path, step_of=message_step):
     """cwd, start, branch, source and first prompt from the start of a transcript."""
     meta = {}
@@ -1824,6 +1928,7 @@ def head_meta(path, step_of=message_step):
     return meta
 
 
+@cached_read
 def tail_scan(path, step_of=message_step):
     """(end record, mid_turn, last prompt, model) from the end of a transcript."""
     end, steps, model, talked = None, [], None, False
@@ -2264,9 +2369,9 @@ def build_index(since=None):
     """Every session every harness on this machine kept, with how each one
     ended. With `since`, only sessions active since then: the rest keep the
     rows an earlier, wider scan wrote (write_index leaves them alone)."""
-    global SCAN_SINCE
+    global SCAN_SINCE, READS
     rows, failed = {}, set()
-    SCAN_SINCE = since
+    SCAN_SINCE, READS = since, ReadCache()
     try:
         for indexer in INDEXERS:
             try:
@@ -2277,6 +2382,14 @@ def build_index(since=None):
                 print("cgr: %s: %s" % (indexer.__name__[6:], e), file=sys.stderr)
     finally:
         SCAN_SINCE = None
+    try:
+        return finish_index(rows, failed, since)
+    finally:
+        READS.save()
+        READS = None
+
+
+def finish_index(rows, failed, since):
     # A harness's first exit record dates when it began writing them; a
     # windowed scan may not reach it, so the stored rows count too.
     first = indexed_first_exits() if since is not None else {}
@@ -2706,7 +2819,7 @@ def choose_history(rows, groups, preview=False, alt=None, full=False, months=Non
         nonlocal sets, rows, groups, months, open_day, cur, top, note, picked
         if n == months:
             return
-        show_note(_c("  reading sessions from %s… (slow: every transcript in it is read)"
+        show_note(_c("  reading sessions from %s… (slow only the first time; then only changed files)"
                      % window_name(n), "1;33"))
         sets = reload(n)
         months, note = n, ""

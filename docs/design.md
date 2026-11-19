@@ -1659,7 +1659,7 @@ windowed scan may not reach it.
 **Measured.** On this machine 354 of about 460 Claude transcripts were written
 in the last 30 days, so the default window reads in about 8 s against 12 to 30 s
 for all time (the spread is machine load). The window bounds the wait; the
-per-transcript cache noted in 18.8 would remove most of it.
+read cache in 18.10 removes most of it.
 
 Tests: `test_history_picker_shows_30_days_and_m_adds_a_month`,
 `test_history_picker_a_typed_number_sets_the_months`,
@@ -1667,3 +1667,35 @@ Tests: `test_history_picker_shows_30_days_and_m_adds_a_month`,
 `test_history_lists_30_days_unless_months_says_more`,
 `test_a_windowed_scan_skips_old_transcripts_and_keeps_their_rows`,
 `test_all_picker_shows_30_days_and_m_or_a_number_reaches_further`.
+
+### 18.10 The read cache (2026-11-19)
+
+**The request.** After 18.9 the default window still took about 8 s: "we
+should move to a cache or database solution then: read once to populate and
+then just cover the new sessions."
+
+**What it does.** `reads.db` (owner-only, beside `sessions.db`) keeps the
+results of the three per-file readers that cost the time, `head_meta`,
+`tail_scan` and `continued_in`, keyed by reader (with its step reader, for
+codex) and path, and stamped with the file's inode, size and `st_mtime_ns`.
+While `build_index` runs, `READS` serves a reader from the cache when the
+stamp still matches and reads the file otherwise. New sessions are not the
+only ones read again: a running session's transcript keeps growing, so any
+change to the stamp counts. `save()` stores what was read and drops the
+entries of files that no longer exist.
+
+**What it does not cache.** Verdicts. Whether a session was cut off still
+comes from the reads plus the live evidence (processes, the watcher, saves,
+first exit records) on every scan, per the rule that a stored verdict is never
+trusted over evidence. A file modified within the last 2 s is read but not
+stored, because a write inside one mtime tick could leave the same stamp (the
+"racy" case git's index has too). The cache is stamped with a hash of cgr
+itself, so a new cgr, whose reading may differ, starts it over.
+
+**Measured.** `cgr --full --list`: 9.1 s cold, 1.0 s warm; `--months 0`: 6.6 s
+cold, 1.9 s warm. A cached and an uncached full scan of this machine produced
+identical rows (2175 sessions, 0 differences).
+
+Test: `test_a_rescan_reads_only_transcripts_that_changed` (unchanged files are
+not opened, an append is read again, a new cgr reads all, a deleted file
+leaves the cache, a just-written file is never stored).

@@ -1724,6 +1724,54 @@ class CgrTests(unittest.TestCase):
         self.assertEqual(in_store, {"fresh": 1, "stale": 1})
         self.assertIsNone(self.cg.SCAN_SINCE)
 
+    def test_a_rescan_reads_only_transcripts_that_changed(self):
+        now = time.time()
+        self.transcript("a", [prompt("first")], now - 3600)
+        self.transcript("b", [prompt("second")], now - 7200)
+        self.transcript("hot", [prompt("live")], now)  # just written: may change again unseen
+        self.cg.build_index()
+        reads, real = [], self.cg.first_records
+
+        def counting(path, *a):
+            reads.append(Path(path).stem)
+            return real(path, *a)
+
+        def scan():
+            reads.clear()
+            return {r["id"]: r for r in self.cg.build_index()[0] if r["harness"] == "claude"}
+
+        self.cg.first_records = counting
+        try:
+            self.assertEqual(set(scan()), {"a", "b", "hot"})
+            self.assertEqual(set(reads), {"hot"})
+            # an append changes the size, so that file alone is read again
+            path = self.home / ".claude" / "projects" / "-w" / "a.jsonl"
+            with open(path, "a") as fh:
+                fh.write(json.dumps(prompt("more")) + "\n")
+            os.utime(path, (now - 3500, now - 3500))
+            rows = scan()
+            self.assertEqual(set(reads), {"a", "hot"})
+            self.assertEqual(rows["a"]["last_prompt"], "more")
+            # a different cgr may read differently: everything is read again
+            version, self.cg.code_version = self.cg.code_version, lambda: "another cgr"
+            try:
+                scan()
+            finally:
+                self.cg.code_version = version
+            self.assertEqual(set(reads), {"a", "b", "hot"})
+            # a deleted transcript leaves the cache too
+            (self.home / ".claude" / "projects" / "-w" / "b.jsonl").unlink()
+            scan()
+        finally:
+            self.cg.first_records = real
+        con = sqlite3.connect(str(self.cg.STATE / "reads.db"))
+        try:
+            paths = {Path(p).stem for (p,) in con.execute("SELECT DISTINCT path FROM reads")}
+        finally:
+            con.close()
+        self.assertEqual(paths, {"a"})
+        self.assertIsNone(self.cg.READS)
+
     def test_all_picker_shows_30_days_and_m_or_a_number_reaches_further(self):
         self.watched_boot("recent", self.prev, ["/one", "/two"])
         self.watched_boot("earlier", self.prev - 86400, ["/other"])

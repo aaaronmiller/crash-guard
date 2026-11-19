@@ -69,9 +69,14 @@ back too, and picks are kept across the switch.
 more. In their pickers `m` adds one month, and typing a number shows that many
 months (`6` for six, `12` for a year, `0` for all time); the number counts once
 you stop typing for a moment, or on the next key. `--months N` does the same
-from the command line. Reading a wider window for `--history` and `--full`
-takes a few seconds (every transcript in it is read), and the picker says so
-while it reads.
+from the command line. The picker says so while it reads.
+
+Reading is fast after the first time: `~/.local/state/crash-guard/reads.db`
+keeps what cgr read from each transcript, and a later scan opens only the
+files that changed since (a different size, modification time or inode), so
+`cgr --full` takes about a second, all time about two. The cache holds reads,
+never verdicts, and starts over whenever cgr itself changes; deleting it is
+always safe.
 
 Example, after WezTerm crashed on 2026-11-09 and took three agents with it
 (colored in a terminal; prompts shortened here):
